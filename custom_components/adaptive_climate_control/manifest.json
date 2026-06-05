@@ -1,0 +1,12 @@
+{
+  "domain": "adaptive_climate_control",
+  "name": "Adaptive Climate Control",
+  "version": "0.1.0",
+  "config_flow": true,
+  "documentation": "https://github.com/Raven-git-hub/ha-adaptive-climate",
+  "issue_tracker": "https://github.com/Raven-git-hub/ha-adaptive-climate/issues",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": ["@Raven-git-hub"],
+  "iot_class": "local_push"
+}

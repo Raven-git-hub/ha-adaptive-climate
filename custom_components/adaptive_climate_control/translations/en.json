@@ -1,0 +1,58 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Adaptive Climate Control Setup",
+        "description": "Configure your Adaptive Climate Control integration.",
+        "data": {
+          "log_dir": "Log directory path"
+        }
+      },
+      "room": {
+        "title": "Add a Room",
+        "description": "Configure a room for Adaptive Climate Control.",
+        "data": {
+          "room_id": "Room name (no spaces, e.g. living_room)",
+          "climate_entity": "Climate entity (thermostat / AC unit)",
+          "presence_entities": "Presence sensors (optional)",
+          "sleep_sensor": "Sleep sensor (optional)"
+        }
+      },
+      "sensors": {
+        "title": "Temperature Sensors",
+        "description": "Add temperature sensors for this room and set their initial trust level.",
+        "data": {
+          "sensor_entity": "Temperature sensor",
+          "sensor_trust": "Sensor reliability"
+        }
+      },
+      "defaults": {
+        "title": "Default Temperatures",
+        "description": "Set the starting temperature for each period. The system will learn from these over time.",
+        "data": {
+          "morning": "Morning (05:00 - 09:00)",
+          "day": "Day (09:00 - 12:00)",
+          "afternoon": "Afternoon (12:00 - 17:00)",
+          "evening": "Evening (17:00 - 23:00)",
+          "overnight": "Overnight (23:00 - 05:00)"
+        }
+      },
+      "another_room": {
+        "title": "Add Another Room?",
+        "description": "Would you like to configure another room?",
+        "data": {
+          "add_another": "Add another room"
+        }
+      }
+    },
+    "error": {
+      "invalid_room_id": "Room name must contain only letters, numbers and underscores.",
+      "room_id_exists": "A room with this name already exists.",
+      "invalid_entity": "Entity not found in Home Assistant.",
+      "invalid_temperature": "Temperature must be between 10 and 35 degrees."
+    },
+    "abort": {
+      "already_configured": "Adaptive Climate Control is already configured."
+    }
+  }
+}
