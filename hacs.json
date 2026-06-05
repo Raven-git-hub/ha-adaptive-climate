@@ -1,0 +1,6 @@
+{
+  "name": "Adaptive Climate Control",
+  "description": "A Home Assistant integration that learns your temperature preferences over time, building a personal comfort almanac to intelligently control your climate system.",
+  "render_readme": true,
+  "homeassistant": "2024.1.0"
+}
