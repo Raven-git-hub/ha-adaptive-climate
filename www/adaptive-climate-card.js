@@ -119,7 +119,9 @@ class AdaptiveClimateCard extends HTMLElement {
 
     const temp         = parseFloat(this.getState(tempEntity)) || "--";
     const corrective   = this.getState(stateEntity) || "idle";
-    const acOn         = corrective !== "idle";
+    const climateEntity = this.config.climate_entities?.[roomId];
+    const climateState  = this.getState(climateEntity);
+    const acOn          = climateState && climateState !== "off" && climateState !== "unavailable" && climateState !== "unknown";
     const warnings     = this.getWarnings(roomId);
     const hasWarning   = warnings.length > 0;
 
