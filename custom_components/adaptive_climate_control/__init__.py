@@ -71,6 +71,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register reload handler
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
+    await async_setup_services(hass)
     _LOGGER.info("Adaptive Climate Control set up successfully")
     return True
 
@@ -102,3 +103,33 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload a config entry when options are updated."""
     await async_unload_entry(hass, entry)
     await async_setup_entry(hass, entry)
+
+
+async def async_setup_services(hass: HomeAssistant) -> None:
+    """Register Adaptive Climate Control services."""
+    import voluptuous as vol
+    from homeassistant.helpers import config_validation as cv
+
+    async def handle_nudge_temperature(call):
+        """Handle a nudge_temperature service call from the Lovelace card."""
+        room_id = call.data.get("room_id")
+        direction = call.data.get("direction")
+
+        for entry_id, entry_data in hass.data.get(DOMAIN, {}).items():
+            coordinator = entry_data.get("coordinator")
+            if coordinator and room_id in coordinator.almanacs:
+                coordinator.record_intervention(room_id, coordinator.almanacs[room_id].current_target(), direction)
+                _LOGGER.info("Nudge service: room=%s direction=%s", room_id, direction)
+                return
+
+        _LOGGER.warning("Nudge service: room_id '%s' not found", room_id)
+
+    hass.services.async_register(
+        DOMAIN,
+        "nudge_temperature",
+        handle_nudge_temperature,
+        schema=vol.Schema({
+            vol.Required("room_id"): cv.string,
+            vol.Required("direction"): vol.In(["up", "down"]),
+        }),
+    )
