@@ -76,7 +76,9 @@ def _get_binary_sensors(hass: HomeAssistant) -> list[str]:
     ]
 
 
-class AdaptiveClimateConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class AdaptiveClimateConfigFlow(config_entries.ConfigFlow):
+
+    DOMAIN = DOMAIN
     """Handle the config flow for Adaptive Climate Control."""
 
     VERSION = 1
