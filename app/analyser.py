@@ -172,7 +172,14 @@ def analyse_room(conn, room: dict, cfg: LearningConfig,
             if c is None:
                 b = cfg.low_trust_deviation
             else:
-                devs = [(abs(t - c), rw(d)) for d, t in re_sensor[sec].get(sid, [])]
+                # A reaction only informs THIS sensor's band if this sensor
+                # had actually drifted at reaction time. A sensor sitting at
+                # its comfort when the user reacted is evidence of nothing
+                # about that sensor - folding its ~0 deviation in would wrongly
+                # make it look maximally trusted. Only count reactions where it
+                # moved by at least the high-trust threshold. (docs/TRUST_MODEL.md)
+                devs = [(abs(t - c), rw(d)) for d, t in re_sensor[sec].get(sid, [])
+                        if abs(t - c) >= cfg.high_trust_deviation]
                 mean_dev = _weighted_mean(devs)
                 b = (band_from_deviation(mean_dev, cfg.high_trust_deviation,
                                          cfg.low_trust_deviation)

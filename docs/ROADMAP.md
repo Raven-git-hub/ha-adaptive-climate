@@ -11,9 +11,9 @@ the start of the rebuild, with the design settled enough to begin the contract.
 | 3 | Trust model + quorum design and the pure-function core | **drafted** — `docs/TRUST_MODEL.md`, `app/trust.py` |
 | 4 | Analyser: setpoint learning + per-sensor comfort/trust/band | **in progress** — `app/analyser.py` (built + tested), almanac contract in `docs/ALMANAC_FORMAT.md` |
 | 5 | Generator: helpers, AC state machine, maintenance/quorum, leak | **done** — helpers/scene/leak/watchdog/maintenance all built + tested (maintenance logic verified against `app.trust` via real Jinja2, 45/45) |
-| 6 | Scheduler: clock-only boundary computation (no sun) | todo — `app/scheduler.py` |
+| 6 | Scheduler: clock-only boundary computation (no sun) | **done** — `app/scheduler.py`, swept a year via `tools/sweep.py` (tz-aware, out-of-order times, overnight lookup) |
 | 7 | HA client (REST + WebSocket) and connection doctor | **done** — `app/ha.py` (fake-HA integration-tested), `tools/doctor.py` (6-step diagnostic) |
-| 8 | Storage layer: dual CSV/SQLite writes, event log, CSV re-ingest | todo — `app/store.py` |
+| 8 | Storage layer: dual CSV/SQLite writes, event log, CSV re-ingest | **writes done** — heartbeat/reactive (CSV+SQLite), section_run, events, config versioning, activity() reads; verified end-to-end into the analyser via `tools/store_check.py`. CSV re-ingest (recovery path) still todo |
 | 9 | Config loader: schema validation, defaults, cross-reference checks | todo — `app/config.py` |
 | 10 | Runtime: scheduler, observer, reactive detector, almanac push, leak latch | todo — `app/runtime.py` |
 | 11 | Config API and deployment to Home Assistant | **first slice done** — `app/deploy.py` (list-diff helpers, ledger-based automations, offline-tested), `/api/config`, `/api/deploy`, `/api/deploy/check`; foreign-conflict detection still TODO, see `docs/DEPLOY.md` |

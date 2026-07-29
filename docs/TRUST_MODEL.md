@@ -55,6 +55,19 @@ deviations at which the user has reacted on that sensor, clamped to
 band = clamp( weighted_mean(reaction_deviations), D_HIGH, D_LOW )
 ```
 
+**Attribution — which sensor a reaction teaches.** When you react, the system
+snapshots *every* sensor, but a reaction only tells us about the sensors that
+had actually *drifted*. A sensor sitting at its comfort reading when you reacted
+is evidence of nothing about that sensor (if anything, that it failed to predict
+your discomfort), so its ~0 deviation must not be folded in — doing so would
+wrongly make an unmoved sensor look maximally trusted. So a reaction updates a
+sensor's band only when that sensor's deviation at reaction time is at least
+`D_HIGH`; sensors at or near comfort are skipped for that reaction. A sensor
+with no qualifying reactions keeps the widest band (low trust), exactly like one
+with no reactions at all. In the worked example below, sensor A drifted 1.0 and
+is taught; a second sensor sitting at its comfort would learn nothing from the
+same reaction.
+
 **Trust** is the normalised inverse of the band, purely for display and
 tie-breaking (the quorum itself is vote-count based, below):
 
