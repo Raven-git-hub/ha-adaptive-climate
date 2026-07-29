@@ -87,6 +87,9 @@ def leak_automation_id(room: str, unit: str) -> str:
 def watchdog_automation_id(room: str) -> str:
     return f"ac_watchdog_{room}"
 
+def correction_started_id(room: str) -> str:
+    return f"input_datetime.ac_correction_started_{room}"
+
 
 def _split(entity_id: str) -> tuple[str, str]:
     """('input_boolean.ac_hold_x') -> ('input_boolean', 'ac_hold_x')."""
@@ -131,6 +134,9 @@ def build_helpers(config: dict) -> list[dict]:
         domain, obj = _split(scene_select_id(r))
         specs.append({"domain": domain, "object_id": obj, "name": obj,
                       "options": list(SECTIONS)})
+        domain, obj = _split(correction_started_id(r))
+        specs.append({"domain": domain, "object_id": obj, "name": obj,
+                      "has_date": True, "has_time": True})
         for unit in _leak_units(room):
             specs.append(boolean(leak_id(r, unit["id"])))
             specs.append(boolean(leak_confirm_id(r, unit["id"])))
@@ -164,8 +170,8 @@ def _setpoint_template(alm: str, section: str, unit_id: str, entity: str) -> str
             ).replace("<<E>>", entity)
 
 
-def _fan_supported_template(entity: str) -> str:
-    return "{{ 'low' in (state_attr('<<E>>','fan_modes') or []) }}".replace("<<E>>", entity)
+def _fan_supported_template(entity: str, mode: str) -> str:
+    return f"{{{{ '{mode}' in (state_attr('{entity}','fan_modes') or []) }}}}"
 
 
 def _set(service: str, entity: str, data: dict | None = None) -> dict:
@@ -193,7 +199,7 @@ def _drive_unit(alm: str, section: str, unit: dict, forced_off: bool) -> dict:
                  {"temperature": _setpoint_template(alm, section, unit["id"], e)}),
             {"choose": [{
                 "conditions": [{"condition": "template",
-                                "value_template": _fan_supported_template(e)}],
+                                "value_template": _fan_supported_template(e, "low")}],
                 "sequence": [_set("climate.set_fan_mode", e, {"fan_mode": "low"})],
             }], "default": []},
         ],
@@ -295,18 +301,194 @@ def build_watchdog_automation(config: dict, room: dict) -> dict:
 # Maintenance / quorum automation - NEXT Phase 5 sub-step.
 # ---------------------------------------------------------------------
 
-def build_maintenance_automation(config: dict, room: dict) -> dict:
-    """Runs on HA's clock (D4 decided: HA owns maintenance). Per heartbeat,
-    for the active section (input_select.ac_scene_<room>): tally per-sensor
-    votes against the almanac comfort/band, apply the quorum rule, and if
-    met nudge setpoints by <= max_step_degrees in the breach direction,
-    honouring guard/hold and driving Cooling/Warming/Leak states.
+# ---------------------------------------------------------------------
+# Maintenance / quorum automation (D4: HA owns maintenance, runs on HA's
+# own clock so correction survives container downtime).
+#
+# Design, matching docs/TRUST_MODEL.md exactly:
+#   * a sensor votes when |reading - comfort| >= band; unavailable or
+#     never-learned sensors are excluded from both the tally and the
+#     quorum base (n = usable sensor count, not configured count)
+#   * quorum: n==1->1, n==2->2, n>=3->ceil(n/2)  ==(n+1)//2 for n>=3
+#   * direction: trust-weighted sum of the breaching sensors' sign
+#   * a unit is corrected only if it is already on, has a learned
+#     setpoint, is not forced off for the section, and its leak boolean
+#     (if any) is not on - leak mode owns the unit instead
+#   * the one-hour cap uses input_datetime.ac_correction_started_<room>:
+#     reset to now() every heartbeat the quorum is NOT met (idle clock);
+#     left untouched while it IS met, so elapsed-since-idle approximates
+#     how long correction has been continuously warranted. Once elapsed
+#     passes correction_max_minutes, correction pauses until a heartbeat
+#     drops back below quorum and resets the clock.
+# ---------------------------------------------------------------------
 
-    Deferred: this encodes the whole voting model in HA Jinja and wants a
-    live trace to validate, so it is being built as its own focused pass.
-    See docs/TRUST_MODEL.md and docs/ALMANAC_FORMAT.md.
-    """
-    raise NotImplementedError("Phase 5 - maintenance/quorum template (next sub-step)")
+def _sensor_entry_template(sensor: dict, low_dev: float) -> str:
+    sid, entity = sensor["id"], sensor["entity_id"]
+    return (
+        "{'id': '<<ID>>', "
+        "'reading': states('<<E>>') | float(none), "
+        "'comfort': (sensor_data.get('<<ID>>') or {}).get('comfort'), "
+        "'band': (sensor_data.get('<<ID>>') or {}).get('band', <<LOW>>), "
+        "'trust': (sensor_data.get('<<ID>>') or {}).get('trust', 0.0)}"
+    ).replace("<<ID>>", sid).replace("<<E>>", entity).replace("<<LOW>>", repr(low_dev))
+
+
+def _vote_expr(room: dict, low_dev: float) -> str:
+    """A single Jinja expression -> dict literal {tally, required, met,
+    direction}, computed from `sensor_data` (set earlier in variables).
+    Trim markers keep the rendered string a clean Python literal so HA's
+    variable parser (literal_eval) accepts it."""
+    entries = ", ".join(_sensor_entry_template(s, low_dev) for s in room["sensors"])
+    return (
+        "{%- set sensors = [" + entries + "] -%}"
+        "{%- set usable = sensors | selectattr('reading','ne',none) | selectattr('comfort','ne',none) | list -%}"
+        "{%- set n = usable | length -%}"
+        "{%- set required = 1 if n==1 else (2 if n==2 else ((n+1)//2 if n>=3 else 0)) -%}"
+        "{%- set ns = namespace(tally=0, warm=0.0, cool=0.0) -%}"
+        "{%- for s in usable -%}"
+        "{%- set dev = s.reading - s.comfort -%}"
+        "{%- if dev|abs >= s.band -%}"
+        "{%- set ns.tally = ns.tally + 1 -%}"
+        "{%- set w = s.trust + 0.000001 -%}"
+        "{%- if dev > 0 -%}{%- set ns.warm = ns.warm + w -%}"
+        "{%- else -%}{%- set ns.cool = ns.cool + w -%}{%- endif -%}"
+        "{%- endif -%}"
+        "{%- endfor -%}"
+        "{%- set met = required > 0 and ns.tally >= required -%}"
+        "{%- set direction = ('cool' if ns.warm > ns.cool else ('warm' if ns.cool > ns.warm else 'none')) "
+        "if met else 'none' -%}"
+        "{{ {'tally': ns.tally, 'required': required, 'met': met, 'direction': direction} }}"
+    )
+
+
+def _correction_setpoint_template(unit_id: str, entity: str, offset: float) -> str:
+    return (
+        "{% set u = unit_data.get('<<U>>') or {} %}"
+        "{% set sp = u.get('setpoint') %}"
+        "{% set step = state_attr('<<E>>','target_temp_step') or 1 %}"
+        "{% set lo = state_attr('<<E>>','min_temp') or 16 %}"
+        "{% set hi = state_attr('<<E>>','max_temp') or 30 %}"
+        "{% set target = sp + (<<OFF>>) %}"
+        "{% set snapped = ((target / step) | round(0)) * step %}"
+        "{{ [[snapped, lo] | max, hi] | min }}"
+    ).replace("<<U>>", unit_id).replace("<<E>>", entity).replace("<<OFF>>", repr(offset))
+
+
+def _correction_gate_template(room: str, unit: dict) -> str:
+    """True only when this unit should be corrected this heartbeat: a
+    direction is active, the unit has a learned setpoint, is not forced
+    off, is currently on, and (if leak-enabled) its leak boolean is off."""
+    uid, entity = unit["id"], unit["entity_id"]
+    leak_clause = ""
+    if unit.get("leak_detection", {}).get("enabled"):
+        leak_clause = f" and states('{leak_id(room, uid)}') != 'on'"
+    return (
+        "{{ vote.direction in ('warm','cool')"
+        f" and (unit_data.get('{uid}') or {{}}).get('setpoint') is not none"
+        f" and not (unit_data.get('{uid}') or {{}}).get('off', false)"
+        f" and states('{entity}') not in ('off','unavailable','unknown')"
+        f"{leak_clause} }}}}"
+    )
+
+
+def _drive_correction_unit(room: dict, unit: dict) -> dict:
+    r, uid, entity = room["id"], unit["id"], unit["entity_id"]
+    cool_seq = [
+        _set("climate.set_hvac_mode", entity, {"hvac_mode": "cool"}),
+        _set("climate.set_temperature", entity,
+             {"temperature": _correction_setpoint_template(uid, entity, -2)}),
+        {"choose": [{"conditions": [{"condition": "template",
+                     "value_template": _fan_supported_template(entity, "medium")}],
+                    "sequence": [_set("climate.set_fan_mode", entity, {"fan_mode": "medium"})]}],
+         "default": []},
+    ]
+    warm_seq = [
+        _set("climate.set_hvac_mode", entity, {"hvac_mode": "fan_only"}),
+        _set("climate.set_temperature", entity,
+             {"temperature": _correction_setpoint_template(uid, entity, 0)}),
+        {"choose": [{"conditions": [{"condition": "template",
+                     "value_template": _fan_supported_template(entity, "low")}],
+                    "sequence": [_set("climate.set_fan_mode", entity, {"fan_mode": "low"})]}],
+         "default": []},
+    ]
+    return {
+        "choose": [{
+            "conditions": [{"condition": "template",
+                            "value_template": _correction_gate_template(r, unit)}],
+            "sequence": [{
+                "choose": [
+                    {"conditions": [{"condition": "template",
+                                     "value_template": "{{ vote.direction == 'cool' }}"}],
+                     "sequence": cool_seq},
+                    {"conditions": [{"condition": "template",
+                                     "value_template": "{{ vote.direction == 'warm' }}"}],
+                     "sequence": warm_seq},
+                ],
+                "default": [],
+            }],
+        }],
+        "default": [],
+    }
+
+
+def build_maintenance_automation(config: dict, room: dict) -> dict:
+    r = room["id"]
+    alm = almanac_id(r)
+    trust_cfg = config.get("system", {}).get("trust", {})
+    low_dev = trust_cfg.get("low_trust_deviation", 5.0)
+    interval = config.get("system", {}).get("heartbeat_interval_minutes", 10)
+    max_minutes = config.get("system", {}).get("correction_max_minutes", 60)
+    started = correction_started_id(r)
+
+    variables = {
+        "section": f"{{{{ states('{scene_select_id(r)}') }}}}",
+        "secs": f"{{{{ state_attr('{alm}','sections') or {{}} }}}}",
+        "sect": "{{ secs.get(section) or {} }}",
+        "sensor_data": "{{ sect.get('sensors') or {} }}",
+        "unit_data": "{{ sect.get('units') or {} }}",
+        "vote": _vote_expr(room, low_dev),
+        "elapsed_minutes": (
+            f"{{% set st = states('{started}') %}}"
+            "{% if st in ('unknown','unavailable',none) %}0"
+            "{% else %}{{ ((now() - as_datetime(st)).total_seconds() / 60) | round(1) }}"
+            "{% endif %}"
+        ),
+    }
+
+    reset_clock = {
+        "choose": [{
+            "conditions": [{"condition": "template",
+                            "value_template": "{{ not vote.met }}"}],
+            "sequence": [_set("input_datetime.set_datetime", started,
+                              {"datetime": "{{ now() }}"})],
+        }],
+        "default": [],
+    }
+
+    correct_if_within_cap = {
+        "choose": [{
+            "conditions": [
+                {"condition": "template", "value_template": "{{ vote.met }}"},
+                {"condition": "template",
+                 "value_template": f"{{{{ elapsed_minutes < {max_minutes} }}}}"},
+            ],
+            "sequence": [_drive_correction_unit(room, u) for u in room["units"]],
+        }],
+        "default": [],
+    }
+
+    return {
+        "id": maintenance_automation_id(r),
+        "alias": f"AC {room.get('name', r)} \u2014 maintenance",
+        "mode": "single",
+        "trigger": [{"platform": "time_pattern", "minutes": f"/{interval}"}],
+        "condition": [
+            {"condition": "state", "entity_id": guard_id(r), "state": "off"},
+            {"condition": "state", "entity_id": hold_id(r), "state": "off"},
+        ],
+        "variables": variables,
+        "action": [reset_clock, correct_if_within_cap],
+    }
 
 
 # ---------------------------------------------------------------------
@@ -320,6 +502,7 @@ def render_all(config: dict) -> dict:
     for room in _enabled_rooms(config):
         for section in _sections_for(config, room):
             automations.append(build_scene_automation(config, room, section))
+        automations.append(build_maintenance_automation(config, room))
         for unit in _leak_units(room):
             automations.append(build_leak_automation(config, room, unit))
             automations.append(build_leak_release_automation(config, room, unit))

@@ -60,11 +60,22 @@ for display and tie-breaking; the quorum count itself is unweighted.
 - **sensors[].trust** — normalised inverse of band, 0..1. Display and
   tie-breaking only.
 
-## What the HA maintenance template does with it (D4, Phase 5)
+## What the HA maintenance template does with it (D4, implemented)
 
-Per heartbeat, for the active section: read each sensor's `comfort`/`band`,
-count votes (`abs(reading - comfort) >= band`), apply the quorum rule
-(1→1, 2→2, 3+→ceil(n/2)), and if met, nudge the unit setpoints by at most
-`max_step_degrees` in the breach direction, clamped to each unit's range. Stops
-at the first heartbeat below quorum or after `correction_max_minutes`. The
-`ceil(n/2)` and direction logic are specified in docs/TRUST_MODEL.md.
+`app/generator.py:build_maintenance_automation` emits, per room, an automation
+on a `time_pattern` trigger (every `heartbeat_interval_minutes`, HA's own clock
+per D4). Per heartbeat, for the active section: read each sensor's
+`comfort`/`band`, count votes (`abs(reading - comfort) >= band`) among sensors
+that are currently available and have a learned comfort (unavailable/unlearned
+sensors count toward neither the tally nor the quorum base), apply the quorum
+rule (1→1, 2→2, 3+→ceil(n/2)), and if met, drive each eligible unit into
+Cooling or Warming by the trust-weighted breach direction, clamped/snapped per
+`docs/HARDWARE.md`. A unit is corrected only if it is already on, has a learned
+setpoint, is not forced off for the section, and (if leak-enabled) its leak
+boolean is off. The one-hour cap uses `input_datetime.ac_correction_started_<room>`:
+reset every heartbeat the quorum is not met, left untouched while it is, so
+elapsed time approximates how long correction has been continuously warranted.
+The `ceil(n/2)` and trust-weighted direction logic are specified in
+`docs/TRUST_MODEL.md`, and the Jinja implementing them is cross-checked against
+`app.trust.evaluate_quorum` (the tested reference) in
+`tools/maintenance_logic_check.py` - 45/45 hand and fuzzed scenarios match.
