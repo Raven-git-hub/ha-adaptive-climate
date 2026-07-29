@@ -58,6 +58,21 @@ off, and it's entirely static — decided from config, not from almanac state.
 was. The maintenance automation already had the correct behaviour (it never
 acts without a learned setpoint); this brought the scene automation in line.
 
+## The correction-clock cold-start fix
+
+A freshly-created `input_datetime` helper in Home Assistant doesn't start
+`unknown` — it defaults to today's midnight. The maintenance template's
+one-hour-cap check only treats `unknown`/`unavailable` as "clock not running
+yet"; a real-but-stale midnight timestamp instead looks like a correction that
+has already been running for hours, which could wrongly cap a correction that
+should be allowed to start fresh on its very first opportunity after deploy.
+Rather than depend on that self-healing (the clock resets the moment any
+heartbeat finds quorum *not* met, which is common but not guaranteed to be
+first), `deploy()` now explicitly resets every room's
+`input_datetime.ac_correction_started_<room>` to the real current time on
+every deploy — cheap, idempotent, and closes the gap outright rather than
+relying on timing.
+
 ## Before you deploy to a live, occupied home
 
 - **Run `/api/deploy/check` (or the Config page's "Check deploy" button)

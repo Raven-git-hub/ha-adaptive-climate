@@ -35,10 +35,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from app import generator as g
+from app.generator import correction_started_id
 from app.ha import HAError, HARest, HAWebSocket
 
 MANIFEST_FILENAME = "deploy_manifest.json"
@@ -197,6 +199,29 @@ async def _reconcile_automations(rendered_automations: list[dict], rest: HARest,
     manifest["automations"] = sorted(desired)
 
 
+async def _reset_correction_clocks(config: dict, rest: HARest,
+                                   report: DeployReport) -> None:
+    """Explicitly set every room's correction_started helper to now().
+
+    HA gives a freshly-created input_datetime a default value ("today,
+    00:00:00") rather than leaving it unset. The maintenance template's
+    elapsed-time check only treats an unknown/unavailable state as "fresh
+    clock"; a real-but-stale midnight value would instead look like an
+    already-long-running correction, incorrectly capping a correction that
+    should be allowed to start. Run every deploy (idempotent, harmless if
+    a correction happens to be mid-flight - it just gets a fresh hour)."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for room in config.get("rooms", []):
+        if not room.get("enabled", True):
+            continue
+        entity_id = correction_started_id(room["id"])
+        try:
+            await rest.call_service("input_datetime", "set_datetime",
+                                    {"entity_id": entity_id, "datetime": now_str})
+        except Exception as e:
+            report.problems.append(f"could not reset {entity_id}: {e}")
+
+
 async def deploy(config: dict, rest: HARest, ws: HAWebSocket,
                  data_dir: str | Path) -> DeployReport:
     check_report = await check(config, rest)
@@ -209,6 +234,7 @@ async def deploy(config: dict, rest: HARest, ws: HAWebSocket,
     manifest = load_manifest(data_dir)
 
     await _reconcile_helpers(rendered["helpers"], ws, report)
+    await _reset_correction_clocks(config, rest, report)
     await _reconcile_automations(rendered["automations"], rest, manifest, report)
 
     manifest["helpers"] = sorted(f"{h['domain']}.{h['object_id']}" for h in rendered["helpers"])

@@ -23,11 +23,13 @@ from app import deploy as d  # noqa: E402
 
 
 class StubRest:
-    """Records automation writes/deletes; entity existence is fixed."""
+    """Records automation writes/deletes and service calls; entity
+    existence is fixed."""
     def __init__(self, entity_ids):
         self._entities = set(entity_ids)
         self.set_calls: list[str] = []
         self.delete_calls: list[str] = []
+        self.service_calls: list[tuple[str, str, dict]] = []
 
     async def states(self):
         return [{"entity_id": e} for e in self._entities]
@@ -37,6 +39,9 @@ class StubRest:
 
     async def delete_automation(self, aid):
         self.delete_calls.append(aid)
+
+    async def call_service(self, domain, service, data=None):
+        self.service_calls.append((domain, service, data or {}))
 
 
 class StubWS:
@@ -78,6 +83,17 @@ async def main() -> int:
     assert len(r1.automations_written) == 24
     assert r1.automations_removed == r1.helpers_removed == []
     print("deploy 1 (from nothing): created 12 helpers, wrote 24 automations - OK")
+
+    # correction_started clock must be reset explicitly every deploy (not
+    # left at HA's stale creation default) - one input_datetime.set_datetime
+    # call per room
+    clock_resets = [c for c in rest.service_calls
+                    if c[:2] == ("input_datetime", "set_datetime")]
+    assert len(clock_resets) == len(cfg["rooms"]), clock_resets
+    for domain, service, data in clock_resets:
+        assert data["entity_id"].startswith("input_datetime.ac_correction_started_")
+        assert data["datetime"]  # a real timestamp string, not empty
+    print(f"deploy 1: correction clock explicitly reset for all {len(clock_resets)} rooms - OK")
 
     # deploy 2: identical config -> idempotent, nothing pruned
     r2 = await d.deploy(cfg, rest, ws, tmp)
