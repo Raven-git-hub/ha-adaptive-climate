@@ -245,6 +245,14 @@ function escapeHtml(s) {
 const SENSOR_COLORS = ["#4bb3fd", "#4fd6a0", "#e0a030", "#c78bff", "#ff8f6b"];
 const analysisState = { room: null, day: null };
 
+// Local YYYY-MM-DD from a Date's local components. Using toISOString() here
+// would convert to UTC and, in a positive-offset zone like +08:00, roll the
+// date back a day - which silently fetched the wrong days (the chart's blank).
+function ymdLocal(dt) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
+}
+
 async function renderAnalysis() {
   view.innerHTML = `<p class="placeholder">Loading\u2026</p>`;
   let rooms;
@@ -257,7 +265,7 @@ async function renderAnalysis() {
   if (!rooms.length) { view.innerHTML = `<p class="placeholder">No rooms configured.</p>`; return; }
   if (!analysisState.room || !rooms.find((r) => r.id === analysisState.room))
     analysisState.room = rooms[0].id;
-  if (!analysisState.day) analysisState.day = new Date().toISOString().slice(0, 10);
+  if (!analysisState.day) analysisState.day = ymdLocal(new Date());
 
   view.innerHTML = `
     <div class="toolbar">
@@ -284,7 +292,7 @@ async function renderAnalysis() {
   const days = [-2, -1, 0].map((d) => {
     const dt = new Date(analysisState.day + "T00:00:00");
     dt.setDate(dt.getDate() + d);
-    return dt.toISOString().slice(0, 10);
+    return ymdLocal(dt);
   });
   let parts;
   try {
@@ -299,6 +307,7 @@ async function renderAnalysis() {
     reactions: parts.flatMap((p) => p.reactions || []),
     section_runs: parts.flatMap((p) => p.section_runs || []),
     almanac: parts[parts.length - 1].almanac || {},   // current, from the selected day
+    tz: parts[parts.length - 1].tz || null,
   };
   drawAnalysis(act, rooms.find((r) => r.id === analysisState.room), days);
 }
@@ -306,7 +315,7 @@ async function renderAnalysis() {
 function shiftDay(delta) {
   const d = new Date(analysisState.day + "T00:00:00");
   d.setDate(d.getDate() + delta);
-  analysisState.day = d.toISOString().slice(0, 10);
+  analysisState.day = ymdLocal(d);
   renderAnalysis();
 }
 
@@ -322,9 +331,15 @@ function drawAnalysis(act, room, days) {
   }
 
   const toEpoch = (ts) => Math.floor(new Date(ts).getTime() / 1000);
-  // fixed 3-day window: 00:00 of the first day .. 00:00 after the last day
-  const xMin = Math.floor(new Date(days[0] + "T00:00:00").getTime() / 1000);
-  const xMax = Math.floor(new Date(days[days.length - 1] + "T00:00:00").getTime() / 1000) + 86400;
+  // The window bounds must be interpreted at the SAME UTC offset as the
+  // heartbeat timestamps (e.g. +08:00), not the browser's local zone, or the
+  // pinned x-range is shifted off the data and nothing draws. Take the offset
+  // from the data itself.
+  const offMatch = (hbs[0].ts || "").match(/([+-]\d{2}:\d{2}|Z)$/);
+  const off = !offMatch ? "" : offMatch[1] === "Z" ? "+00:00" : offMatch[1];
+  const dayStart = (d) => Math.floor(new Date(`${d}T00:00:00${off}`).getTime() / 1000);
+  const xMin = dayStart(days[0]);
+  const xMax = dayStart(days[days.length - 1]) + 86400;
   const xs = hbs.map((h) => toEpoch(h.ts));
 
   const sensors = room.sensors;
@@ -405,6 +420,9 @@ function drawAnalysis(act, room, days) {
     hooks: { drawClear: [bandHook] },
     legend: { show: false },
   };
+  if (act.tz) {
+    try { opts.tzDate = (ts) => uPlot.tzDate(new Date(ts * 1000), act.tz); } catch {}
+  }
 
   chart.innerHTML = "";
   try {

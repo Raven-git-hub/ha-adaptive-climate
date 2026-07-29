@@ -178,6 +178,7 @@ def api_activity(room_id: str, day: str | None = None) -> dict:
     d = day or date.today().isoformat()
     act = state.store.activity(room_id, d)
     act["almanac"] = state.store.current_almanac(room_id).get("sections", {})
+    act["tz"] = str(state.runtime.tz) if getattr(state.runtime, "tz", None) else None  # type: ignore[attr-defined]
     return act
 
 
