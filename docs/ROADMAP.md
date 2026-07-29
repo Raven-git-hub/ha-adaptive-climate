@@ -54,3 +54,7 @@ These bit us in Light and the equivalents are pre-empted here:
 - **Presence rules** — configurable actions when a room is empty for a section.
 - **Custom time sections** — let a profile add or remove sections rather than the
   fixed six (e.g. a nap window, a focus block).
+
+## Validation coverage note
+
+`tools/leak_response_check.py` (added after the leak sensor picker) proves the full wet -> DRY -> confirm -> Normal cycle actually drives the air conditioner, not just the boolean latch, and that non-leak units are unaffected.

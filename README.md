@@ -126,11 +126,19 @@ page - like every other entity picker, so a typo can't silently resolve to
 nothing. Populate it and the generator wires the trigger directly to that
 sensor; leave it blank and the container still creates the boolean helper
 (`input_boolean.ac_leak_<room>_<unit>`) with an empty trigger for you to wire
-by hand in Home Assistant instead. Either way, while the boolean is on the
-unit runs in **Leak** mode (DRY). Release is latched: it clears only when the
-user confirms via `input_boolean.ac_leak_confirmed_<room>_<unit>` **and**, if
-the sensor is known, it is no longer reporting a leak - confirming alone isn't
-enough while the sensor still reads wet.
+by hand in Home Assistant instead.
+
+The full cycle: when the sensor (or your own wiring) trips, the leak
+automation raises `input_boolean.ac_leak_<room>_<unit>` **and immediately
+drives the unit into Leak mode** (DRY, fan LOW, the almanac setpoint if one
+is known). While the boolean is on, the maintenance loop leaves that unit
+alone, and **any scheduled crossover that lands mid-leak re-asserts DRY
+instead of reverting to Normal** - leak safety overrides the schedule, not
+the other way round. Release is latched: it fires when the user confirms via
+`input_boolean.ac_leak_confirmed_<room>_<unit>`, blocked while the sensor
+still reads wet if the sensor is known, and on release the unit is driven
+back to Normal immediately rather than sitting in DRY until the next
+scheduled boundary.
 
 ## Architecture
 

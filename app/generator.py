@@ -179,6 +179,51 @@ def _fan_supported_template(entity: str, mode: str) -> str:
     return f"{{{{ '{mode}' in (state_attr('{entity}','fan_modes') or []) }}}}"
 
 
+def _leak_active_template(room: str, unit_id: str) -> str:
+    return f"{{{{ states('{leak_id(room, unit_id)}') == 'on' }}}}"
+
+
+def _live_section_variables(room: str) -> dict:
+    """variables: block computing the currently active section and its
+    almanac unit data from live HA state (input_select + the almanac
+    sensor), for automations that are triggered by an event rather than a
+    scheduled crossover and so don't know the section at generation time -
+    the same live-lookup pattern build_maintenance_automation uses."""
+    alm = almanac_id(room)
+    return {
+        "section": f"{{{{ states('{scene_select_id(room)}') }}}}",
+        "secs": f"{{{{ state_attr('{alm}','sections') or {{}} }}}}",
+        "sect": "{{ secs.get(section) or {} }}",
+        "unit_data": "{{ sect.get('units') or {} }}",
+    }
+
+
+def _drive_mode_actions_live(unit: dict, hvac_mode: str, offset: float, fan_mode: str) -> list:
+    """Drive one unit into hvac_mode using the LIVE `unit_data` variable
+    (from _live_section_variables) rather than a literal section - for
+    automations fired by an event (leak trip / leak release), not a
+    crossover. Skips the temperature call if no setpoint is known yet
+    rather than inventing one, but still switches hvac_mode/fan so the
+    unit visibly changes state (e.g. leaves DRY) even before an almanac
+    exists - unlike the crossover's "no almanac = untouched" safety rule,
+    a unit already mid safety-override needs a definite way out."""
+    e, uid = unit["entity_id"], unit["id"]
+    return [
+        _set("climate.set_hvac_mode", e, {"hvac_mode": hvac_mode}),
+        {"choose": [{
+            "conditions": [{"condition": "template", "value_template":
+                            "{{ (unit_data.get('" + uid + "') or {}).get('setpoint') is not none }}"}],
+            "sequence": [_set("climate.set_temperature", e,
+                              {"temperature": _correction_setpoint_template(uid, e, offset)})],
+        }], "default": []},
+        {"choose": [{
+            "conditions": [{"condition": "template",
+                            "value_template": _fan_supported_template(e, fan_mode)}],
+            "sequence": [_set("climate.set_fan_mode", e, {"fan_mode": fan_mode})],
+        }], "default": []},
+    ]
+
+
 def _set(service: str, entity: str, data: dict | None = None) -> dict:
     step: dict = {"service": service, "target": {"entity_id": entity}}
     if data:
@@ -186,7 +231,30 @@ def _set(service: str, entity: str, data: dict | None = None) -> dict:
     return step
 
 
-def _drive_unit(alm: str, section: str, unit: dict, forced_off: bool) -> dict:
+def _drive_dry_actions_literal(alm: str, section: str, unit: dict) -> list:
+    """Same as _drive_mode_actions_live but for the crossover automations,
+    which know the section literally at generation time - reuses the
+    literal-section setpoint lookup rather than the live `unit_data`
+    variable."""
+    e, uid = unit["entity_id"], unit["id"]
+    return [
+        _set("climate.set_hvac_mode", e, {"hvac_mode": "dry"}),
+        {"choose": [{
+            "conditions": [{"condition": "template",
+                            "value_template": _unit_lookup(alm, section, uid)
+                                              + "{{ u.get('setpoint') is not none }}"}],
+            "sequence": [_set("climate.set_temperature", e,
+                              {"temperature": _setpoint_template(alm, section, uid, e)})],
+        }], "default": []},
+        {"choose": [{
+            "conditions": [{"condition": "template",
+                            "value_template": _fan_supported_template(e, "low")}],
+            "sequence": [_set("climate.set_fan_mode", e, {"fan_mode": "low"})],
+        }], "default": []},
+    ]
+
+
+def _drive_unit(alm: str, section: str, unit: dict, forced_off: bool, room_id: str) -> dict:
     """One action step: force off (deliberate, static, from config scenes),
     or drive to the Normal state (cool, snapped+clamped almanac setpoint,
     fan low if supported) - or, if no almanac has been learned for this
@@ -196,29 +264,48 @@ def _drive_unit(alm: str, section: str, unit: dict, forced_off: bool) -> dict:
     the runtime exists to seed a provisional almanac (Phase 10), every
     section starts with no learned setpoint; if that were mapped to an
     off command, deploying would force every unit off at every crossover
-    on a fresh install. forced_off (this function's other branch) is the
-    ONLY path that commands off, and it fires solely from the user's own
-    scene configuration - never from missing learned data.
+    on a fresh install. forced_off (below) is the ONLY path that commands
+    off from missing data, and it fires solely from the user's own scene
+    configuration.
+
+    LEAK SAFETY: if this unit has leak detection enabled, an active leak
+    (input_boolean.ac_leak_<room>_<unit> is 'on') takes priority over
+    EVERYTHING below, including an explicit forced-off scene - a crossover
+    landing while a leak is active must re-assert DRY, not silently revert
+    to Normal or Off. See docs/DESIGN.md D6.
     """
     e = unit["entity_id"]
     if forced_off:
-        return _set("climate.set_hvac_mode", e, {"hvac_mode": "off"})
+        base = _set("climate.set_hvac_mode", e, {"hvac_mode": "off"})
+    else:
+        base = {
+            "choose": [{
+                "conditions": [{"condition": "template",
+                                "value_template": _skip_condition(alm, section, unit["id"])}],
+                "sequence": [],   # no almanac yet -> leave the unit alone, do not touch it
+            }],
+            "default": [
+                _set("climate.set_hvac_mode", e, {"hvac_mode": "cool"}),
+                _set("climate.set_temperature", e,
+                     {"temperature": _setpoint_template(alm, section, unit["id"], e)}),
+                {"choose": [{
+                    "conditions": [{"condition": "template",
+                                    "value_template": _fan_supported_template(e, "low")}],
+                    "sequence": [_set("climate.set_fan_mode", e, {"fan_mode": "low"})],
+                }], "default": []},
+            ],
+        }
+
+    if not unit.get("leak_detection", {}).get("enabled"):
+        return base
+
     return {
         "choose": [{
             "conditions": [{"condition": "template",
-                            "value_template": _skip_condition(alm, section, unit["id"])}],
-            "sequence": [],   # no almanac yet -> leave the unit alone, do not touch it
+                            "value_template": _leak_active_template(room_id, unit["id"])}],
+            "sequence": _drive_dry_actions_literal(alm, section, unit),
         }],
-        "default": [
-            _set("climate.set_hvac_mode", e, {"hvac_mode": "cool"}),
-            _set("climate.set_temperature", e,
-                 {"temperature": _setpoint_template(alm, section, unit["id"], e)}),
-            {"choose": [{
-                "conditions": [{"condition": "template",
-                                "value_template": _fan_supported_template(e, "low")}],
-                "sequence": [_set("climate.set_fan_mode", e, {"fan_mode": "low"})],
-            }], "default": []},
-        ],
+        "default": [base],
     }
 
 
@@ -242,7 +329,7 @@ def build_scene_automation(config: dict, room: dict, section: dict) -> dict:
     ]
     for unit in room["units"]:
         forced_off = unit_modes.get(unit["id"], {}).get("mode", "auto") == "off"
-        actions.append(_drive_unit(alm, sid, unit, forced_off))
+        actions.append(_drive_unit(alm, sid, unit, forced_off, r))
     if transition > 0:
         actions.append({"delay": {"seconds": transition}})
     actions.append(_set("input_boolean.turn_off", guard_id(r)))
@@ -263,11 +350,15 @@ def build_scene_automation(config: dict, room: dict, section: dict) -> dict:
 # ---------------------------------------------------------------------
 
 def build_leak_automation(config: dict, room: dict, unit: dict) -> dict:
-    """Raises the leak boolean. When the unit's leak_detection.sensor_entity_id
-    is set (chosen from the Config page's live picker), the trigger is wired
+    """Raises the leak boolean AND immediately drives the unit into Leak
+    state (DRY, fan LOW if supported, almanac setpoint if known) - the
+    boolean alone drives nothing on its own; this is the actual safety
+    response. When the unit's leak_detection.sensor_entity_id is set
+    (chosen from the Config page's live picker), the trigger is wired
     directly to that binary_sensor going 'on'. Left unset, the trigger is
     empty for the user to wire a sensor into by hand in Home Assistant -
-    the original manual-wiring path stays fully supported."""
+    the manual-wiring path stays fully supported, and drives the same
+    response once fired. See docs/DESIGN.md D6."""
     r, u = room["id"], unit["id"]
     sensor = unit.get("leak_detection", {}).get("sensor_entity_id")
     trigger = [{"platform": "state", "entity_id": sensor, "to": "on"}] if sensor else []
@@ -277,16 +368,21 @@ def build_leak_automation(config: dict, room: dict, unit: dict) -> dict:
         "mode": "queued",
         "trigger": trigger,
         "condition": [],
-        "action": [_set("input_boolean.turn_on", leak_id(r, u))],
+        "variables": _live_section_variables(r),
+        "action": [_set("input_boolean.turn_on", leak_id(r, u))]
+                  + _drive_mode_actions_live(unit, "dry", 0, "low"),
     }
 
 
 def build_leak_release_automation(config: dict, room: dict, unit: dict) -> dict:
-    """Latch release: fires when the user confirms the fix. When the sensor
-    is known, a condition also requires it to no longer read 'on' - the
-    confirm alone is not enough while the sensor still reports wet. Without
-    a known sensor, release depends on confirmation alone, as before (the
-    user is expected to have checked)."""
+    """Latch release: fires when the user confirms the fix, and immediately
+    restores the unit to Normal (cool, fan LOW, almanac setpoint if known)
+    rather than leaving it in DRY until the next scheduled crossover, which
+    could be hours away. When the sensor is known, a condition also
+    requires it to no longer read 'on' - confirmation alone is not enough
+    while the sensor still reports wet. Without a known sensor, release
+    depends on confirmation alone, as before (the user is expected to have
+    checked)."""
     r, u = room["id"], unit["id"]
     sensor = unit.get("leak_detection", {}).get("sensor_entity_id")
     condition = []
@@ -301,10 +397,11 @@ def build_leak_release_automation(config: dict, room: dict, unit: dict) -> dict:
         "mode": "single",
         "trigger": [{"platform": "state", "entity_id": leak_confirm_id(r, u), "to": "on"}],
         "condition": condition,
+        "variables": _live_section_variables(r),
         "action": [
             _set("input_boolean.turn_off", leak_id(r, u)),
             _set("input_boolean.turn_off", leak_confirm_id(r, u)),
-        ],
+        ] + _drive_mode_actions_live(unit, "cool", 0, "low"),
     }
 
 

@@ -127,12 +127,28 @@ and the release automation's condition directly to it no longer reading `on` -
 no manual automation editing required. Left blank, the generator falls back to
 its original behaviour: a dedicated boolean helper
 `input_boolean.ac_leak_<room>_<unit>` and a stub automation with an empty
-trigger for the user to wire their own sensor into by hand. Either way, while
-the boolean is on the unit runs in Leak mode (DRY). Leak mode is a **latch**:
-release requires the user's confirmation (`input_boolean.ac_leak_confirmed_
-<room>_<unit>`) and, when the sensor is known, that it has actually stopped
-reporting a leak - confirming alone is not enough while the sensor still reads
-wet, closing the gap the manual-only path left open.
+trigger for the user to wire their own sensor into by hand.
+
+**The boolean is not a passive record - it drives the AC.** The leak automation
+raises `input_boolean.ac_leak_<room>_<unit>` and, in the same action list,
+immediately drives the unit into Leak mode (DRY, fan LOW if supported, the
+almanac setpoint if known - reusing the maintenance automation's live
+`unit_data` variable pattern rather than a literal section, since this fires
+from an event, not a crossover). The maintenance automation already skips
+correcting a unit while its leak boolean is on. Critically, **every scene
+(crossover) automation for a leak-enabled unit checks the leak boolean before
+anything else** - ahead of even an explicit forced-off scene - and re-asserts
+DRY if it's on, instead of driving the unit back to Normal. Without this, a
+scheduled boundary landing while a leak was still active would have silently
+reverted the unit to Cool, which was a real defect caught after the picker
+shipped (see `tools/leak_response_check.py`).
+
+Leak mode is a **latch**: release requires the user's confirmation
+(`input_boolean.ac_leak_confirmed_<room>_<unit>`) and, when the sensor is
+known, that it has actually stopped reporting a leak - confirming alone is not
+enough while the sensor still reads wet. On release, the unit is driven back
+to Normal immediately (same live-variable pattern), rather than left in DRY
+until whatever scheduled crossover happens to be next.
 
 ### D7. Temperature unit is configurable
 
