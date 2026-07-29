@@ -84,8 +84,36 @@ async def lifespan(app: FastAPI):
     if not CONFIG_PATH.exists():
         save(blank(), CONFIG_PATH)
         log.info("wrote a blank config to %s", CONFIG_PATH)
-    log.info("adaptive-climate up; idle until a runtime is wired (Phase 10)")
+
+    cfg = _raw_config()
+    have_rooms = any(r.get("enabled", True) for r in cfg.get("rooms", []))
+    have_creds = bool(os.environ.get("AC_HA_URL") and os.environ.get("AC_HA_TOKEN"))
+    if have_rooms and have_creds:
+        try:
+            from app.ha import HARest, HAWebSocket
+            from app.runtime import Runtime
+            url = os.environ["AC_HA_URL"]
+            token = os.environ["AC_HA_TOKEN"]
+            verify = os.environ.get("AC_HA_VERIFY_SSL", "true").lower() != "false"
+            rest = HARest(url, token, verify_ssl=verify)
+            ws = HAWebSocket(url, token, verify_ssl=verify)
+            await ws.connect()
+            runtime = Runtime(cfg, state.store, rest, ws, DATA_DIR)
+            await runtime.start()
+            state.runtime = runtime
+            log.info("runtime started (%d room(s) live)", len(runtime.rooms))
+        except Exception as e:
+            state.error = f"runtime failed to start: {e}"
+            log.error(state.error)
+    else:
+        log.info("idle: %s", "no rooms configured" if not have_rooms
+                 else "AC_HA_URL/AC_HA_TOKEN not set")
     yield
+    if state.runtime:
+        try:
+            await state.runtime.stop()
+        except Exception:
+            pass
     if state.store:
         state.store.close()
 
@@ -132,12 +160,15 @@ def api_almanac(room_id: str) -> dict:
 
 
 @app.post("/api/analysis/run")
-def api_run_analysis() -> dict:
-    """Rebuild almanacs now from whatever the store holds. Real end to end;
-    it simply finds nothing to learn until the observer (Phase 10) writes
-    heartbeats."""
+async def api_run_analysis() -> dict:
+    """Rebuild almanacs now. When the runtime is live this also pushes the
+    result to Home Assistant; otherwise it just rebuilds from whatever the
+    store holds (and finds nothing until the observer has run)."""
     if not state.store:
         raise HTTPException(503, "store not ready")
+    if state.runtime is not None:
+        await state.runtime.run_analysis()  # type: ignore[attr-defined]
+        return {"ok": True, "via": "runtime"}
     cfg = _raw_config()
     lc = _learning_config(cfg)
     today = date.today()

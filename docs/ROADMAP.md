@@ -15,7 +15,7 @@ the start of the rebuild, with the design settled enough to begin the contract.
 | 7 | HA client (REST + WebSocket) and connection doctor | **done** — `app/ha.py` (fake-HA integration-tested), `tools/doctor.py` (6-step diagnostic) |
 | 8 | Storage layer: dual CSV/SQLite writes, event log, CSV re-ingest | **writes done** — heartbeat/reactive (CSV+SQLite), section_run, events, config versioning, activity() reads; verified end-to-end into the analyser via `tools/store_check.py`. CSV re-ingest (recovery path) still todo |
 | 9 | Config loader: schema validation, defaults, cross-reference checks | todo — `app/config.py` |
-| 10 | Runtime: scheduler, observer, reactive detector, almanac push, leak latch | todo — `app/runtime.py` |
+| 10 | Runtime: scheduler, observer, reactive detector, almanac push, leak latch | **done** — `app/runtime.py` (observer + control loop), wired into `app/main.py` lifespan; offline-tested via `tools/runtime_check.py` |
 | 11 | Config API and deployment to Home Assistant | **first slice done** — `app/deploy.py` (list-diff helpers, ledger-based automations, offline-tested), `/api/config`, `/api/deploy`, `/api/deploy/check`; foreign-conflict detection still TODO, see `docs/DEPLOY.md` |
 | 12 | UI shell, status strip, Config and Log | **Config done** (JSON editor + validate/save/check/deploy); Log still todo |
 | 13 | UI — Now (live dashboard, per-sensor bands, AC state) | **first slice done** — guard/hold/scene + live unit and sensor state via `/api/now`; comfort-band visualisation still todo |
