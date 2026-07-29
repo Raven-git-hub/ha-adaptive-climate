@@ -6,10 +6,10 @@ the start of the rebuild, with the design settled enough to begin the contract.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | n8n prototype: proved the concept, exposed the implementation pain | superseded by this rebuild |
-| 1 | Config schema — the contract everything else derives from | **in progress** — `schema/config.schema.json` |
-| 2 | Storage: SQLite DDL, CSV layout, event log | **in progress** — `schema/storage.schema.sql` |
-| 3 | Trust model + quorum design and the pure-function core | **drafted** — `docs/TRUST_MODEL.md`, `app/trust.py` |
-| 4 | Analyser: setpoint learning + per-sensor comfort/trust/band | **in progress** — `app/analyser.py` (built + tested), almanac contract in `docs/ALMANAC_FORMAT.md` |
+| 1 | Config schema — the contract everything else derives from | **done** — `schema/config.schema.json` |
+| 2 | Storage: SQLite DDL, CSV layout, event log | **done** — `schema/storage.schema.sql` |
+| 3 | Trust model + quorum design and the pure-function core | **done** — `docs/TRUST_MODEL.md`, `app/trust.py` (tested) |
+| 4 | Analyser: setpoint learning + per-sensor comfort/trust/band | **done** — `app/analyser.py` (tested), almanac contract in `docs/ALMANAC_FORMAT.md` |
 | 5 | Generator: helpers, AC state machine, maintenance/quorum, leak | **done** — helpers/scene/leak/watchdog/maintenance all built + tested (maintenance logic verified against `app.trust` via real Jinja2, 45/45) |
 | 6 | Scheduler: clock-only boundary computation (no sun) | **done** — `app/scheduler.py`, swept a year via `tools/sweep.py` (tz-aware, out-of-order times, overnight lookup) |
 | 7 | HA client (REST + WebSocket) and connection doctor | **done** — `app/ha.py` (fake-HA integration-tested), `tools/doctor.py` (6-step diagnostic) |
