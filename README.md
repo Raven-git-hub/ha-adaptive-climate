@@ -172,10 +172,14 @@ login (it lives on your LAN). All five views are built:
   through history with the date controls.
 - **Almanac** — the learned model per room: per section, the learned setpoint per
   unit and, per sensor, the comfort reading with its trust and band.
-- **Config** — the configuration as validated JSON, with **Validate & Save**,
-  **Check deploy** (entity-existence dry run, no writes), and **Deploy to Home
-  Assistant**. A structured room/unit/sensor picker is planned; the JSON editor
-  is the current first slice and validates against the same schema the backend
+- **Config** — structured editor: collapsible rooms (units, sensors, leak
+  toggles, the per-section scene auto/off matrix) and collapsible time
+  profiles, plus system/learning/connection settings. Entity pickers are
+  backed by a live list from Home Assistant with a found/not-found indicator,
+  degrading to free-text entry while idle. A **Raw JSON** toggle exposes the
+  same document directly for anything the form doesn't cover yet. **Validate &
+  Save**, **Check deploy** (entity-existence dry run, no writes), and **Deploy
+  to Home Assistant** all validate against the same schema the backend
   enforces.
 - **Log** — everything the container did and when, filterable by room, category
   and severity, with expandable detail. Heartbeats sit at debug level so they do

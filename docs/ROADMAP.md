@@ -17,7 +17,7 @@ the start of the rebuild, with the design settled enough to begin the contract.
 | 9 | Config loader: schema validation, defaults, cross-reference checks | todo — `app/config.py` |
 | 10 | Runtime: scheduler, observer, reactive detector, almanac push, leak latch | **done** — `app/runtime.py` (observer + control loop), wired into `app/main.py` lifespan; offline-tested via `tools/runtime_check.py` |
 | 11 | Config API and deployment to Home Assistant | **first slice done** — `app/deploy.py` (list-diff helpers, ledger-based automations, offline-tested), `/api/config`, `/api/deploy`, `/api/deploy/check`; foreign-conflict detection still TODO, see `docs/DEPLOY.md` |
-| 12 | UI shell, status strip, Config and Log | **done** — Config (JSON editor + deploy) and Log (filterable feed, expandable detail) |
+| 12 | UI shell, status strip, Config and Log | **done** — Config (structured room/unit/sensor/profile editor, live entity pickers, scene matrix, raw-JSON fallback) and Log (filterable feed, expandable detail) |
 | 13 | UI — Now (live dashboard, per-sensor bands, AC state) | **first slice done** — guard/hold/scene + live unit and sensor state via `/api/now`; comfort-band visualisation still todo |
 | 14 | UI — Analysis (day chart, uPlot) | **done** — vendored uPlot 1.6.31; per-sensor traces, comfort bands, per-unit setpoint, section boundaries, reaction markers, date stepping |
 | 15 | UI — Almanac (setpoint + per-sensor trust/band, settling sparkline) | **started** — Almanac view + `/api/almanac`, `/api/analysis/run` live |

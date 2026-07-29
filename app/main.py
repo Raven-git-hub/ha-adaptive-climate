@@ -235,6 +235,35 @@ def _ha_clients():
     return HARest(url, token, verify_ssl=verify_ssl), HAWebSocket(url, token, verify_ssl=verify_ssl)
 
 
+@app.get("/api/entities")
+async def api_entities(domain: str) -> dict:
+    """Live entities for the Config page's pickers, so a typo can't silently
+    resolve to 'unknown'. Degrades gracefully (empty list + a note) when HA
+    credentials aren't set or the connection fails, rather than erroring -
+    the config editor must still be usable while idle."""
+    if domain not in ("climate", "sensor"):
+        raise HTTPException(400, "domain must be 'climate' or 'sensor'")
+    url = os.environ.get("AC_HA_URL")
+    token = os.environ.get("AC_HA_TOKEN")
+    if not url or not token:
+        return {"entities": [], "connected": False,
+               "note": "AC_HA_URL/AC_HA_TOKEN not set; enter entity ids manually"}
+    from app.ha import HARest
+    verify = os.environ.get("AC_HA_VERIFY_SSL", "true").lower() != "false"
+    rest = HARest(url, token, verify_ssl=verify)
+    try:
+        states = await rest.states()
+    except Exception as e:
+        return {"entities": [], "connected": False, "note": f"could not reach Home Assistant: {e}"}
+    finally:
+        await rest.close()
+    out = [{"entity_id": s["entity_id"],
+           "name": (s.get("attributes", {}) or {}).get("friendly_name", s["entity_id"])}
+          for s in states if s["entity_id"].startswith(f"{domain}.")]
+    out.sort(key=lambda e: e["name"].lower())
+    return {"entities": out, "connected": True}
+
+
 @app.get("/api/deploy/check")
 async def api_deploy_check() -> dict:
     """Dry run: entity existence only. No writes to Home Assistant."""

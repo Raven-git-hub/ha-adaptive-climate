@@ -172,42 +172,118 @@ function renderNowRoom(room) {
 
 // ---- Config -------------------------------------------------------
 
+// ---- Config: shared state -------------------------------------
+
+let cfg = null;                 // working copy of the config
+let cfgMode = "form";           // 'form' | 'raw'
+let entityLists = { climate: [], sensor: [], connected: false };
+const uiOpen = { rooms: new Set(), profiles: new Set() };
+let cfgListenersWired = false;
+
+const DEFAULT_TIMES = { sunrise: "05:30", day: "08:00", afternoon: "14:00",
+                        sunset: "16:00", night: "20:30", sleep: "22:00" };
+
+function slugify(s) {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "room";
+}
+
+// --- path helpers: "rooms.0.units.1.entity_id", "system.trust.high_trust_deviation" ---
+function getPath(obj, path, def) {
+  const parts = path.split(".");
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null) return def;
+    cur = cur[/^\d+$/.test(p) ? Number(p) : p];
+  }
+  return cur === undefined ? def : cur;
+}
+function setPath(obj, path, value) {
+  const parts = path.split(".");
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const p = /^\d+$/.test(parts[i]) ? Number(parts[i]) : parts[i];
+    if (cur[p] == null || typeof cur[p] !== "object") cur[p] = {};
+    cur = cur[p];
+  }
+  const last = parts[parts.length - 1];
+  if (value === undefined) delete cur[last]; else cur[last] = value;
+}
+
+function defaultProfile(id, name) {
+  return { id, name, sections: Object.entries(DEFAULT_TIMES).map(([sid, time]) => ({
+    id: sid, name: sid[0].toUpperCase() + sid.slice(1), trigger: { type: "clock", time } })) };
+}
+
+// ---- Config: entry point ---------------------------------------
+
 async function renderConfig() {
   view.innerHTML = `<p class="placeholder">Loading config\u2026</p>`;
-  let cfg;
   try {
     cfg = await (await fetch("/api/config")).json();
   } catch {
     view.innerHTML = `<p class="placeholder">Could not reach the API.</p>`;
     return;
   }
+  if (uiOpen.rooms.size === 0) (cfg.rooms || []).forEach((r) => uiOpen.rooms.add(r.id));
 
   view.innerHTML = `
     <div class="toolbar">
       <button id="cfg-save">Validate &amp; Save</button>
       <button id="cfg-check">Check deploy</button>
       <button id="cfg-deploy" class="danger">Deploy to Home Assistant</button>
+      <span class="spacer"></span>
+      <button id="cfg-mode" data-action="toggle-mode">${cfgMode === "form" ? "Raw JSON" : "Form view"}</button>
       <span id="cfg-msg" class="muted"></span>
     </div>
-    <p class="muted">Raw config JSON. A structured room/unit/sensor picker is
-      planned; this text editor is the honest first slice \u2014 it validates
-      against the same schema the backend enforces.</p>
-    <textarea id="cfg-text" spellcheck="false">${escapeHtml(JSON.stringify(cfg, null, 2))}</textarea>
+    <p class="muted">A change to section <b>times</b> is live from Save alone. A change to what a
+      scene <b>does</b> \u2014 a unit's auto/off mode, transition time, or any room/unit/sensor \u2014
+      needs <b>Deploy</b>. The running observer picks up a saved config after a container restart.</p>
+    <div id="cfg-body"></div>
     <pre id="cfg-report" class="report"></pre>
+    <datalist id="dl-climate"></datalist>
+    <datalist id="dl-sensor"></datalist>
   `;
 
+  wireConfigToolbar();
+  if (!cfgListenersWired) { wireConfigDelegation(); cfgListenersWired = true; }
+  await loadEntities();
+  renderConfigBody();
+}
+
+async function loadEntities() {
+  try {
+    const [c, s] = await Promise.all([
+      fetch("/api/entities?domain=climate").then((r) => r.json()),
+      fetch("/api/entities?domain=sensor").then((r) => r.json()),
+    ]);
+    entityLists = { climate: c.entities || [], sensor: s.entities || [],
+                    connected: c.connected, note: c.note };
+    const fill = (id, list) => {
+      const dl = document.getElementById(id);
+      if (dl) dl.innerHTML = list.map((e) =>
+        `<option value="${escapeHtml(e.entity_id)}">${escapeHtml(e.name)}</option>`).join("");
+    };
+    fill("dl-climate", entityLists.climate);
+    fill("dl-sensor", entityLists.sensor);
+  } catch { /* pickers still work as free text */ }
+}
+
+function entityKnown(domain, entityId) {
+  if (!entityLists.connected) return null;   // unknown either way; don't warn
+  return entityLists[domain].some((e) => e.entity_id === entityId);
+}
+
+// ---- Config: toolbar (save/check/deploy/mode) -------------------
+
+function wireConfigToolbar() {
   const msg = document.getElementById("cfg-msg");
   const report = document.getElementById("cfg-report");
-  const textarea = document.getElementById("cfg-text");
 
   document.getElementById("cfg-save").addEventListener("click", async () => {
-    let parsed;
-    try { parsed = JSON.parse(textarea.value); }
-    catch (e) { msg.textContent = "invalid JSON: " + e.message; return; }
     msg.textContent = "saving\u2026";
     const r = await fetch("/api/config", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(parsed),
+      body: JSON.stringify(cfg),
     });
     const j = await r.json().catch(() => ({}));
     msg.textContent = r.ok ? "saved" : "rejected: " + (j.detail || r.status);
@@ -223,9 +299,7 @@ async function renderConfig() {
 
   document.getElementById("cfg-deploy").addEventListener("click", async () => {
     if (!confirm("This writes helpers and automations to your real Home " +
-                 "Assistant and lets them start controlling these thermostats. Continue?")) {
-      return;
-    }
+                 "Assistant and lets them start controlling these thermostats. Continue?")) return;
     msg.textContent = "deploying\u2026"; report.textContent = "";
     const btn = document.getElementById("cfg-deploy"); btn.disabled = true;
     const r = await fetch("/api/deploy", { method: "POST" });
@@ -234,6 +308,286 @@ async function renderConfig() {
     report.textContent = JSON.stringify(j, null, 2);
     btn.disabled = false;
   });
+}
+
+// ---- Config: delegated input/change/click (survives body re-renders) ---
+
+function wireConfigDelegation() {
+  view.addEventListener("input", (e) => {
+    const t = e.target;
+    if (!t.dataset || !t.dataset.path || t.dataset.live !== "1") return;
+    applyFieldValue(t);
+    if (t.dataset.checkEntity) updateEntityCheck(t);
+  });
+  view.addEventListener("change", (e) => {
+    const t = e.target;
+    if (!t.dataset || !t.dataset.path) return;
+    applyFieldValue(t);
+    if (t.dataset.checkEntity) updateEntityCheck(t);
+  });
+  view.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-action]");
+    if (!b || !view.contains(b)) return;
+    const fn = cfgActions[b.dataset.action];
+    if (fn) fn(b.dataset);
+  });
+}
+
+function applyFieldValue(t) {
+  let v;
+  if (t.type === "checkbox") v = t.checked;
+  else v = t.value;
+  if (t.dataset.vtype === "number") v = v === "" ? undefined : parseFloat(v);
+  else if (t.dataset.vtype === "csv") v = v.split(",").map((x) => x.trim()).filter(Boolean);
+  setPath(cfg, t.dataset.path, v);
+}
+
+function updateEntityCheck(t) {
+  const span = t.parentElement.querySelector(".entity-check");
+  if (!span) return;
+  const known = entityKnown(t.dataset.checkEntity, t.value);
+  span.textContent = known === null ? "" : known ? "\u2713 in HA" : "\u26a0 not found in HA";
+  span.className = "entity-check" + (known === false ? " warn" : known ? " ok" : "");
+}
+
+// ---- Config: actions (structural changes -> re-render body only) ---
+
+const cfgActions = {
+  "toggle-mode": () => {
+    if (cfgMode === "form") {
+      cfgMode = "raw";
+    } else {
+      try { cfg = JSON.parse(document.getElementById("cfg-raw").value); }
+      catch (e) { alert("Invalid JSON, staying in raw view: " + e.message); return; }
+      cfgMode = "form";
+    }
+    document.getElementById("cfg-mode").textContent = cfgMode === "form" ? "Raw JSON" : "Form view";
+    renderConfigBody();
+  },
+  "toggle-room": (d) => { toggleSet(uiOpen.rooms, d.room); renderConfigBody(); },
+  "toggle-profile": (d) => { toggleSet(uiOpen.profiles, d.profile); renderConfigBody(); },
+
+  "add-room": () => {
+    const id = slugify(prompt("Room id (letters/numbers/underscore, stable once deployed):", ""));
+    if (!id || cfg.rooms.some((r) => r.id === id)) return;
+    cfg.rooms.push({ id, name: id, enabled: true,
+      schedule_profile: (cfg.schedule_profiles[0] || {}).id || "default",
+      units: [], sensors: [], presence_sensors: [], scenes: {} });
+    uiOpen.rooms.add(id);
+    renderConfigBody();
+  },
+  "remove-room": (d) => {
+    if (!confirm(`Remove room "${d.room}" from config? (Deploy afterward to remove it from Home Assistant too.)`)) return;
+    cfg.rooms = cfg.rooms.filter((r) => r.id !== d.room);
+    renderConfigBody();
+  },
+  "add-unit": (d) => {
+    const room = cfg.rooms.find((r) => r.id === d.room);
+    const id = slugify(prompt("Unit id:", "")); if (!id) return;
+    room.units.push({ id, name: id, entity_id: "climate.", leak_detection: { enabled: false } });
+    renderConfigBody();
+  },
+  "remove-unit": (d) => {
+    const room = cfg.rooms.find((r) => r.id === d.room);
+    room.units.splice(Number(d.idx), 1);
+    renderConfigBody();
+  },
+  "add-sensor": (d) => {
+    const room = cfg.rooms.find((r) => r.id === d.room);
+    const id = slugify(prompt("Sensor id:", "")); if (!id) return;
+    room.sensors.push({ id, name: id, entity_id: "sensor." });
+    renderConfigBody();
+  },
+  "remove-sensor": (d) => {
+    const room = cfg.rooms.find((r) => r.id === d.room);
+    room.sensors.splice(Number(d.idx), 1);
+    renderConfigBody();
+  },
+
+  "add-profile": () => {
+    const id = slugify(prompt("Time profile id:", "")); if (!id) return;
+    if (cfg.schedule_profiles.some((p) => p.id === id)) return;
+    cfg.schedule_profiles.push(defaultProfile(id, id));
+    uiOpen.profiles.add(id);
+    renderConfigBody();
+  },
+  "remove-profile": (d) => {
+    if (cfg.schedule_profiles.length <= 1) { alert("At least one time profile is required."); return; }
+    if (!confirm(`Remove time profile "${d.profile}"? Rooms using it will need reassigning.`)) return;
+    cfg.schedule_profiles = cfg.schedule_profiles.filter((p) => p.id !== d.profile);
+    renderConfigBody();
+  },
+};
+
+function toggleSet(set, id) { set.has(id) ? set.delete(id) : set.add(id); }
+
+// ---- Config: render body ----------------------------------------
+
+function renderConfigBody() {
+  const body = document.getElementById("cfg-body");
+  body.innerHTML = cfgMode === "raw" ? rawHtml() : formHtml();
+}
+
+function rawHtml() {
+  return `<textarea id="cfg-raw" spellcheck="false">${escapeHtml(JSON.stringify(cfg, null, 2))}</textarea>
+    <p class="muted">Switching back to Form view parses this JSON; fix any syntax errors first.</p>`;
+}
+
+function formHtml() {
+  return settingsHtml() + profilesHtml() + roomsHtml();
+}
+
+function numField(path, val, opts = {}) {
+  return `<input type="number" ${opts.step ? `step="${opts.step}"` : ""} data-path="${path}"
+    data-vtype="number" data-live="1" value="${val ?? ""}" />`;
+}
+function textField(path, val, opts = {}) {
+  return `<input type="text" data-path="${path}" data-live="1" value="${escapeHtml(val ?? "")}"
+    ${opts.placeholder ? `placeholder="${escapeHtml(opts.placeholder)}"` : ""} />`;
+}
+function entityField(path, val, domain) {
+  const known = entityKnown(domain, val || "");
+  const cls = "entity-check" + (known === false ? " warn" : known ? " ok" : "");
+  return `<span class="entity-field">
+    <input type="text" list="dl-${domain}" data-path="${path}" data-live="1"
+      data-check-entity="${domain}" value="${escapeHtml(val || "")}" placeholder="${domain}." />
+    <span class="${cls}">${known === false ? "\u26a0 not found in HA" : known ? "\u2713 in HA" : ""}</span>
+  </span>`;
+}
+
+function settingsHtml() {
+  const sys = cfg.system || (cfg.system = {});
+  const trust = sys.trust || (sys.trust = {});
+  const learn = cfg.learning || (cfg.learning = {});
+  const ha = cfg.homeassistant || (cfg.homeassistant = {});
+  return `<details class="panel"><summary>System, learning &amp; connection settings</summary>
+    <div class="field-grid">
+      <label>Home Assistant URL ${textField("homeassistant.base_url", ha.base_url)}</label>
+      <label class="chk"><input type="checkbox" data-path="homeassistant.verify_ssl" data-live="1"
+        ${ha.verify_ssl !== false ? "checked" : ""}/> Verify SSL</label>
+      <label>Temperature unit
+        <select data-path="system.temperature_unit" data-live="1">
+          <option value="C" ${sys.temperature_unit !== "F" ? "selected" : ""}>Celsius</option>
+          <option value="F" ${sys.temperature_unit === "F" ? "selected" : ""}>Fahrenheit</option>
+        </select></label>
+      <label>Heartbeat interval (min) ${numField("system.heartbeat_interval_minutes", sys.heartbeat_interval_minutes ?? 10)}</label>
+      <label>Reactive min delta (\u00b0) ${numField("system.reactive_min_delta", sys.reactive_min_delta ?? 0.5, {step:"0.1"})}</label>
+      <label>Max maintenance step (\u00b0) ${numField("system.max_step_degrees", sys.max_step_degrees ?? 2.0, {step:"0.5"})}</label>
+      <label>Correction cap (min) ${numField("system.correction_max_minutes", sys.correction_max_minutes ?? 60)}</label>
+      <label>High-trust deviation (\u00b0) ${numField("system.trust.high_trust_deviation", trust.high_trust_deviation ?? 0.5, {step:"0.1"})}</label>
+      <label>Low-trust deviation (\u00b0) ${numField("system.trust.low_trust_deviation", trust.low_trust_deviation ?? 5.0, {step:"0.5"})}</label>
+      <label>Analysis window (days) ${numField("learning.analysis_window_days", learn.analysis_window_days ?? 21)}</label>
+      <label>Bootstrap min days ${numField("learning.bootstrap_min_days", learn.bootstrap_min_days ?? 7)}</label>
+      <label>Validity delay (days) ${numField("learning.validity_delay_days", learn.validity_delay_days ?? 2)}</label>
+      <label>Reactive weight (\u00d7) ${numField("learning.reactive_weight", learn.reactive_weight ?? 5)}</label>
+      <label class="wide">External guard booleans (comma-separated, coexistence only)
+        <input type="text" data-path="system.external_guards" data-vtype="csv" data-live="1"
+          value="${escapeHtml((sys.external_guards || []).join(", "))}" /></label>
+    </div>
+  </details>`;
+}
+
+function profilesHtml() {
+  const profiles = cfg.schedule_profiles || [];
+  return `<div class="panel-header"><h2>Time Profiles</h2>
+    <button data-action="add-profile">+ Add profile</button></div>
+    ${profiles.map((p, i) => profileHtml(p, i)).join("")}`;
+}
+
+function profileHtml(p, i) {
+  const open = uiOpen.profiles.has(p.id);
+  const rows = SECTIONS.map((sid) => {
+    const idx = p.sections.findIndex((s) => s.id === sid);
+    const sec = p.sections[idx] || { name: sid, trigger: { time: "" } };
+    return `<tr><td>${sec.name || sid}</td><td>
+      <input type="time" data-path="schedule_profiles.${i}.sections.${idx}.trigger.time"
+        data-live="1" value="${sec.trigger?.time || ""}" /></td></tr>`;
+  }).join("");
+  return `<details class="panel" ${open ? "open" : ""}>
+    <summary data-action="toggle-profile" data-profile="${p.id}">${p.name || p.id}
+      <span class="muted">(${p.id})</span></summary>
+    <div class="field-grid">
+      <label>Name ${textField(`schedule_profiles.${i}.name`, p.name)}</label>
+    </div>
+    <table class="now"><tr><th>Section</th><th>Time</th></tr>${rows}</table>
+    <button class="danger-outline" data-action="remove-profile" data-profile="${p.id}">Remove profile</button>
+  </details>`;
+}
+
+function roomsHtml() {
+  const rooms = cfg.rooms || [];
+  const profileOpts = (cfg.schedule_profiles || []).map((p) => p.id);
+  return `<div class="panel-header"><h2>Rooms</h2>
+    <button data-action="add-room">+ Add room</button></div>
+    ${rooms.map((r, i) => roomHtml(r, i, profileOpts)).join("")}`;
+}
+
+function roomHtml(room, i, profileOpts) {
+  const open = uiOpen.rooms.has(room.id);
+  return `<details class="panel" ${open ? "open" : ""}>
+    <summary data-action="toggle-room" data-room="${room.id}">
+      ${room.name || room.id} <span class="muted">(${room.id})</span>
+      ${room.enabled === false ? '<span class="pill off">disabled</span>' : ""}</summary>
+    <div class="field-grid">
+      <label>Name ${textField(`rooms.${i}.name`, room.name)}</label>
+      <label class="chk"><input type="checkbox" data-path="rooms.${i}.enabled" data-live="1"
+        ${room.enabled !== false ? "checked" : ""}/> Enabled</label>
+      <label>Time profile
+        <select data-path="rooms.${i}.schedule_profile" data-live="1">
+          ${profileOpts.map((pid) => `<option value="${pid}" ${pid === room.schedule_profile ? "selected" : ""}>${pid}</option>`).join("")}
+        </select></label>
+    </div>
+    ${unitsHtml(room, i)}
+    ${sensorsHtml(room, i)}
+    ${scenesHtml(room, i)}
+    <button class="danger-outline" data-action="remove-room" data-room="${room.id}">Remove room</button>
+  </details>`;
+}
+
+function unitsHtml(room, i) {
+  const rows = room.units.map((u, j) => `<tr>
+    <td>${textField(`rooms.${i}.units.${j}.id`, u.id)}</td>
+    <td>${textField(`rooms.${i}.units.${j}.name`, u.name)}</td>
+    <td>${entityField(`rooms.${i}.units.${j}.entity_id`, u.entity_id, "climate")}</td>
+    <td class="chk"><input type="checkbox" data-path="rooms.${i}.units.${j}.leak_detection.enabled"
+      data-live="1" ${u.leak_detection?.enabled ? "checked" : ""}/></td>
+    <td><button class="danger-outline" data-action="remove-unit" data-room="${room.id}" data-idx="${j}">remove</button></td>
+  </tr>`).join("");
+  return `<h3>AC units <button class="small" data-action="add-unit" data-room="${room.id}">+ add</button></h3>
+    <table class="now"><tr><th>id</th><th>name</th><th>entity_id</th><th>leak?</th><th></th></tr>
+    ${rows || `<tr class="empty"><td colspan="5">no units yet</td></tr>`}</table>`;
+}
+
+function sensorsHtml(room, i) {
+  const rows = room.sensors.map((s, j) => `<tr>
+    <td>${textField(`rooms.${i}.sensors.${j}.id`, s.id)}</td>
+    <td>${textField(`rooms.${i}.sensors.${j}.name`, s.name)}</td>
+    <td>${entityField(`rooms.${i}.sensors.${j}.entity_id`, s.entity_id, "sensor")}</td>
+    <td><button class="danger-outline" data-action="remove-sensor" data-room="${room.id}" data-idx="${j}">remove</button></td>
+  </tr>`).join("");
+  return `<h3>Temperature sensors <button class="small" data-action="add-sensor" data-room="${room.id}">+ add</button></h3>
+    <table class="now"><tr><th>id</th><th>name</th><th>entity_id</th><th></th></tr>
+    ${rows || `<tr class="empty"><td colspan="4">no sensors yet</td></tr>`}</table>`;
+}
+
+function scenesHtml(room, i) {
+  if (!room.units.length) return `<h3>Scenes</h3><p class="muted">add a unit first</p>`;
+  const head = `<tr><th>Section</th><th>Transition (s)</th>${room.units.map((u) =>
+    `<th>${u.name || u.id}</th>`).join("")}</tr>`;
+  const rows = SECTIONS.map((sid) => {
+    const scene = (room.scenes || {})[sid] || {};
+    const trans = numField(`rooms.${i}.scenes.${sid}.transition_seconds`, scene.transition_seconds ?? 0);
+    const cells = room.units.map((u) => {
+      const mode = getPath(room, `scenes.${sid}.units.${u.id}.mode`, "auto");
+      return `<td><select data-path="rooms.${i}.scenes.${sid}.units.${u.id}.mode" data-live="1">
+        <option value="auto" ${mode === "auto" ? "selected" : ""}>auto</option>
+        <option value="off" ${mode === "off" ? "selected" : ""}>off</option>
+      </select></td>`;
+    }).join("");
+    return `<tr><td>${sid}</td><td>${trans}</td>${cells}</tr>`;
+  }).join("");
+  return `<h3>Scenes <span class="muted">(needs Deploy to take effect)</span></h3>
+    <table class="now">${head}${rows}</table>`;
 }
 
 function escapeHtml(s) {
