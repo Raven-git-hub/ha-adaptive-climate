@@ -280,14 +280,27 @@ async function renderAnalysis() {
   document.getElementById("an-prev").addEventListener("click", () => { shiftDay(-1); });
   document.getElementById("an-next").addEventListener("click", () => { shiftDay(1); });
 
-  let act;
+  // Fetch the selected day plus the two before it, for a 3-day window.
+  const days = [-2, -1, 0].map((d) => {
+    const dt = new Date(analysisState.day + "T00:00:00");
+    dt.setDate(dt.getDate() + d);
+    return dt.toISOString().slice(0, 10);
+  });
+  let parts;
   try {
-    act = await (await fetch(`/api/activity/${analysisState.room}?day=${analysisState.day}`)).json();
+    parts = await Promise.all(days.map((d) =>
+      fetch(`/api/activity/${analysisState.room}?day=${d}`).then((r) => r.json())));
   } catch {
     document.getElementById("an-msg").textContent = "could not load activity";
     return;
   }
-  drawAnalysis(act, rooms.find((r) => r.id === analysisState.room));
+  const act = {
+    heartbeats: parts.flatMap((p) => p.heartbeats || []).sort((a, b) => a.ts.localeCompare(b.ts)),
+    reactions: parts.flatMap((p) => p.reactions || []),
+    section_runs: parts.flatMap((p) => p.section_runs || []),
+    almanac: parts[parts.length - 1].almanac || {},   // current, from the selected day
+  };
+  drawAnalysis(act, rooms.find((r) => r.id === analysisState.room), days);
 }
 
 function shiftDay(delta) {
@@ -297,18 +310,21 @@ function shiftDay(delta) {
   renderAnalysis();
 }
 
-function drawAnalysis(act, room) {
+function drawAnalysis(act, room, days) {
   const chart = document.getElementById("an-chart");
   const legend = document.getElementById("an-legend");
   const hbs = act.heartbeats || [];
   if (!hbs.length) {
-    chart.innerHTML = `<p class="placeholder">No heartbeats recorded for this day yet.
+    chart.innerHTML = `<p class="placeholder">No heartbeats recorded in this window yet.
       A heartbeat lands every ten minutes; check back once some have accrued.</p>`;
     legend.innerHTML = "";
     return;
   }
 
   const toEpoch = (ts) => Math.floor(new Date(ts).getTime() / 1000);
+  // fixed 3-day window: 00:00 of the first day .. 00:00 after the last day
+  const xMin = Math.floor(new Date(days[0] + "T00:00:00").getTime() / 1000);
+  const xMax = Math.floor(new Date(days[days.length - 1] + "T00:00:00").getTime() / 1000) + 86400;
   const xs = hbs.map((h) => toEpoch(h.ts));
 
   const sensors = room.sensors;
@@ -354,7 +370,7 @@ function drawAnalysis(act, room) {
       if (!sec || !run.actual_start) continue;
       const x0 = u.valToPos(toEpoch(run.actual_start), "x", true);
       const x1 = run.ended_at ? u.valToPos(toEpoch(run.ended_at), "x", true)
-                              : u.bbox.top + u.bbox.width;
+                              : u.bbox.left + u.bbox.width;
       sensors.forEach((s, i) => {
         const sd = (sec.sensors || {})[s.id];
         if (!sd || sd.comfort == null) return;
@@ -376,7 +392,10 @@ function drawAnalysis(act, room) {
   const opts = {
     width: chart.clientWidth || 900,
     height: 420,
-    scales: { x: { time: true } },
+    scales: {
+      x: { time: true, range: [xMin, xMax] },
+      y: { range: [15, 30] },
+    },
     axes: [
       { stroke: "#8b95a5", grid: { stroke: "rgba(139,149,165,.08)" } },
       { stroke: "#8b95a5", grid: { stroke: "rgba(139,149,165,.08)" },
