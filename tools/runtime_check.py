@@ -165,6 +165,24 @@ async def main() -> int:
     print("reactive: automation-caused and guard-window changes correctly ignored - OK")
 
     await rt.stop()
+
+    # --- restart with almanac already seeded + select already on-section:
+    #     catch-up must NOT re-fire the scene (no gratuitous beep) ---
+    seeded_section = seeded_section  # from above
+    rest2 = StubRest(_build_states())
+    # HA now reports the scene select already sitting on the active section
+    active_now, _ = __import__("app.scheduler", fromlist=["active_section_at"]).active_section_at(
+        rt.rooms["main_room"].profile, rt._now()[3], rt.tz)
+    for s in rest2._states:
+        if s["entity_id"].startswith("input_select.ac_scene_"):
+            s["state"] = active_now
+    ws2 = StubWS()
+    rt2 = Runtime(CONFIG, store, rest2, ws2, tmp)   # same store: almanac persists
+    await rt2.start()
+    refires = [c for c in rest2.service_calls if c[:2] == ("automation", "trigger")]
+    assert refires == [], f"restart re-fired scenes (would beep): {refires}"
+    print("restart: almanac present + already in section -> no scene re-fire (no beep) - OK")
+    await rt2.stop()
     store.close()
     print("\nALL RUNTIME CHECKS PASSED")
     return 0

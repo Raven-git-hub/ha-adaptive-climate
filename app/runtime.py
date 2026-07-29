@@ -309,32 +309,45 @@ class Runtime:
         if rs.section and rs.section != section:
             self.store.close_section_run(room_id, local_date, rs.section, ts)
 
-        await self._seed_provisional_if_needed(rs, section)
+        seeded = await self._seed_provisional_if_needed(rs, section)
 
-        entity = self._automation_entity.get(scene_automation_id(room_id, section))
-        if entity:
-            await self._safe_service("automation", "trigger", {"entity_id": entity})
-        else:
-            # scene automation not deployed yet: at least set the scene select
-            await self._safe_service("input_select", "select_option",
-                                     {"entity_id": scene_select_id(room_id), "option": section})
+        # On startup catch-up, the world may already be in the right section
+        # (a plain restart, not real downtime). If HA's scene select already
+        # shows this section AND we didn't just have to seed a fresh almanac,
+        # don't re-fire the scene - re-driving the units is needless, and it
+        # makes the ACs beep on every restart. A genuine missed crossover
+        # (select disagrees) still re-fires, which is the point of catch-up.
+        already_here = self._cache.get(scene_select_id(room_id)) == section
+        refire = not (catch_up and already_here and not seeded)
+
+        if refire:
+            entity = self._automation_entity.get(scene_automation_id(room_id, section))
+            if entity:
+                await self._safe_service("automation", "trigger", {"entity_id": entity})
+            else:
+                await self._safe_service("input_select", "select_option",
+                                         {"entity_id": scene_select_id(room_id), "option": section})
 
         self.store.record_section_run(
             room_id, local_date, section,
             planned_start=started.isoformat(timespec="seconds") if started else None,
             actual_start=ts,
             outcome="caught_up" if catch_up else "ran")
+        note = " (catch-up)" if catch_up else ""
+        if not refire:
+            note = " (catch-up, already in section - not re-fired)"
         self.store.log_event(ts, ts_utc, "info", "crossover",
-                             f"{rs.room['name']} -> {section}"
-                             + (" (catch-up)" if catch_up else ""), room_id=room_id)
+                             f"{rs.room['name']} -> {section}{note}", room_id=room_id)
         rs.section, rs.section_started = section, started
-        log.info("crossover %s -> %s%s", room_id, section, " (catch-up)" if catch_up else "")
+        log.info("crossover %s -> %s%s", room_id, section, note)
 
-    async def _seed_provisional_if_needed(self, rs: RoomState, section: str) -> None:
+    async def _seed_provisional_if_needed(self, rs: RoomState, section: str) -> bool:
+        """Seed a provisional almanac from current state if none is in force
+        for this section. Returns True if it seeded, False if one existed."""
         room_id = rs.room["id"]
         current = self.store.current_almanac(room_id, as_of=date.today())
         if section in current.get("sections", {}):
-            return  # already have something in force for this section
+            return False  # already have something in force for this section
 
         low_dev = self._sys.get("trust", {}).get("low_trust_deviation", 5.0)
         states = {s["entity_id"]: s for s in await self.rest.states()}
@@ -361,6 +374,7 @@ class Runtime:
         self.store.log_event(ts, ts_utc, "info", "almanac",
                              f"seeded provisional {section} for {rs.room['name']}",
                              room_id=room_id)
+        return True
 
     # ---- almanac push ---------------------------------------------
 
