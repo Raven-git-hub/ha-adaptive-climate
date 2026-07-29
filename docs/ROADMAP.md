@@ -12,7 +12,7 @@ the start of the rebuild, with the design settled enough to begin the contract.
 | 4 | Analyser: setpoint learning + per-sensor comfort/trust/band | **in progress** — `app/analyser.py` (built + tested), almanac contract in `docs/ALMANAC_FORMAT.md` |
 | 5 | Generator: helpers, AC state machine, maintenance/quorum, leak | **in progress** — helpers/scene/leak/watchdog built + render-tested; maintenance/quorum template next |
 | 6 | Scheduler: clock-only boundary computation (no sun) | todo — `app/scheduler.py` |
-| 7 | HA client (REST + WebSocket) and connection doctor | todo — `app/ha.py`, `tools/doctor.py` |
+| 7 | HA client (REST + WebSocket) and connection doctor | **done** — `app/ha.py` (fake-HA integration-tested), `tools/doctor.py` (6-step diagnostic) |
 | 8 | Storage layer: dual CSV/SQLite writes, event log, CSV re-ingest | todo — `app/store.py` |
 | 9 | Config loader: schema validation, defaults, cross-reference checks | todo — `app/config.py` |
 | 10 | Runtime: scheduler, observer, reactive detector, almanac push, leak latch | todo — `app/runtime.py` |
