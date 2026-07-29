@@ -9,7 +9,7 @@ the start of the rebuild, with the design settled enough to begin the contract.
 | 1 | Config schema — the contract everything else derives from | **in progress** — `schema/config.schema.json` |
 | 2 | Storage: SQLite DDL, CSV layout, event log | **in progress** — `schema/storage.schema.sql` |
 | 3 | Trust model + quorum design and the pure-function core | **drafted** — `docs/TRUST_MODEL.md`, `app/trust.py` |
-| 4 | Analyser: setpoint learning + per-sensor comfort/trust/band | todo — `app/analyser.py` |
+| 4 | Analyser: setpoint learning + per-sensor comfort/trust/band | **in progress** — `app/analyser.py` (built + tested), almanac contract in `docs/ALMANAC_FORMAT.md` |
 | 5 | Generator: helpers, AC state machine, maintenance/quorum, leak | todo — `app/generator.py` |
 | 6 | Scheduler: clock-only boundary computation (no sun) | todo — `app/scheduler.py` |
 | 7 | HA client (REST + WebSocket) and connection doctor | todo — `app/ha.py`, `tools/doctor.py` |
@@ -20,15 +20,15 @@ the start of the rebuild, with the design settled enough to begin the contract.
 | 12 | UI shell, status strip, Config and Log | todo — `app/static/` |
 | 13 | UI — Now (live dashboard, per-sensor bands, AC state) | todo |
 | 14 | UI — Analysis (day chart, uPlot) | todo |
-| 15 | UI — Almanac (setpoint + per-sensor trust/band, settling sparkline) | todo |
+| 15 | UI — Almanac (setpoint + per-sensor trust/band, settling sparkline) | **started** — Almanac view + `/api/almanac`, `/api/analysis/run` live |
 | 16 | Home Assistant add-on packaging | later |
 | 17 | User-customisable AC state profiles | later |
 
 ## First decisions to make (Phase 4 gate)
 
-1. **Where the quorum maintenance loop runs** — Home Assistant templates
-   (resilient, richer) vs. the container (simpler, pauses on downtime). Current
-   lean: HA, to preserve "HA owns behaviour". See `docs/DESIGN.md` D4.
+1. **Where the quorum maintenance loop runs** — DECIDED: Home Assistant
+   templates, preserving "HA owns behaviour". See `docs/DESIGN.md` D4 and the
+   almanac contract in `docs/ALMANAC_FORMAT.md`.
 2. **Occupancy** — whether presence gates learning or drives an empty-room
    action, or is ignored. Schema reserves an optional slot so this is not a
    migration. See `docs/DESIGN.md` open decisions.

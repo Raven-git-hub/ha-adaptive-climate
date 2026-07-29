@@ -101,10 +101,12 @@ current_temp) rather than a single 0–255 int.
 Light nudged whenever measured lux left a simple margin around the target.
 Climate tallies per-sensor votes and acts only when the quorum is met, stopping
 when the tally falls below quorum or after one hour. See `docs/TRUST_MODEL.md`
-for the voting rules. **Open decision (Phase 4):** whether the quorum loop runs
-in HA templates (resilient, richer templates) or in the container (simpler
-templates, pauses on container downtime). Current lean: keep it in HA to
-preserve principle 2.
+for the voting rules. **Decided:** the quorum loop runs in **Home Assistant
+templates**, on HA's own clock, preserving principle 2 (HA owns behaviour) and
+surviving container downtime. The container's job is to publish an almanac
+carrying everything the template needs — per-unit setpoint, per-sensor comfort
+and band — in the shape fixed by `docs/ALMANAC_FORMAT.md`. The generated
+maintenance template is Phase 5.
 
 ### D5. Sun machinery removed entirely
 
@@ -141,7 +143,6 @@ image and container names.
 
 ## Open decisions still to settle
 
-- **Where the quorum loop runs** (D4) — first decision of Phase 4.
 - **Occupancy.** Light used presence to gate whether a heartbeat was eligible for
   learning. Climate is currently silent on it. Decide whether an empty room
   should stop cooling / suspend learning, or whether presence is irrelevant here.
