@@ -70,3 +70,34 @@ tr.empty td { color: var(--muted); }
   padding: .8rem; margin-top: .8rem; font-size: .8rem; white-space: pre-wrap;
   max-height: 320px; overflow: auto;
 }
+
+/* --- Analysis view --- */
+.toolbar select, .toolbar input[type="date"] {
+  background: var(--panel); color: var(--ink); border: 1px solid var(--band);
+  border-radius: 6px; padding: .35rem .5rem;
+}
+.toolbar button { background: var(--band); color: var(--ink); border: 0;
+  padding: .4rem .7rem; border-radius: 6px; cursor: pointer; }
+.legend { display: flex; flex-wrap: wrap; gap: 1rem; margin: .5rem 0 1rem; font-size: .85rem; }
+.legend .key { display: inline-flex; align-items: center; gap: .4rem; color: var(--muted); }
+.legend .key i { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+.legend .key i.dash { background: repeating-linear-gradient(90deg,#8b95a5 0 4px,transparent 4px 7px); }
+#an-chart { min-height: 420px; }
+/* uPlot dark theming */
+.uplot, .u-wrap { background: transparent !important; }
+.u-title, .u-legend { color: var(--ink); }
+.u-axis { color: var(--muted); }
+
+/* --- Log view --- */
+table.log { border-collapse: collapse; width: 100%; font-size: .85rem; }
+table.log th, table.log td { text-align: left; padding: .35rem .6rem;
+  border-bottom: 1px solid var(--band); vertical-align: top; }
+table.log th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--bg); }
+table.log tr.ev:hover { background: var(--panel); }
+.sev { font-size: .72em; text-transform: uppercase; padding: .1rem .4rem; border-radius: 4px; }
+.sev.debug { background: var(--band); color: var(--muted); }
+.sev.info { background: #123047; color: var(--accent); }
+.sev.warning { background: #3a2f12; color: var(--warn); }
+.sev.error { background: #3a1414; color: var(--err); }
+table.log tr.detail pre { margin: 0; padding: .5rem .7rem; background: var(--panel);
+  border-radius: 6px; font-size: .78rem; white-space: pre-wrap; }

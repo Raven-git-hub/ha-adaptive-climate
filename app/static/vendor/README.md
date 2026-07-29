@@ -1,6 +1,11 @@
 # Vendored front-end libraries
 
-Drop `uPlot.min.js` and `uPlot.min.css` here in Phase 14 (Analysis chart).
-Pin the version in a comment when you do, matching whatever Adaptive Light
-vendored, so the two UIs stay consistent. No build step; index.html
-references these files directly.
+uPlot v1.6.31 (https://github.com/leeoniya/uPlot), used by the Analysis view.
+Files are the npm `dist` IIFE build (exposes the `uPlot` global; no build step):
+
+  - uPlot.iife.min.js
+  - uPlot.min.css
+
+index.html references these directly. To update, replace both files from the
+matching npm tarball (registry.npmjs.org/uplot/-/uplot-<version>.tgz, dist/)
+and bump the version here.

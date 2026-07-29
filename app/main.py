@@ -159,6 +159,28 @@ def api_almanac(room_id: str) -> dict:
     return state.store.current_almanac(room_id)
 
 
+@app.get("/api/events")
+def api_events(limit: int = 200, room_id: str | None = None,
+               category: str | None = None, severity: str | None = None) -> dict:
+    """The Log view feed."""
+    if not state.store:
+        raise HTTPException(503, "store not ready")
+    return {"events": state.store.recent_events(
+        limit=min(limit, 1000), room_id=room_id, category=category, severity=severity)}
+
+
+@app.get("/api/activity/{room_id}")
+def api_activity(room_id: str, day: str | None = None) -> dict:
+    """One room, one day: heartbeats, reactions, section runs (for the
+    Analysis chart), plus the almanac in force (for the comfort bands)."""
+    if not state.store:
+        raise HTTPException(503, "store not ready")
+    d = day or date.today().isoformat()
+    act = state.store.activity(room_id, d)
+    act["almanac"] = state.store.current_almanac(room_id).get("sections", {})
+    return act
+
+
 @app.post("/api/analysis/run")
 async def api_run_analysis() -> dict:
     """Rebuild almanacs now. When the runtime is live this also pushes the

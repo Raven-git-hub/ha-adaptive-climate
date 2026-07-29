@@ -239,7 +239,16 @@ class Store:
         q += " ORDER BY ts_utc DESC LIMIT ?"; params.append(limit)
         with self._lock:
             rows = self._conn.execute(q, params).fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            if d.get("detail"):
+                try:
+                    d["detail"] = json.loads(d["detail"])
+                except (json.JSONDecodeError, TypeError):
+                    pass  # leave as-is if it wasn't JSON
+            out.append(d)
+        return out
 
     def activity(self, room_id: str, day: str) -> dict:
         """Everything the Analysis view needs for one room/day: heartbeats

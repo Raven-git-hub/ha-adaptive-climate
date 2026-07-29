@@ -10,10 +10,10 @@ const fmt = (x, d = 1) => (x === null || x === undefined ? "—" : Number(x).toF
 
 const views = {
   now:      renderNow,
-  analysis: () => placeholder("Analysis"),
+  analysis: renderAnalysis,
   almanac:  renderAlmanac,
   config:   renderConfig,
-  log:      () => placeholder("Log"),
+  log:      renderLog,
 };
 
 document.querySelectorAll("#tabs button").forEach((b) => {
@@ -238,4 +238,250 @@ async function renderConfig() {
 
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ---- Analysis ------------------------------------------------------
+
+const SENSOR_COLORS = ["#4bb3fd", "#4fd6a0", "#e0a030", "#c78bff", "#ff8f6b"];
+const analysisState = { room: null, day: null };
+
+async function renderAnalysis() {
+  view.innerHTML = `<p class="placeholder">Loading\u2026</p>`;
+  let rooms;
+  try {
+    rooms = (await (await fetch("/api/rooms")).json()).rooms;
+  } catch {
+    view.innerHTML = `<p class="placeholder">Could not reach the API.</p>`;
+    return;
+  }
+  if (!rooms.length) { view.innerHTML = `<p class="placeholder">No rooms configured.</p>`; return; }
+  if (!analysisState.room || !rooms.find((r) => r.id === analysisState.room))
+    analysisState.room = rooms[0].id;
+  if (!analysisState.day) analysisState.day = new Date().toISOString().slice(0, 10);
+
+  view.innerHTML = `
+    <div class="toolbar">
+      <select id="an-room">${rooms.map((r) =>
+        `<option value="${r.id}" ${r.id === analysisState.room ? "selected" : ""}>${r.name}</option>`).join("")}</select>
+      <button id="an-prev">\u2039 prev</button>
+      <input type="date" id="an-date" value="${analysisState.day}" />
+      <button id="an-next">next \u203a</button>
+      <span id="an-msg" class="muted"></span>
+    </div>
+    <div id="an-legend" class="legend"></div>
+    <div id="an-chart"></div>`;
+
+  document.getElementById("an-room").addEventListener("change", (e) => {
+    analysisState.room = e.target.value; renderAnalysis();
+  });
+  document.getElementById("an-date").addEventListener("change", (e) => {
+    analysisState.day = e.target.value; renderAnalysis();
+  });
+  document.getElementById("an-prev").addEventListener("click", () => { shiftDay(-1); });
+  document.getElementById("an-next").addEventListener("click", () => { shiftDay(1); });
+
+  let act;
+  try {
+    act = await (await fetch(`/api/activity/${analysisState.room}?day=${analysisState.day}`)).json();
+  } catch {
+    document.getElementById("an-msg").textContent = "could not load activity";
+    return;
+  }
+  drawAnalysis(act, rooms.find((r) => r.id === analysisState.room));
+}
+
+function shiftDay(delta) {
+  const d = new Date(analysisState.day + "T00:00:00");
+  d.setDate(d.getDate() + delta);
+  analysisState.day = d.toISOString().slice(0, 10);
+  renderAnalysis();
+}
+
+function drawAnalysis(act, room) {
+  const chart = document.getElementById("an-chart");
+  const legend = document.getElementById("an-legend");
+  const hbs = act.heartbeats || [];
+  if (!hbs.length) {
+    chart.innerHTML = `<p class="placeholder">No heartbeats recorded for this day yet.
+      A heartbeat lands every ten minutes; check back once some have accrued.</p>`;
+    legend.innerHTML = "";
+    return;
+  }
+
+  const toEpoch = (ts) => Math.floor(new Date(ts).getTime() / 1000);
+  const xs = hbs.map((h) => toEpoch(h.ts));
+
+  const sensors = room.sensors;
+  const units = room.units;
+  // one y-series per sensor (temperature), plus one per unit (setpoint)
+  const sensorSeries = sensors.map((s) => hbs.map((h) => h.sensors[s.id] ?? null));
+  const unitSeries = units.map((u) => hbs.map((h) => (h.units[u.id] || {}).setpoint ?? null));
+
+  const data = [xs, ...sensorSeries, ...unitSeries];
+
+  const series = [{}];
+  sensors.forEach((s, i) => series.push({
+    label: s.name, stroke: SENSOR_COLORS[i % SENSOR_COLORS.length], width: 2,
+    points: { show: false },
+  }));
+  units.forEach((u) => series.push({
+    label: u.name + " setpoint", stroke: "#8b95a5", width: 1.5, dash: [6, 4],
+    points: { show: false },
+  }));
+
+  // section spans + comfort bands + reaction markers, drawn under the lines
+  const runs = act.section_runs || [];
+  const almanac = act.almanac || {};
+  const reactions = (act.reactions || []).map((r) => toEpoch(r.ts));
+
+  const bandHook = (u) => {
+    const ctx = u.ctx;
+    ctx.save();
+    // section boundary verticals + labels
+    for (const run of runs) {
+      if (!run.actual_start) continue;
+      const x = u.valToPos(toEpoch(run.actual_start), "x", true);
+      ctx.strokeStyle = "rgba(139,149,165,.25)";
+      ctx.setLineDash([2, 3]); ctx.beginPath();
+      ctx.moveTo(x, u.bbox.top); ctx.lineTo(x, u.bbox.top + u.bbox.height); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(139,149,165,.7)"; ctx.font = "10px system-ui";
+      ctx.fillText(run.section, x + 3, u.bbox.top + 11);
+    }
+    // comfort bands per sensor per section (faint fill)
+    for (const run of runs) {
+      const sec = almanac[run.section];
+      if (!sec || !run.actual_start) continue;
+      const x0 = u.valToPos(toEpoch(run.actual_start), "x", true);
+      const x1 = run.ended_at ? u.valToPos(toEpoch(run.ended_at), "x", true)
+                              : u.bbox.top + u.bbox.width;
+      sensors.forEach((s, i) => {
+        const sd = (sec.sensors || {})[s.id];
+        if (!sd || sd.comfort == null) return;
+        const yTop = u.valToPos(sd.comfort + (sd.band ?? 0), "y", true);
+        const yBot = u.valToPos(sd.comfort - (sd.band ?? 0), "y", true);
+        ctx.fillStyle = hexToRgba(SENSOR_COLORS[i % SENSOR_COLORS.length], 0.06);
+        ctx.fillRect(x0, yTop, Math.max(1, x1 - x0), yBot - yTop);
+      });
+    }
+    // reaction markers
+    for (const rx of reactions) {
+      const x = u.valToPos(rx, "x", true);
+      ctx.strokeStyle = "#e05252"; ctx.setLineDash([]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(x, u.bbox.top); ctx.lineTo(x, u.bbox.top + u.bbox.height); ctx.stroke();
+    }
+    ctx.restore();
+  };
+
+  const opts = {
+    width: chart.clientWidth || 900,
+    height: 420,
+    scales: { x: { time: true } },
+    axes: [
+      { stroke: "#8b95a5", grid: { stroke: "rgba(139,149,165,.08)" } },
+      { stroke: "#8b95a5", grid: { stroke: "rgba(139,149,165,.08)" },
+        label: "\u00b0C", labelSize: 30 },
+    ],
+    series,
+    hooks: { drawClear: [bandHook] },
+    legend: { show: false },
+  };
+
+  chart.innerHTML = "";
+  try {
+    const plot = new uPlot(opts, data, chart);
+    window.addEventListener("resize", () => plot.setSize({ width: chart.clientWidth, height: 420 }),
+      { once: true });
+  } catch (e) {
+    chart.innerHTML = `<p class="placeholder">Chart failed to render: ${e.message}</p>`;
+    return;
+  }
+
+  legend.innerHTML = sensors.map((s, i) =>
+    `<span class="key"><i style="background:${SENSOR_COLORS[i % SENSOR_COLORS.length]}"></i>${s.name}</span>`).join("")
+    + units.map((u) => `<span class="key"><i class="dash"></i>${u.name} setpoint</span>`).join("")
+    + `<span class="key"><i style="background:#e05252"></i>your intervention</span>`
+    + `<span class="muted">${reactions.length === 0 ? "\u2014 a day with no red marks is a day it got right" : ""}</span>`;
+}
+
+function hexToRgba(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+// ---- Log -----------------------------------------------------------
+
+const logState = { room: "", category: "", severity: "" };
+const CATEGORIES = ["crossover", "maintenance", "quorum", "correction", "reactive",
+  "hold", "heartbeat", "analysis", "almanac", "leak", "connection", "deploy",
+  "config", "validation"];
+const SEVERITIES = ["debug", "info", "warning", "error"];
+
+async function renderLog() {
+  view.innerHTML = `<p class="placeholder">Loading log\u2026</p>`;
+  let rooms = [];
+  try { rooms = (await (await fetch("/api/rooms")).json()).rooms; } catch {}
+
+  const sel = (id, opts, cur) =>
+    `<select id="${id}"><option value="">all</option>${opts.map((o) =>
+      `<option value="${o.v ?? o}" ${(o.v ?? o) === cur ? "selected" : ""}>${o.t ?? o}</option>`).join("")}</select>`;
+
+  view.innerHTML = `
+    <div class="toolbar">
+      ${sel("log-room", rooms.map((r) => ({ v: r.id, t: r.name })), logState.room)}
+      ${sel("log-cat", CATEGORIES, logState.category)}
+      ${sel("log-sev", SEVERITIES, logState.severity)}
+      <button id="log-refresh">refresh</button>
+      <span id="log-msg" class="muted"></span>
+    </div>
+    <table class="log"><thead><tr><th>Time</th><th>Room</th><th>Severity</th>
+      <th>Category</th><th>Message</th></tr></thead><tbody id="log-body"></tbody></table>`;
+
+  const apply = () => {
+    logState.room = document.getElementById("log-room").value;
+    logState.category = document.getElementById("log-cat").value;
+    logState.severity = document.getElementById("log-sev").value;
+    loadLog();
+  };
+  ["log-room", "log-cat", "log-sev"].forEach((id) =>
+    document.getElementById(id).addEventListener("change", apply));
+  document.getElementById("log-refresh").addEventListener("click", loadLog);
+
+  loadLog();
+}
+
+async function loadLog() {
+  const body = document.getElementById("log-body");
+  const msg = document.getElementById("log-msg");
+  const qs = new URLSearchParams();
+  if (logState.room) qs.set("room_id", logState.room);
+  if (logState.category) qs.set("category", logState.category);
+  if (logState.severity) qs.set("severity", logState.severity);
+  let events;
+  try {
+    events = (await (await fetch("/api/events?" + qs.toString())).json()).events;
+  } catch {
+    msg.textContent = "could not load log"; return;
+  }
+  msg.textContent = `${events.length} event(s)`;
+  if (!events.length) {
+    body.innerHTML = `<tr class="empty"><td colspan="5">nothing logged yet for this filter</td></tr>`;
+    return;
+  }
+  body.innerHTML = events.map((e, i) => {
+    const t = (e.ts || "").replace("T", " ").slice(0, 19);
+    const detail = e.detail ? `<tr class="detail" id="d${i}" hidden><td colspan="5"><pre>${
+      escapeHtml(typeof e.detail === "string" ? e.detail : JSON.stringify(e.detail, null, 2))}</pre></td></tr>` : "";
+    return `<tr class="ev ${e.severity}" ${e.detail ? `data-d="d${i}"` : ""}>
+      <td>${t}</td><td>${e.room_id ?? "\u2014"}</td>
+      <td><span class="sev ${e.severity}">${e.severity}</span></td>
+      <td>${e.category}</td><td>${escapeHtml(e.message)}</td></tr>${detail}`;
+  }).join("");
+  body.querySelectorAll("tr.ev[data-d]").forEach((row) => {
+    row.style.cursor = "pointer";
+    row.addEventListener("click", () => {
+      const d = document.getElementById(row.dataset.d);
+      if (d) d.hidden = !d.hidden;
+    });
+  });
 }
