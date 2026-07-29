@@ -1,18 +1,28 @@
 """
 Adaptive Climate - helper and automation generator.
 
-Emits the Home Assistant helpers and automations from the config. Nothing
-here bakes in a learned value: the generator emits templates that read the
-almanac at runtime, so changing a band or a mode needs only an almanac
-republish - regeneration is required only when *entities* change.
-
-Generation uses PyYAML over Python data structures, never a template
-engine (rendering Jinja to produce Jinja consumes the inner pass). Output
+Pure and offline: config in, helper specs + automation configs out. No HA
+connection, no learned state baked in. The emitted automations read the
+almanac (sensor.ac_almanac_<room>) and the live entity attributes at
+runtime, so changing a band, a setpoint or a mode needs only an almanac
+republish - regeneration is required only when *entities* change. Output
 is deterministic, so regeneration is a safe overwrite.
 
-STATUS: skeleton. The naming block below is final and load-bearing; the
-build_* functions are stubbed pending the Phase 5 decision on where the
-quorum/maintenance loop runs (see docs/DESIGN.md D4).
+Everything emitted is namespaced `ac_*`, derived from the room's stable
+id. That naming is what lets deploy (Phase 11) own our artifacts
+completely - create, update, prune our own - while never touching a
+foreign automation. Conflict handling lives in deploy, not here: this
+module never looks at what is already in HA.
+
+Per-unit hardware differences (fan availability, temperature step, min/max
+range - see docs/HARDWARE.md) are handled inside the generated templates by
+reading the unit's own attributes at runtime, so one generated automation
+adapts to each unit and to the dry-mode-hides-fan quirk.
+
+STATUS: helpers, scene (crossover), leak and watchdog generation are
+implemented and render-tested (tools/render_generated.py). The
+maintenance/quorum template is the next Phase 5 sub-step (see
+build_maintenance_automation).
 """
 
 from __future__ import annotations
@@ -26,7 +36,8 @@ SECTIONS = ("sunrise", "day", "afternoon", "sunset", "night", "sleep")
 
 
 # ---------------------------------------------------------------------
-# YAML serialisation
+# YAML serialisation (for human inspection / the render harness; the
+# canonical output is the Python dicts that deploy consumes over the API)
 # ---------------------------------------------------------------------
 
 class _Dumper(yaml.SafeDumper):
@@ -51,11 +62,6 @@ def dump(obj: Any) -> str:
 
 # ---------------------------------------------------------------------
 # Naming - single source of truth for every generated entity id.
-#
-# The 'ac_' prefix (not Light's 'al_') lets both systems coexist on one
-# host. Every id derives from the room's stable id, never its display
-# name, so the object id HA derives always matches what the automations
-# reference.
 # ---------------------------------------------------------------------
 
 def guard_id(room: str) -> str:        return f"input_boolean.ac_active_{room}"
@@ -78,100 +84,244 @@ def maintenance_automation_id(room: str) -> str:
 def leak_automation_id(room: str, unit: str) -> str:
     return f"ac_leak_{room}_{unit}"
 
+def watchdog_automation_id(room: str) -> str:
+    return f"ac_watchdog_{room}"
 
-# ---------------------------------------------------------------------
-# Section resolution
-# ---------------------------------------------------------------------
+
+def _split(entity_id: str) -> tuple[str, str]:
+    """('input_boolean.ac_hold_x') -> ('input_boolean', 'ac_hold_x')."""
+    domain, _, object_id = entity_id.partition(".")
+    return domain, object_id
+
+
+def _enabled_rooms(config: dict) -> list[dict]:
+    return [r for r in config.get("rooms", []) if r.get("enabled", True)]
+
 
 def _sections_for(config: dict, room: dict) -> list[dict]:
     profiles = {p["id"]: p for p in config.get("schedule_profiles", [])}
     profile = profiles.get(room.get("schedule_profile", "default")) \
-              or profiles.get("default") or config["schedule_profiles"][0]
+        or profiles.get("default") or config["schedule_profiles"][0]
     by_id = {s["id"]: s for s in profile["sections"]}
     return [by_id[s] for s in SECTIONS]
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-
-def build_helpers(config: dict) -> dict[str, str]:
-    """Return {path: yaml} for input_boolean / input_select packages.
-
-    Per room: ac_active, ac_hold, ac_scene. Per leak-enabled unit:
-    ac_leak_<room>_<unit> and ac_leak_confirmed_<room>_<unit>.
-
-    TODO(Phase 5): implement. Mirror Light's build_helpers, add the leak
-    latch pair for units with leak_detection.enabled.
-    """
-    raise NotImplementedError("Phase 5")
+def _leak_units(room: dict) -> list[dict]:
+    return [u for u in room["units"]
+            if u.get("leak_detection", {}).get("enabled")]
 
 
 # ---------------------------------------------------------------------
-# Scene automations (crossover)
+# Helpers  ->  list of {domain, object_id, name, ...} specs
+# Deploy creates each over the WebSocket API (input_boolean/input_select).
+# name == object_id so it slugifies back to itself (docs/DESIGN.md 13).
+# ---------------------------------------------------------------------
+
+def build_helpers(config: dict) -> list[dict]:
+    specs: list[dict] = []
+
+    def boolean(entity_id: str) -> dict:
+        domain, obj = _split(entity_id)
+        return {"domain": domain, "object_id": obj, "name": obj}
+
+    for room in _enabled_rooms(config):
+        r = room["id"]
+        specs.append(boolean(guard_id(r)))
+        specs.append(boolean(hold_id(r)))
+        domain, obj = _split(scene_select_id(r))
+        specs.append({"domain": domain, "object_id": obj, "name": obj,
+                      "options": list(SECTIONS)})
+        for unit in _leak_units(room):
+            specs.append(boolean(leak_id(r, unit["id"])))
+            specs.append(boolean(leak_confirm_id(r, unit["id"])))
+    return specs
+
+
+# ---------------------------------------------------------------------
+# Templated per-unit drive (Normal state), reading almanac + live attrs.
+# Sentinel tokens keep the Jinja braces clear of Python formatting.
+# ---------------------------------------------------------------------
+
+def _unit_lookup(alm: str, section: str, unit_id: str) -> str:
+    return ("{% set secs = state_attr('<<ALM>>','sections') or {} %}"
+            "{% set u = ((secs.get('<<S>>') or {}).get('units') or {}).get('<<U>>') or {} %}"
+            ).replace("<<ALM>>", alm).replace("<<S>>", section).replace("<<U>>", unit_id)
+
+
+def _off_condition(alm: str, section: str, unit_id: str) -> str:
+    return (_unit_lookup(alm, section, unit_id)
+            + "{{ (u.get('off')) or (u.get('setpoint') is none) }}")
+
+
+def _setpoint_template(alm: str, section: str, unit_id: str, entity: str) -> str:
+    return (_unit_lookup(alm, section, unit_id) +
+            "{% set sp = u.get('setpoint') %}"
+            "{% set step = state_attr('<<E>>','target_temp_step') or 1 %}"
+            "{% set lo = state_attr('<<E>>','min_temp') or 16 %}"
+            "{% set hi = state_attr('<<E>>','max_temp') or 30 %}"
+            "{% set snapped = ((sp / step) | round(0)) * step %}"
+            "{{ [[snapped, lo] | max, hi] | min }}"
+            ).replace("<<E>>", entity)
+
+
+def _fan_supported_template(entity: str) -> str:
+    return "{{ 'low' in (state_attr('<<E>>','fan_modes') or []) }}".replace("<<E>>", entity)
+
+
+def _set(service: str, entity: str, data: dict | None = None) -> dict:
+    step: dict = {"service": service, "target": {"entity_id": entity}}
+    if data:
+        step["data"] = data
+    return step
+
+
+def _drive_unit(alm: str, section: str, unit: dict, forced_off: bool) -> dict:
+    """One action step: force off, or drive to the Normal state (cool,
+    snapped+clamped almanac setpoint, fan low if the unit supports it)."""
+    e = unit["entity_id"]
+    if forced_off:
+        return _set("climate.set_hvac_mode", e, {"hvac_mode": "off"})
+    return {
+        "choose": [{
+            "conditions": [{"condition": "template",
+                            "value_template": _off_condition(alm, section, unit["id"])}],
+            "sequence": [_set("climate.set_hvac_mode", e, {"hvac_mode": "off"})],
+        }],
+        "default": [
+            _set("climate.set_hvac_mode", e, {"hvac_mode": "cool"}),
+            _set("climate.set_temperature", e,
+                 {"temperature": _setpoint_template(alm, section, unit["id"], e)}),
+            {"choose": [{
+                "conditions": [{"condition": "template",
+                                "value_template": _fan_supported_template(e)}],
+                "sequence": [_set("climate.set_fan_mode", e, {"fan_mode": "low"})],
+            }], "default": []},
+        ],
+    }
+
+
+# ---------------------------------------------------------------------
+# Scene automation (crossover) - one per room per section.
+# Fired by the container via automation.trigger at the boundary.
 # ---------------------------------------------------------------------
 
 def build_scene_automation(config: dict, room: dict, section: dict) -> dict:
-    """One automation per room per section, fired by the container via
-    automation.trigger.
+    r = room["id"]
+    sid = section["id"]
+    alm = almanac_id(r)
+    scenes = room.get("scenes", {})
+    unit_modes = (scenes.get(sid, {}).get("units", {}))
+    transition = int(scenes.get(sid, {}).get("transition_seconds", 0) or 0)
 
-    On crossover it: raises the guard, clears the hold, sets the scene
-    select, reads the almanac, and for each unit either forces it off
-    (baked-in override) or drives it to the learned setpoint in the
-    Normal state (fan LOW, mode COOL, setpoint = almanac). Emits
-    conditions: [] because automation.trigger defaults to
-    skip_condition: true.
+    actions: list[dict] = [
+        _set("input_boolean.turn_on", guard_id(r)),
+        _set("input_select.select_option", scene_select_id(r), {"option": sid}),
+        _set("input_boolean.turn_off", hold_id(r)),
+    ]
+    for unit in room["units"]:
+        forced_off = unit_modes.get(unit["id"], {}).get("mode", "auto") == "off"
+        actions.append(_drive_unit(alm, sid, unit, forced_off))
+    if transition > 0:
+        actions.append({"delay": {"seconds": transition}})
+    actions.append(_set("input_boolean.turn_off", guard_id(r)))
 
-    TODO(Phase 5): implement, driving the climate entity via
-    climate.set_temperature / set_hvac_mode / set_fan_mode.
-    """
-    raise NotImplementedError("Phase 5")
-
-
-# ---------------------------------------------------------------------
-# Maintenance / quorum automation
-# ---------------------------------------------------------------------
-
-def build_maintenance_automation(config: dict, room: dict) -> dict:
-    """Runs on HA's own clock so correction continues if the container is
-    down. Evaluates the per-sensor quorum against the almanac's comfort
-    and band values, and when met, drives units into Cooling/Warming and
-    nudges the setpoint by at most max_step_degrees, honouring the guard
-    and hold booleans.
-
-    OPEN DECISION (docs/DESIGN.md D4): whether the quorum tally + the
-    "stop below quorum or after an hour" latch live here in templates or
-    in the container. This stub assumes HA. Do not implement until that
-    is settled.
-
-    TODO(Phase 5).
-    """
-    raise NotImplementedError("Phase 5 - pending D4")
+    return {
+        "id": scene_automation_id(r, sid),
+        "alias": f"AC {room.get('name', r)} \u2014 {section.get('name', sid)}",
+        "mode": "restart",
+        "trigger": [],          # fired by the container via automation.trigger
+        "condition": [],        # skip_condition defaults true for automation.trigger
+        "action": actions,
+    }
 
 
 # ---------------------------------------------------------------------
-# Leak automation (stub the user wires their own sensor into)
+# Leak automation - a stub the user wires their own leak sensor into,
+# plus the confirm-to-release side of the latch (docs/DESIGN.md D6).
 # ---------------------------------------------------------------------
 
 def build_leak_automation(config: dict, room: dict, unit: dict) -> dict:
-    """A stub automation whose trigger the user fills with their own leak
-    sensor. It raises ac_leak_<room>_<unit>; the maintenance automation
-    reads that boolean to drive Leak mode (DRY). Release is latched on
-    (no leak) AND (ac_leak_confirmed_<room>_<unit>).
+    r, u = room["id"], unit["id"]
+    return {
+        "id": leak_automation_id(r, u),
+        "alias": f"AC {room.get('name', r)} \u2014 leak latch ({unit.get('name', u)})",
+        "mode": "queued",
+        # The user adds their leak-sensor trigger here (e.g. a binary_sensor
+        # going 'on'). Left empty so it is theirs to wire.
+        "trigger": [],
+        "condition": [],
+        "action": [_set("input_boolean.turn_on", leak_id(r, u))],
+    }
 
-    TODO(Phase 5).
-    """
-    raise NotImplementedError("Phase 5")
+
+def build_leak_release_automation(config: dict, room: dict, unit: dict) -> dict:
+    """Latch release: fires when the user confirms the fix. The 'no longer
+    detected' half is the user's to add as a condition referencing their own
+    leak sensor (we cannot know that entity)."""
+    r, u = room["id"], unit["id"]
+    return {
+        "id": f"{leak_automation_id(r, u)}_release",
+        "alias": f"AC {room.get('name', r)} \u2014 leak release ({unit.get('name', u)})",
+        "mode": "single",
+        "trigger": [{"platform": "state", "entity_id": leak_confirm_id(r, u), "to": "on"}],
+        # Optional: user adds a condition that their leak sensor is clear.
+        "condition": [],
+        "action": [
+            _set("input_boolean.turn_off", leak_id(r, u)),
+            _set("input_boolean.turn_off", leak_confirm_id(r, u)),
+        ],
+    }
 
 
 # ---------------------------------------------------------------------
-# Watchdogs
+# Watchdog - clear a guard boolean stuck on too long, since a stuck guard
+# silently disables both maintenance and observation. One per room.
 # ---------------------------------------------------------------------
 
-def build_watchdogs(config: dict) -> list[dict]:
-    """A stuck guard silently disables both maintenance and observation,
-    so a watchdog clears one left on too long. Mirror Light.
+def build_watchdog_automation(config: dict, room: dict) -> dict:
+    r = room["id"]
+    return {
+        "id": watchdog_automation_id(r),
+        "alias": f"AC {room.get('name', r)} \u2014 guard watchdog",
+        "mode": "single",
+        "trigger": [{"platform": "state", "entity_id": guard_id(r),
+                     "to": "on", "for": {"minutes": 5}}],
+        "condition": [],
+        "action": [_set("input_boolean.turn_off", guard_id(r))],
+    }
 
-    TODO(Phase 5).
+
+# ---------------------------------------------------------------------
+# Maintenance / quorum automation - NEXT Phase 5 sub-step.
+# ---------------------------------------------------------------------
+
+def build_maintenance_automation(config: dict, room: dict) -> dict:
+    """Runs on HA's clock (D4 decided: HA owns maintenance). Per heartbeat,
+    for the active section (input_select.ac_scene_<room>): tally per-sensor
+    votes against the almanac comfort/band, apply the quorum rule, and if
+    met nudge setpoints by <= max_step_degrees in the breach direction,
+    honouring guard/hold and driving Cooling/Warming/Leak states.
+
+    Deferred: this encodes the whole voting model in HA Jinja and wants a
+    live trace to validate, so it is being built as its own focused pass.
+    See docs/TRUST_MODEL.md and docs/ALMANAC_FORMAT.md.
     """
-    raise NotImplementedError("Phase 5")
+    raise NotImplementedError("Phase 5 - maintenance/quorum template (next sub-step)")
+
+
+# ---------------------------------------------------------------------
+# Assemble everything deploy needs.
+# ---------------------------------------------------------------------
+
+def render_all(config: dict) -> dict:
+    """Return {"helpers": [...], "automations": [...]} for the whole config.
+    Maintenance automations are omitted until that sub-step lands."""
+    automations: list[dict] = []
+    for room in _enabled_rooms(config):
+        for section in _sections_for(config, room):
+            automations.append(build_scene_automation(config, room, section))
+        for unit in _leak_units(room):
+            automations.append(build_leak_automation(config, room, unit))
+            automations.append(build_leak_release_automation(config, room, unit))
+        automations.append(build_watchdog_automation(config, room))
+    return {"helpers": build_helpers(config), "automations": automations}

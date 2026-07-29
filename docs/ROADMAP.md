@@ -10,7 +10,7 @@ the start of the rebuild, with the design settled enough to begin the contract.
 | 2 | Storage: SQLite DDL, CSV layout, event log | **in progress** — `schema/storage.schema.sql` |
 | 3 | Trust model + quorum design and the pure-function core | **drafted** — `docs/TRUST_MODEL.md`, `app/trust.py` |
 | 4 | Analyser: setpoint learning + per-sensor comfort/trust/band | **in progress** — `app/analyser.py` (built + tested), almanac contract in `docs/ALMANAC_FORMAT.md` |
-| 5 | Generator: helpers, AC state machine, maintenance/quorum, leak | todo — `app/generator.py` |
+| 5 | Generator: helpers, AC state machine, maintenance/quorum, leak | **in progress** — helpers/scene/leak/watchdog built + render-tested; maintenance/quorum template next |
 | 6 | Scheduler: clock-only boundary computation (no sun) | todo — `app/scheduler.py` |
 | 7 | HA client (REST + WebSocket) and connection doctor | todo — `app/ha.py`, `tools/doctor.py` |
 | 8 | Storage layer: dual CSV/SQLite writes, event log, CSV re-ingest | todo — `app/store.py` |
