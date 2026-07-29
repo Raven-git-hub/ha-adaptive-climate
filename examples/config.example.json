@@ -23,26 +23,58 @@
   },
   "rooms": [
     {
-      "id": "lounge",
-      "name": "Lounge",
+      "id": "main_room",
+      "name": "Main Room",
       "enabled": true,
       "schedule_profile": "default",
       "units": [
         {
-          "id": "lounge_ac",
-          "name": "Lounge AC",
-          "entity_id": "climate.lounge_ac",
-          "leak_detection": { "enabled": true }
+          "id": "main_room_ac",
+          "name": "Main Room AC",
+          "entity_id": "climate.lounge_lounge"
         }
       ],
       "sensors": [
-        { "id": "wall", "name": "Wall sensor", "entity_id": "sensor.lounge_temperature" },
-        { "id": "window", "name": "Window sensor", "entity_id": "sensor.lounge_window_temperature" }
+        { "id": "living1", "name": "Living Room Temp",         "entity_id": "sensor.living_room_temp" },
+        { "id": "living2", "name": "Living Room Temperature 1", "entity_id": "sensor.living_room_temperature_1_temperature" },
+        { "id": "living3", "name": "Living Room Temperature 2", "entity_id": "sensor.living_room_temperature_2_temperature" }
       ],
-      "presence_sensors": [],
-      "scenes": {
-        "sleep": { "units": { "lounge_ac": { "mode": "off" } } }
-      }
+      "presence_sensors": []
+    },
+    {
+      "id": "main_bedroom",
+      "name": "Main Bedroom",
+      "enabled": true,
+      "schedule_profile": "default",
+      "units": [
+        {
+          "id": "main_bedroom_ac",
+          "name": "Main Bedroom AC",
+          "entity_id": "climate.home_s_device_2_home_s_device_2"
+        }
+      ],
+      "sensors": [
+        { "id": "bed_main", "name": "Main Bedroom Temperature", "entity_id": "sensor.main_bedroom_temperature_temperature" },
+        { "id": "bed_2",    "name": "Bedroom Temperature",      "entity_id": "sensor.bedroom_temperature_2" }
+      ],
+      "presence_sensors": []
+    },
+    {
+      "id": "baby_room",
+      "name": "Baby Room",
+      "enabled": true,
+      "schedule_profile": "default",
+      "units": [
+        {
+          "id": "baby_room_ac",
+          "name": "Baby Room AC",
+          "entity_id": "climate.baby_room_ac"
+        }
+      ],
+      "sensors": [
+        { "id": "baby", "name": "Baby Room Temperature", "entity_id": "sensor.baby_room_temperature_temperature" }
+      ],
+      "presence_sensors": []
     }
   ],
   "schedule_profiles": [
