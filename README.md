@@ -121,12 +121,16 @@ for now; making them user-customisable is on the roadmap.
 
 ## Leak detection
 
-Optional, per unit. When enabled, the system generates a boolean helper
-(`input_boolean.ac_leak_<room>_<unit>`) and a stub automation in Home Assistant;
-you wire whatever leak sensor you like to that automation to raise the boolean.
-While it is on, the unit runs in **Leak** mode (DRY). Release is latched: it
-clears only when the leak is no longer detected **and** the user confirms via
-`input_boolean.ac_leak_confirmed_<room>_<unit>`.
+Optional, per unit, picked from a live `binary_sensor` list on the Config
+page - like every other entity picker, so a typo can't silently resolve to
+nothing. Populate it and the generator wires the trigger directly to that
+sensor; leave it blank and the container still creates the boolean helper
+(`input_boolean.ac_leak_<room>_<unit>`) with an empty trigger for you to wire
+by hand in Home Assistant instead. Either way, while the boolean is on the
+unit runs in **Leak** mode (DRY). Release is latched: it clears only when the
+user confirms via `input_boolean.ac_leak_confirmed_<room>_<unit>` **and**, if
+the sensor is known, it is no longer reporting a leak - confirming alone isn't
+enough while the sensor still reads wet.
 
 ## Architecture
 

@@ -198,9 +198,14 @@
         "leak_detection": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Optional. When enabled, the generator emits input_boolean.ac_leak_<room>_<unit> plus a stub automation you wire your own leak sensor into. Leak mode is a latch (see docs/DESIGN.md D6).",
+          "description": "Optional. When a sensor_entity_id is set, the generator wires the leak automation's trigger directly to it. Left blank, the generator emits a stub automation you wire your own sensor into by hand. Either way leak mode is a latch (see docs/DESIGN.md D6).",
           "properties": {
-            "enabled": { "type": "boolean", "default": false }
+            "enabled": { "type": "boolean", "default": false },
+            "sensor_entity_id": {
+              "type": "string",
+              "pattern": "^binary_sensor\\.",
+              "description": "The HA binary_sensor for this unit's leak/moisture detector, e.g. binary_sensor.baby_room_ac_leak. Chosen from a live picker. Optional - leave unset to wire the trigger manually in Home Assistant instead."
+            }
           }
         }
       }

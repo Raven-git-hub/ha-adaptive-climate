@@ -263,31 +263,44 @@ def build_scene_automation(config: dict, room: dict, section: dict) -> dict:
 # ---------------------------------------------------------------------
 
 def build_leak_automation(config: dict, room: dict, unit: dict) -> dict:
+    """Raises the leak boolean. When the unit's leak_detection.sensor_entity_id
+    is set (chosen from the Config page's live picker), the trigger is wired
+    directly to that binary_sensor going 'on'. Left unset, the trigger is
+    empty for the user to wire a sensor into by hand in Home Assistant -
+    the original manual-wiring path stays fully supported."""
     r, u = room["id"], unit["id"]
+    sensor = unit.get("leak_detection", {}).get("sensor_entity_id")
+    trigger = [{"platform": "state", "entity_id": sensor, "to": "on"}] if sensor else []
     return {
         "id": leak_automation_id(r, u),
         "alias": f"AC {room.get('name', r)} \u2014 leak latch ({unit.get('name', u)})",
         "mode": "queued",
-        # The user adds their leak-sensor trigger here (e.g. a binary_sensor
-        # going 'on'). Left empty so it is theirs to wire.
-        "trigger": [],
+        "trigger": trigger,
         "condition": [],
         "action": [_set("input_boolean.turn_on", leak_id(r, u))],
     }
 
 
 def build_leak_release_automation(config: dict, room: dict, unit: dict) -> dict:
-    """Latch release: fires when the user confirms the fix. The 'no longer
-    detected' half is the user's to add as a condition referencing their own
-    leak sensor (we cannot know that entity)."""
+    """Latch release: fires when the user confirms the fix. When the sensor
+    is known, a condition also requires it to no longer read 'on' - the
+    confirm alone is not enough while the sensor still reports wet. Without
+    a known sensor, release depends on confirmation alone, as before (the
+    user is expected to have checked)."""
     r, u = room["id"], unit["id"]
+    sensor = unit.get("leak_detection", {}).get("sensor_entity_id")
+    condition = []
+    if sensor:
+        # "not currently reading on" - expressed via the not: wrapper since a
+        # plain condition entry has no native != operator.
+        condition = [{"condition": "not", "conditions":
+                     [{"condition": "state", "entity_id": sensor, "state": "on"}]}]
     return {
         "id": f"{leak_automation_id(r, u)}_release",
         "alias": f"AC {room.get('name', r)} \u2014 leak release ({unit.get('name', u)})",
         "mode": "single",
         "trigger": [{"platform": "state", "entity_id": leak_confirm_id(r, u), "to": "on"}],
-        # Optional: user adds a condition that their leak sensor is clear.
-        "condition": [],
+        "condition": condition,
         "action": [
             _set("input_boolean.turn_off", leak_id(r, u)),
             _set("input_boolean.turn_off", leak_confirm_id(r, u)),

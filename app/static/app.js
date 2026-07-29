@@ -176,7 +176,7 @@ function renderNowRoom(room) {
 
 let cfg = null;                 // working copy of the config
 let cfgMode = "form";           // 'form' | 'raw'
-let entityLists = { climate: [], sensor: [], connected: false };
+let entityLists = { climate: [], sensor: [], binary_sensor: [], connected: false };
 const uiOpen = { rooms: new Set(), profiles: new Set() };
 let cfgListenersWired = false;
 
@@ -242,6 +242,7 @@ async function renderConfig() {
     <pre id="cfg-report" class="report"></pre>
     <datalist id="dl-climate"></datalist>
     <datalist id="dl-sensor"></datalist>
+    <datalist id="dl-binary_sensor"></datalist>
   `;
 
   wireConfigToolbar();
@@ -252,11 +253,13 @@ async function renderConfig() {
 
 async function loadEntities() {
   try {
-    const [c, s] = await Promise.all([
+    const [c, s, b] = await Promise.all([
       fetch("/api/entities?domain=climate").then((r) => r.json()),
       fetch("/api/entities?domain=sensor").then((r) => r.json()),
+      fetch("/api/entities?domain=binary_sensor").then((r) => r.json()),
     ]);
     entityLists = { climate: c.entities || [], sensor: s.entities || [],
+                    binary_sensor: b.entities || [],
                     connected: c.connected, note: c.note };
     const fill = (id, list) => {
       const dl = document.getElementById(id);
@@ -265,6 +268,7 @@ async function loadEntities() {
     };
     fill("dl-climate", entityLists.climate);
     fill("dl-sensor", entityLists.sensor);
+    fill("dl-binary_sensor", entityLists.binary_sensor);
   } catch { /* pickers still work as free text */ }
 }
 
@@ -339,6 +343,16 @@ function applyFieldValue(t) {
   else v = t.value;
   if (t.dataset.vtype === "number") v = v === "" ? undefined : parseFloat(v);
   else if (t.dataset.vtype === "csv") v = v.split(",").map((x) => x.trim()).filter(Boolean);
+
+  if (t.dataset.leakDerive === "1") {
+    const trimmed = (typeof v === "string" ? v.trim() : v) || "";
+    // schema requires sensor_entity_id (if present at all) to start with
+    // 'binary_sensor.', so an emptied field must delete the key, not save "".
+    setPath(cfg, t.dataset.path, trimmed === "" ? undefined : trimmed);
+    const enabledPath = t.dataset.path.replace(/\.sensor_entity_id$/, ".enabled");
+    setPath(cfg, enabledPath, trimmed !== "");
+    return;
+  }
   setPath(cfg, t.dataset.path, v);
 }
 
@@ -455,6 +469,25 @@ function entityField(path, val, domain) {
   </span>`;
 }
 
+function leakField(path, val, domain) {
+  // Optional and clearable: blank means "no leak sensor picked - wire one
+  // manually in HA if you like" (docs/DESIGN.md D6's original fallback).
+  // Populated means "the system knows to go into Leak mode when this
+  // triggers" - data-leak-derive tells the delegation handler to also set
+  // leak_detection.enabled to match, and to delete the key on clear rather
+  // than save an empty string (the schema requires a real binary_sensor.
+  // prefix when the field is present at all).
+  const known = entityKnown(domain, val || "");
+  const cls = "entity-check" + (known === false ? " warn" : known ? " ok" : "");
+  return `<span class="entity-field">
+    <input type="text" list="dl-${domain}" data-path="${path}" data-live="1"
+      data-check-entity="${domain}" data-leak-derive="1"
+      value="${escapeHtml(val || "")}" placeholder="none \u2014 optional" />
+    <span class="${cls}">${val ? (known === false ? "\u26a0 not found in HA" : known ? "\u2713 in HA" : "")
+      : "blank = wire manually in HA"}</span>
+  </span>`;
+}
+
 function settingsHtml() {
   const sys = cfg.system || (cfg.system = {});
   const trust = sys.trust || (sys.trust = {});
@@ -549,12 +582,12 @@ function unitsHtml(room, i) {
     <td>${textField(`rooms.${i}.units.${j}.id`, u.id)}</td>
     <td>${textField(`rooms.${i}.units.${j}.name`, u.name)}</td>
     <td>${entityField(`rooms.${i}.units.${j}.entity_id`, u.entity_id, "climate")}</td>
-    <td class="chk"><input type="checkbox" data-path="rooms.${i}.units.${j}.leak_detection.enabled"
-      data-live="1" ${u.leak_detection?.enabled ? "checked" : ""}/></td>
+    <td>${leakField(`rooms.${i}.units.${j}.leak_detection.sensor_entity_id`,
+      u.leak_detection?.sensor_entity_id, "binary_sensor")}</td>
     <td><button class="danger-outline" data-action="remove-unit" data-room="${room.id}" data-idx="${j}">remove</button></td>
   </tr>`).join("");
   return `<h3>AC units <button class="small" data-action="add-unit" data-room="${room.id}">+ add</button></h3>
-    <table class="now"><tr><th>id</th><th>name</th><th>entity_id</th><th>leak?</th><th></th></tr>
+    <table class="now"><tr><th>id</th><th>name</th><th>entity_id</th><th>leak sensor</th><th></th></tr>
     ${rows || `<tr class="empty"><td colspan="5">no units yet</td></tr>`}</table>`;
 }
 

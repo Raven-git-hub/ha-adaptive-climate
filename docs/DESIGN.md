@@ -120,12 +120,19 @@ is correspondingly simpler: sort six clock times, fire crossovers as they pass.
 
 ### D6. Leak detection
 
-Optional, per unit. When enabled, the generator emits a dedicated boolean helper
-`input_boolean.ac_leak_<room>_<unit>` and a stub automation the user wires their
-own leak sensor into. While the boolean is on, the unit runs in Leak mode (DRY).
-Leak mode is a **latch**: it releases only when the leak is no longer detected
-*and* the user confirms the fix (a UI action / second boolean), so a momentarily
-dry sensor cannot silently release it.
+Optional, per unit, chosen via a live `binary_sensor` picker on the Config page
+(the same live-entity pattern as every other picker). When a sensor is picked,
+the generator wires the leak automation's trigger directly to it going `on`,
+and the release automation's condition directly to it no longer reading `on` -
+no manual automation editing required. Left blank, the generator falls back to
+its original behaviour: a dedicated boolean helper
+`input_boolean.ac_leak_<room>_<unit>` and a stub automation with an empty
+trigger for the user to wire their own sensor into by hand. Either way, while
+the boolean is on the unit runs in Leak mode (DRY). Leak mode is a **latch**:
+release requires the user's confirmation (`input_boolean.ac_leak_confirmed_
+<room>_<unit>`) and, when the sensor is known, that it has actually stopped
+reporting a leak - confirming alone is not enough while the sensor still reads
+wet, closing the gap the manual-only path left open.
 
 ### D7. Temperature unit is configurable
 

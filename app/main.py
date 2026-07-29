@@ -241,8 +241,8 @@ async def api_entities(domain: str) -> dict:
     resolve to 'unknown'. Degrades gracefully (empty list + a note) when HA
     credentials aren't set or the connection fails, rather than erroring -
     the config editor must still be usable while idle."""
-    if domain not in ("climate", "sensor"):
-        raise HTTPException(400, "domain must be 'climate' or 'sensor'")
+    if domain not in ("climate", "sensor", "binary_sensor"):
+        raise HTTPException(400, "domain must be 'climate', 'sensor', or 'binary_sensor'")
     url = os.environ.get("AC_HA_URL")
     token = os.environ.get("AC_HA_TOKEN")
     if not url or not token:
