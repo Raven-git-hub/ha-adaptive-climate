@@ -1,0 +1,24 @@
+/* Adaptive Climate - dark, desktop-oriented LAN UI. Skeleton. */
+:root {
+  --bg: #14171c; --panel: #1c2128; --ink: #e6e9ef; --muted: #8b95a5;
+  --accent: #4bb3fd; --band: #2a3038; --warn: #e0a030; --err: #e05252;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.5 system-ui, sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 1rem;
+  padding: .75rem 1rem; background: var(--panel);
+  border-bottom: 1px solid #000;
+}
+h1 { font-size: 1rem; margin: 0; color: var(--accent); }
+nav button {
+  background: none; border: 0; color: var(--muted);
+  padding: .4rem .7rem; cursor: pointer; border-radius: 6px;
+}
+nav button.active, nav button:hover { color: var(--ink); background: var(--band); }
+#status-strip { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+main { padding: 1.5rem; }
+.placeholder { color: var(--muted); }

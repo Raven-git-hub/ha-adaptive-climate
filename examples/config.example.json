@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "homeassistant": {
+    "base_url": "http://192.168.1.251:8123",
+    "verify_ssl": true
+  },
+  "system": {
+    "temperature_unit": "C",
+    "heartbeat_interval_minutes": 10,
+    "reactive_min_delta": 0.5,
+    "max_step_degrees": 2.0,
+    "correction_max_minutes": 60,
+    "trust": {
+      "high_trust_deviation": 0.5,
+      "low_trust_deviation": 5.0
+    }
+  },
+  "learning": {
+    "analysis_window_days": 21,
+    "bootstrap_min_days": 7,
+    "validity_delay_days": 2,
+    "reactive_weight": 5
+  },
+  "rooms": [
+    {
+      "id": "lounge",
+      "name": "Lounge",
+      "enabled": true,
+      "schedule_profile": "default",
+      "units": [
+        {
+          "id": "lounge_ac",
+          "name": "Lounge AC",
+          "entity_id": "climate.lounge_ac",
+          "leak_detection": { "enabled": true }
+        }
+      ],
+      "sensors": [
+        { "id": "wall", "name": "Wall sensor", "entity_id": "sensor.lounge_temperature" },
+        { "id": "window", "name": "Window sensor", "entity_id": "sensor.lounge_window_temperature" }
+      ],
+      "presence_sensors": [],
+      "scenes": {
+        "sleep": { "units": { "lounge_ac": { "mode": "off" } } }
+      }
+    }
+  ],
+  "schedule_profiles": [
+    {
+      "id": "default",
+      "name": "Default",
+      "sections": [
+        { "id": "sunrise",   "name": "Sunrise",   "trigger": { "type": "clock", "time": "05:30" } },
+        { "id": "day",       "name": "Day",       "trigger": { "type": "clock", "time": "08:00" } },
+        { "id": "afternoon", "name": "Afternoon", "trigger": { "type": "clock", "time": "14:00" } },
+        { "id": "sunset",    "name": "Sunset",    "trigger": { "type": "clock", "time": "16:00" } },
+        { "id": "night",     "name": "Night",     "trigger": { "type": "clock", "time": "20:30" } },
+        { "id": "sleep",     "name": "Sleep",     "trigger": { "type": "clock", "time": "22:00" } }
+      ]
+    }
+  ]
+}

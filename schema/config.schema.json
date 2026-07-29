@@ -1,0 +1,294 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptive-climate/schema/config.v1.json",
+  "title": "Adaptive Climate Configuration",
+  "description": "Single source of truth for the Adaptive Climate container. Everything downstream is a pure function of this document: the helper/automation generator, the section scheduler, the analyser, and the UI. Learned data (almanacs) is NOT stored here - it lives in the almanac store and is regenerated nightly.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "homeassistant", "system", "rooms", "schedule_profiles"],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Schema version. Bumped only on breaking changes; the container migrates forward on load."
+    },
+
+    "homeassistant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_url"],
+      "properties": {
+        "base_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "e.g. http://192.168.1.251:8123 - no trailing slash.",
+          "examples": ["http://192.168.1.251:8123"]
+        },
+        "access_token": {
+          "type": "string",
+          "description": "Long-lived access token. Held in a separate secrets file at runtime (chmod 600) and REDACTED from any config export or backup download. Present in this schema only so the shape is documented."
+        },
+        "verify_ssl": { "type": "boolean", "default": true },
+        "reconnect_backoff_seconds": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 },
+          "default": [1, 2, 5, 10, 30, 60],
+          "description": "WebSocket reconnect ladder. Final value repeats indefinitely."
+        }
+      }
+    },
+
+    "system": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "temperature_unit": {
+          "enum": ["C", "F"],
+          "default": "C",
+          "description": "Display and storage unit. Everything internal is in this unit; conversion, if any, is a UI concern. Lux had no unit; temperature does, and it scales the reactive delta and maintenance step below."
+        },
+        "heartbeat_interval_minutes": {
+          "type": "integer", "minimum": 1, "maximum": 60, "default": 10,
+          "description": "Observation cadence. A heartbeat is DEFERRED (not skipped) while a room's guard boolean is on, so it never samples a unit mid-transition."
+        },
+        "reactive_window_seconds": {
+          "type": "integer", "minimum": 10, "maximum": 600, "default": 120,
+          "description": "After the first user-originated setpoint change, the container keeps collecting further changes for this long before writing one consolidated reactive event."
+        },
+        "reactive_min_delta": {
+          "type": "number", "minimum": 0, "maximum": 20, "default": 0.5,
+          "description": "A unit's setpoint only counts as genuinely changed if |after - before| exceeds this many degrees. Filters out rounding noise and transition echo."
+        },
+        "max_step_degrees": {
+          "type": "number", "minimum": 0.1, "maximum": 10, "default": 2.0,
+          "description": "Maintenance nudges the setpoint by at most this many degrees per step (the '2 degrees at a time' rule)."
+        },
+        "correction_max_minutes": {
+          "type": "integer", "minimum": 1, "maximum": 240, "default": 60,
+          "description": "Safety cap: corrective action stops after this long even if the quorum is still met, or at the first heartbeat the tally drops below quorum - whichever comes first."
+        },
+        "trust": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Calibration of the sensor trust model. See docs/TRUST_MODEL.md.",
+          "properties": {
+            "high_trust_deviation": {
+              "type": "number", "minimum": 0.1, "default": 0.5,
+              "description": "Reaction deviation (degrees) that maps to maximum trust and the tightest comfort band."
+            },
+            "low_trust_deviation": {
+              "type": "number", "minimum": 0.2, "default": 5.0,
+              "description": "Reaction deviation (degrees) that maps to minimum trust and the widest comfort band. New sensors with no reactions start here."
+            }
+          }
+        },
+        "data_dir": {
+          "type": "string", "default": "/data",
+          "description": "Container volume root. Contains csv/, db/, almanac/, config/."
+        },
+        "csv_enabled": {
+          "type": "boolean", "default": true,
+          "description": "Write human-readable CSV alongside SQLite. SQLite is always rebuildable from CSV, so the container holds no irreplaceable state."
+        },
+        "event_log_retention_days": {
+          "type": "integer", "minimum": 1, "default": 90,
+          "description": "Retention for the UI event log. Heartbeat and reactive history are never auto-pruned."
+        },
+        "external_guards": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Entity ids of input_booleans another system raises while it controls the thermostats. While any is on, setpoint changes are attributed to that system rather than the user. For coexistence during cutover; normally empty."
+        }
+      }
+    },
+
+    "learning": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Analyser tuning. Defaults reproduce the proven Light behaviour for setpoint learning; trust-specific knobs live under system.trust.",
+      "properties": {
+        "analysis_window_days": {
+          "type": "integer", "minimum": 1, "default": 21,
+          "description": "Rolling window for the nightly rebuild (three weeks)."
+        },
+        "bootstrap_min_days": {
+          "type": "integer", "minimum": 1, "default": 7,
+          "description": "Below this many days of data the almanac is published immediately (bootstrap); at or above it, publication waits the validity delay (learning)."
+        },
+        "validity_delay_days": {
+          "type": "integer", "minimum": 0, "default": 2,
+          "description": "In the learning state, a new almanac only takes effect after this delay, so a single odd day cannot swing behaviour."
+        },
+        "reactive_weight": {
+          "type": "number", "minimum": 1, "default": 5,
+          "description": "A reactive event counts this many times a heartbeat. You correcting the system is its most valuable signal."
+        }
+      }
+    },
+
+    "rooms": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/room" }
+    },
+
+    "schedule_profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/schedule_profile" },
+      "description": "Named time profiles. A room selects one by id; several rooms can share one."
+    }
+  },
+
+  "$defs": {
+    "room": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "units", "sensors"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+$",
+          "description": "Stable identifier. Load-bearing: every generated helper and automation is named from this, never from 'name'. Never change it once deployed."
+        },
+        "name": { "type": "string", "minLength": 1, "description": "Display name. Free text, changeable at will." },
+        "enabled": { "type": "boolean", "default": true },
+        "schedule_profile": {
+          "type": "string",
+          "default": "default",
+          "description": "Which schedule_profile this room follows, by id."
+        },
+        "units": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/unit" },
+          "description": "The AC units in this room, each an HA climate entity."
+        },
+        "sensors": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/sensor" },
+          "description": "Temperature sensors in this room. Each learns its own comfort reading, band and trust."
+        },
+        "presence_sensors": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "RESERVED. Optional occupancy sensors. Not yet used - reserved so occupancy can be added without a schema migration. See docs/DESIGN.md open decisions."
+        },
+        "scenes": {
+          "type": "object",
+          "description": "Per-section auto/off matrix, keyed by section id. Absent sections default every unit to auto.",
+          "additionalProperties": { "$ref": "#/$defs/scene" }
+        }
+      }
+    },
+
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "entity_id"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_]+$", "description": "Stable per-unit id, used in almanac rows and generated references." },
+        "name": { "type": "string", "minLength": 1 },
+        "entity_id": {
+          "type": "string",
+          "pattern": "^climate\\.",
+          "description": "The HA climate (thermostat) entity, e.g. climate.lounge_ac. Chosen from a live picker so a typo cannot resolve to 'unknown'."
+        },
+        "leak_detection": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional. When enabled, the generator emits input_boolean.ac_leak_<room>_<unit> plus a stub automation you wire your own leak sensor into. Leak mode is a latch (see docs/DESIGN.md D6).",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false }
+          }
+        }
+      }
+    },
+
+    "sensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "entity_id"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+        "name": { "type": "string", "minLength": 1 },
+        "entity_id": {
+          "type": "string",
+          "pattern": "^sensor\\.",
+          "description": "The HA temperature sensor entity, e.g. sensor.lounge_temperature."
+        }
+      }
+    },
+
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What one section does. Auto/off is per unit; a unit set 'off' is baked into the automation directly and holds from first deploy.",
+      "properties": {
+        "transition_seconds": {
+          "type": "integer", "minimum": 0, "default": 120,
+          "description": "How long the crossover takes to apply."
+        },
+        "units": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": { "enum": ["auto", "off"], "default": "auto" }
+            }
+          },
+          "description": "Keyed by unit id. 'auto' = follow the almanac; 'off' = force this unit off for this section."
+        }
+      }
+    },
+
+    "schedule_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "sections"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+        "name": { "type": "string", "minLength": 1 },
+        "sections": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "items": { "$ref": "#/$defs/section" },
+          "description": "All six sections, in canonical order (sunrise -> sleep). Times should increase through the day."
+        }
+      }
+    },
+
+    "section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "trigger"],
+      "properties": {
+        "id": {
+          "enum": ["sunrise", "day", "afternoon", "sunset", "night", "sleep"],
+          "description": "Canonical section identifier. Fixed set - these six and only these six. These are SECTION names, not astronomical events: climate has no sun-relative triggers."
+        },
+        "name": { "type": "string", "minLength": 1, "description": "Display name. Free text; only id is load-bearing." },
+        "trigger": { "$ref": "#/$defs/trigger" }
+      }
+    },
+
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "time"],
+      "description": "A fixed clock time. Climate has no sun-relative or composite triggers - it follows your routine, not the sun.",
+      "properties": {
+        "type": { "const": "clock" },
+        "time": {
+          "type": "string",
+          "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+          "description": "24-hour local clock time, HH:MM.",
+          "examples": ["05:30", "22:00"]
+        }
+      }
+    }
+  }
+}

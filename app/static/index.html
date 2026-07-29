@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Adaptive Climate</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <!-- uPlot is vendored here in Phase 14; see app/static/vendor/README.md -->
+</head>
+<body>
+  <header>
+    <h1>Adaptive Climate</h1>
+    <nav id="tabs">
+      <button data-view="now" class="active">Now</button>
+      <button data-view="analysis">Analysis</button>
+      <button data-view="almanac">Almanac</button>
+      <button data-view="config">Config</button>
+      <button data-view="log">Log</button>
+    </nav>
+    <span id="status-strip">connecting…</span>
+  </header>
+  <main id="view"><p class="placeholder">UI shell - views land in Phases 12-15.</p></main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
