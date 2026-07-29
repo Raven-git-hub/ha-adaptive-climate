@@ -9,6 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 COPY schema/ ./schema/
+COPY tools/ ./tools/
+COPY examples/ ./examples/
 
 ENV AC_DATA_DIR=/data
 EXPOSE 8098
