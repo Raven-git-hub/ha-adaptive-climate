@@ -47,3 +47,26 @@ table.almanac tr.empty td { color: var(--muted); }
 .trust { display: inline-block; width: 46px; height: 6px; background: var(--band);
   border-radius: 3px; margin-left: .3rem; overflow: hidden; vertical-align: middle; }
 .trust > span { display: block; height: 100%; background: var(--accent); }
+
+/* --- Now view --- */
+.pill { font-size: .75em; padding: .1rem .5rem; border-radius: 999px; margin-left: .4rem; }
+.pill.off { background: var(--band); color: var(--muted); }
+.pill.on { background: #3a2f12; color: var(--warn); }
+table.now { border-collapse: collapse; width: 100%; margin: .5rem 0 1rem; font-size: .9rem; }
+table.now th, table.now td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--band); }
+table.now th { color: var(--muted); font-weight: 600; }
+table.now.sensors { max-width: 420px; }
+tr.empty td { color: var(--muted); }
+
+/* --- Config view --- */
+#cfg-text {
+  width: 100%; min-height: 420px; background: var(--panel); color: var(--ink);
+  border: 1px solid var(--band); border-radius: 8px; padding: .8rem;
+  font: 13px/1.5 ui-monospace, "SF Mono", Consolas, monospace; resize: vertical;
+}
+.toolbar button.danger { background: var(--err); color: #fff; }
+.report {
+  background: var(--panel); border: 1px solid var(--band); border-radius: 8px;
+  padding: .8rem; margin-top: .8rem; font-size: .8rem; white-space: pre-wrap;
+  max-height: 320px; overflow: auto;
+}

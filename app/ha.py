@@ -79,6 +79,14 @@ class HARest:
         r.raise_for_status()
         return r.json() if r.content else {}
 
+    async def _delete(self, path: str) -> None:
+        r = await (await self._c()).delete(f"{self.url}{path}")
+        if r.status_code == 401:
+            raise HAAuthError("token rejected by Home Assistant")
+        if r.status_code == 404:
+            return
+        r.raise_for_status()
+
     # --- public
     async def ping(self) -> dict:                       return await self._get("/api/")
     async def config(self) -> dict:                     return await self._get("/api/config")
@@ -91,6 +99,28 @@ class HARest:
     async def call_service(self, domain: str, service: str,
                            data: dict | None = None) -> Any:
         return await self._post(f"/api/services/{domain}/{service}", data or {})
+
+    # --- automation config editor API (used by deploy.py) -----------
+    # These are the same endpoints Home Assistant's own frontend
+    # automation editor uses (GET/POST/DELETE /api/config/automation/
+    # config/<id>). There is no reliable "list all automations" call in
+    # this family, which is why deploy.py tracks what it has deployed in
+    # its own local manifest rather than depending on enumeration - see
+    # docs/DEPLOY.md.
+    async def get_automation(self, automation_id: str) -> dict | None:
+        try:
+            return await self._get(f"/api/config/automation/config/{automation_id}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+
+    async def set_automation(self, automation_id: str, config: dict) -> Any:
+        body = {k: v for k, v in config.items() if k != "id"}
+        return await self._post(f"/api/config/automation/config/{automation_id}", body)
+
+    async def delete_automation(self, automation_id: str) -> None:
+        await self._delete(f"/api/config/automation/config/{automation_id}")
 
 
 # ---------------------------------------------------------------------

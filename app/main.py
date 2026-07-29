@@ -151,6 +151,124 @@ def api_run_analysis() -> dict:
     return {"ok": True, "built": built}
 
 
+@app.get("/api/config")
+def api_get_config() -> dict:
+    return _raw_config()
+
+
+@app.post("/api/config")
+def api_save_config(cfg: dict) -> dict:
+    try:
+        import jsonschema
+        schema = json.loads((SCHEMA_DIR / "config.schema.json").read_text())
+        jsonschema.validate(cfg, schema)
+    except Exception as e:
+        raise HTTPException(400, f"config did not validate: {e}")
+    save(cfg, CONFIG_PATH)
+    return {"ok": True}
+
+
+def _ha_clients():
+    """Build a REST + WebSocket client pair from the environment, the
+    same source doctor.py uses. Raises a clear HTTPException if unset."""
+    from app.ha import HARest, HAWebSocket
+    url = os.environ.get("AC_HA_URL")
+    token = os.environ.get("AC_HA_TOKEN")
+    verify_ssl = os.environ.get("AC_HA_VERIFY_SSL", "true").lower() != "false"
+    if not url or not token:
+        raise HTTPException(503, "AC_HA_URL / AC_HA_TOKEN are not set in the "
+                                 "container environment; check .env")
+    return HARest(url, token, verify_ssl=verify_ssl), HAWebSocket(url, token, verify_ssl=verify_ssl)
+
+
+@app.get("/api/deploy/check")
+async def api_deploy_check() -> dict:
+    """Dry run: entity existence only. No writes to Home Assistant."""
+    from app.deploy import check
+    rest, _ = _ha_clients()
+    try:
+        report = await check(_raw_config(), rest)
+    finally:
+        await rest.close()
+    return report.as_dict()
+
+
+@app.post("/api/deploy")
+async def api_deploy() -> dict:
+    """Real reconciliation: creates/updates our helpers and automations in
+    Home Assistant, prunes our own stale ones. See app/deploy.py and
+    docs/DEPLOY.md for exactly what this does and does not touch."""
+    from app.deploy import deploy
+    rest, ws = _ha_clients()
+    try:
+        await ws.connect()
+        report = await deploy(_raw_config(), rest, ws, DATA_DIR)
+    finally:
+        await ws.close()
+        await rest.close()
+    return report.as_dict()
+
+
+@app.get("/api/now")
+async def api_now() -> dict:
+    """Live state for the Now view: per room, the guard/hold/scene helpers
+    plus each unit's and sensor's current reading from Home Assistant."""
+    rest, _ = _ha_clients()
+    try:
+        states = {s["entity_id"]: s for s in await rest.states()}
+    finally:
+        await rest.close()
+
+    from app.generator import guard_id, hold_id, scene_select_id
+
+    cfg = _raw_config()
+    rooms_out = []
+    for room in cfg.get("rooms", []):
+        if not room.get("enabled", True):
+            continue
+        r = room["id"]
+
+        def st(entity_id: str) -> dict | None:
+            s = states.get(entity_id)
+            if not s:
+                return None
+            return {"state": s.get("state"), "attributes": s.get("attributes", {})}
+
+        units_out = []
+        for u in room.get("units", []):
+            s = st(u["entity_id"])
+            attrs = (s or {}).get("attributes", {})
+            units_out.append({
+                "id": u["id"], "name": u.get("name", u["id"]), "entity_id": u["entity_id"],
+                "state": (s or {}).get("state"),
+                "current_temperature": attrs.get("current_temperature"),
+                "setpoint": attrs.get("temperature"),
+                "fan_mode": attrs.get("fan_mode"),
+            })
+        sensors_out = []
+        for sconf in room.get("sensors", []):
+            s = st(sconf["entity_id"])
+            sensors_out.append({
+                "id": sconf["id"], "name": sconf.get("name", sconf["id"]),
+                "entity_id": sconf["entity_id"],
+                "reading": (s or {}).get("state"),
+                "unit": ((s or {}).get("attributes", {}) or {}).get("unit_of_measurement"),
+            })
+
+        guard = st(guard_id(r))
+        hold = st(hold_id(r))
+        scene = st(scene_select_id(r))
+        rooms_out.append({
+            "id": r, "name": room.get("name", r),
+            "guard": (guard or {}).get("state"),
+            "hold": (hold or {}).get("state"),
+            "scene": (scene or {}).get("state"),
+            "units": units_out,
+            "sensors": sensors_out,
+        })
+    return {"rooms": rooms_out}
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")

@@ -154,7 +154,12 @@ def _unit_lookup(alm: str, section: str, unit_id: str) -> str:
             ).replace("<<ALM>>", alm).replace("<<S>>", section).replace("<<U>>", unit_id)
 
 
-def _off_condition(alm: str, section: str, unit_id: str) -> str:
+def _skip_condition(alm: str, section: str, unit_id: str) -> str:
+    """True when there is nothing safe to drive the unit to: either the
+    almanac's off flag is set (reserved; the analyser never sets this
+    today - scene-level off is handled separately, statically, below) or
+    no setpoint has been learned yet. In BOTH cases the correct action is
+    to leave the unit alone, not command it off - see _drive_unit."""
     return (_unit_lookup(alm, section, unit_id)
             + "{{ (u.get('off')) or (u.get('setpoint') is none) }}")
 
@@ -182,16 +187,27 @@ def _set(service: str, entity: str, data: dict | None = None) -> dict:
 
 
 def _drive_unit(alm: str, section: str, unit: dict, forced_off: bool) -> dict:
-    """One action step: force off, or drive to the Normal state (cool,
-    snapped+clamped almanac setpoint, fan low if the unit supports it)."""
+    """One action step: force off (deliberate, static, from config scenes),
+    or drive to the Normal state (cool, snapped+clamped almanac setpoint,
+    fan low if supported) - or, if no almanac has been learned for this
+    section yet, do NOTHING and leave the unit exactly as it is.
+
+    SAFETY: "no almanac yet" must never be treated as "turn off". Before
+    the runtime exists to seed a provisional almanac (Phase 10), every
+    section starts with no learned setpoint; if that were mapped to an
+    off command, deploying would force every unit off at every crossover
+    on a fresh install. forced_off (this function's other branch) is the
+    ONLY path that commands off, and it fires solely from the user's own
+    scene configuration - never from missing learned data.
+    """
     e = unit["entity_id"]
     if forced_off:
         return _set("climate.set_hvac_mode", e, {"hvac_mode": "off"})
     return {
         "choose": [{
             "conditions": [{"condition": "template",
-                            "value_template": _off_condition(alm, section, unit["id"])}],
-            "sequence": [_set("climate.set_hvac_mode", e, {"hvac_mode": "off"})],
+                            "value_template": _skip_condition(alm, section, unit["id"])}],
+            "sequence": [],   # no almanac yet -> leave the unit alone, do not touch it
         }],
         "default": [
             _set("climate.set_hvac_mode", e, {"hvac_mode": "cool"}),

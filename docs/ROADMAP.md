@@ -16,9 +16,9 @@ the start of the rebuild, with the design settled enough to begin the contract.
 | 8 | Storage layer: dual CSV/SQLite writes, event log, CSV re-ingest | todo — `app/store.py` |
 | 9 | Config loader: schema validation, defaults, cross-reference checks | todo — `app/config.py` |
 | 10 | Runtime: scheduler, observer, reactive detector, almanac push, leak latch | todo — `app/runtime.py` |
-| 11 | Config API and deployment to Home Assistant | todo — `app/deploy.py`, `app/main.py` |
-| 12 | UI shell, status strip, Config and Log | todo — `app/static/` |
-| 13 | UI — Now (live dashboard, per-sensor bands, AC state) | todo |
+| 11 | Config API and deployment to Home Assistant | **first slice done** — `app/deploy.py` (list-diff helpers, ledger-based automations, offline-tested), `/api/config`, `/api/deploy`, `/api/deploy/check`; foreign-conflict detection still TODO, see `docs/DEPLOY.md` |
+| 12 | UI shell, status strip, Config and Log | **Config done** (JSON editor + validate/save/check/deploy); Log still todo |
+| 13 | UI — Now (live dashboard, per-sensor bands, AC state) | **first slice done** — guard/hold/scene + live unit and sensor state via `/api/now`; comfort-band visualisation still todo |
 | 14 | UI — Analysis (day chart, uPlot) | todo |
 | 15 | UI — Almanac (setpoint + per-sensor trust/band, settling sparkline) | **started** — Almanac view + `/api/almanac`, `/api/analysis/run` live |
 | 16 | Home Assistant add-on packaging | later |
