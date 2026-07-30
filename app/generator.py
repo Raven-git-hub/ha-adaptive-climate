@@ -448,15 +448,35 @@ def build_watchdog_automation(config: dict, room: dict) -> dict:
 #     drops back below quorum and resets the clock.
 # ---------------------------------------------------------------------
 
-def _sensor_entry_template(sensor: dict, low_dev: float) -> str:
-    sid, entity = sensor["id"], sensor["entity_id"]
+def _sensor_reading_expr(sensor: dict, room: dict) -> str:
+    """The Jinja fragment that yields this sensor's current reading (a
+    float or none) inside the maintenance vote template. Physical sensor:
+    reads its own entity state. Virtual (source-based): reads the
+    referenced unit's attribute. The rest of the vote/quorum logic is
+    identical - only where the number comes from changes."""
+    source = sensor.get("source")
+    if source is None:
+        return f"states('{sensor['entity_id']}') | float(none)"
+    if source.get("type") == "unit_attribute":
+        uid = source.get("unit_id")
+        unit = next((u for u in room["units"] if u["id"] == uid), None)
+        if unit is None:
+            return "none"
+        attr = source.get("attribute", "current_temperature")
+        return f"state_attr('{unit['entity_id']}', '{attr}') | float(none)"
+    return "none"
+
+
+def _sensor_entry_template(sensor: dict, room: dict, low_dev: float) -> str:
+    sid = sensor["id"]
+    reading = _sensor_reading_expr(sensor, room)
     return (
         "{'id': '<<ID>>', "
-        "'reading': states('<<E>>') | float(none), "
+        "'reading': <<R>>, "
         "'comfort': (sensor_data.get('<<ID>>') or {}).get('comfort'), "
         "'band': (sensor_data.get('<<ID>>') or {}).get('band', <<LOW>>), "
         "'trust': (sensor_data.get('<<ID>>') or {}).get('trust', 0.0)}"
-    ).replace("<<ID>>", sid).replace("<<E>>", entity).replace("<<LOW>>", repr(low_dev))
+    ).replace("<<ID>>", sid).replace("<<R>>", reading).replace("<<LOW>>", repr(low_dev))
 
 
 def _vote_expr(room: dict, low_dev: float) -> str:
@@ -464,7 +484,7 @@ def _vote_expr(room: dict, low_dev: float) -> str:
     direction}, computed from `sensor_data` (set earlier in variables).
     Trim markers keep the rendered string a clean Python literal so HA's
     variable parser (literal_eval) accepts it."""
-    entries = ", ".join(_sensor_entry_template(s, low_dev) for s in room["sensors"])
+    entries = ", ".join(_sensor_entry_template(s, room, low_dev) for s in room["sensors"])
     return (
         "{%- set sensors = [" + entries + "] -%}"
         "{%- set usable = sensors | selectattr('reading','ne',none) | selectattr('comfort','ne',none) | list -%}"

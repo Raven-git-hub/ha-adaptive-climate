@@ -123,6 +123,8 @@ async def check(config: dict, rest: HARest) -> DeployReport:
             if u["entity_id"] not in states:
                 report.missing_entities.append(u["entity_id"])
         for s in room.get("sensors", []):
+            if s.get("source"):
+                continue   # virtual sensor - no entity_id to verify
             if s["entity_id"] not in states:
                 report.missing_entities.append(s["entity_id"])
 

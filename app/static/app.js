@@ -325,7 +325,13 @@ function wireConfigDelegation() {
   });
   view.addEventListener("change", (e) => {
     const t = e.target;
-    if (!t.dataset || !t.dataset.path) return;
+    if (!t.dataset) return;
+    if (t.dataset.sensorType === "1") {
+      handleSensorTypeChange(t);
+      renderConfigBody();
+      return;
+    }
+    if (!t.dataset.path) return;
     applyFieldValue(t);
     if (t.dataset.checkEntity) updateEntityCheck(t);
   });
@@ -354,6 +360,23 @@ function applyFieldValue(t) {
     return;
   }
   setPath(cfg, t.dataset.path, v);
+}
+
+function handleSensorTypeChange(t) {
+  const room = cfg.rooms.find((r) => r.id === t.dataset.room);
+  if (!room) return;
+  const sensor = room.sensors[Number(t.dataset.idx)];
+  if (!sensor) return;
+  if (t.value === "virtual") {
+    if (!room.units.length) return;   // <option disabled> guards this too
+    delete sensor.entity_id;
+    sensor.source = { type: "unit_attribute",
+                      unit_id: sensor.source?.unit_id || room.units[0].id,
+                      attribute: "current_temperature" };
+  } else {
+    delete sensor.source;
+    if (sensor.entity_id === undefined) sensor.entity_id = "sensor.";
+  }
 }
 
 function updateEntityCheck(t) {
@@ -592,15 +615,36 @@ function unitsHtml(room, i) {
 }
 
 function sensorsHtml(room, i) {
-  const rows = room.sensors.map((s, j) => `<tr>
-    <td>${textField(`rooms.${i}.sensors.${j}.id`, s.id)}</td>
-    <td>${textField(`rooms.${i}.sensors.${j}.name`, s.name)}</td>
-    <td>${entityField(`rooms.${i}.sensors.${j}.entity_id`, s.entity_id, "sensor")}</td>
-    <td><button class="danger-outline" data-action="remove-sensor" data-room="${room.id}" data-idx="${j}">remove</button></td>
-  </tr>`).join("");
+  const rows = room.sensors.map((s, j) => {
+    const isVirtual = !!(s.source && s.source.type === "unit_attribute");
+    const sourceCell = isVirtual
+      ? virtualSourceField(room, i, j, s.source.unit_id)
+      : entityField(`rooms.${i}.sensors.${j}.entity_id`, s.entity_id, "sensor");
+    return `<tr>
+      <td>${textField(`rooms.${i}.sensors.${j}.id`, s.id)}</td>
+      <td>${textField(`rooms.${i}.sensors.${j}.name`, s.name)}</td>
+      <td>
+        <select data-sensor-type="1" data-room="${room.id}" data-idx="${j}">
+          <option value="physical" ${isVirtual ? "" : "selected"}>Physical</option>
+          <option value="virtual" ${isVirtual ? "selected" : ""}
+            ${room.units.length === 0 ? "disabled" : ""}>AC internal</option>
+        </select>
+      </td>
+      <td>${sourceCell}</td>
+      <td><button class="danger-outline" data-action="remove-sensor" data-room="${room.id}" data-idx="${j}">remove</button></td>
+    </tr>`;
+  }).join("");
   return `<h3>Temperature sensors <button class="small" data-action="add-sensor" data-room="${room.id}">+ add</button></h3>
-    <table class="now"><tr><th>id</th><th>name</th><th>entity_id</th><th></th></tr>
-    ${rows || `<tr class="empty"><td colspan="4">no sensors yet</td></tr>`}</table>`;
+    <table class="now"><tr><th>id</th><th>name</th><th>type</th><th>reading source</th><th></th></tr>
+    ${rows || `<tr class="empty"><td colspan="5">no sensors yet</td></tr>`}</table>`;
+}
+
+function virtualSourceField(room, i, j, currentUnitId) {
+  const opts = room.units.map((u) =>
+    `<option value="${u.id}" ${u.id === currentUnitId ? "selected" : ""}>${escapeHtml(u.name || u.id)} (${escapeHtml(u.entity_id || "")})</option>`
+  ).join("");
+  if (!opts) return `<span class="muted">add a unit first</span>`;
+  return `<select data-path="rooms.${i}.sensors.${j}.source.unit_id" data-live="1">${opts}</select>`;
 }
 
 function scenesHtml(room, i) {

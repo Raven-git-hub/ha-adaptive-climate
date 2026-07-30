@@ -158,3 +158,7 @@ container (simpler templates, but correction pauses if the container is down).
 The current lean is **HA-owns-maintenance**, preserving the Light principle,
 with the almanac carrying everything the template needs. Flagged in
 `docs/ROADMAP.md` as the first decision of Phase 4.
+
+## Virtual sensors
+
+A sensor's reading can come from a `source: {type: unit_attribute, unit_id, attribute}` in config instead of a standalone `sensor.*` entity - typically the AC's own `current_temperature`. The trust model treats it identically to a physical sensor; only where the number is read from changes. Worth knowing about it in practice: a unit-internal sensor isn't independent of the AC's *behavior*. When the unit is idle/steady it's a fair proxy for the room; while maintenance is actively correcting, its reading partly responds to the correction itself rather than to the room. That correlation isn't hidden anywhere - it'll show up as slower trust convergence for that sensor, since you'll react to it less specifically. Documented rather than special-cased, because the model handles it correctly on its own.

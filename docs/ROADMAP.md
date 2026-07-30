@@ -58,3 +58,5 @@ These bit us in Light and the equivalents are pre-empted here:
 ## Validation coverage note
 
 `tools/leak_response_check.py` (added after the leak sensor picker) proves the full wet -> DRY -> confirm -> Normal cycle actually drives the air conditioner, not just the boolean latch, and that non-leak units are unaffected.
+
+`tools/virtual_sensor_check.py` proves the end-to-end path for a source-based sensor whose reading comes from a unit's own attribute.

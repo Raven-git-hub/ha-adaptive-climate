@@ -214,16 +214,42 @@
     "sensor": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "name", "entity_id"],
+      "required": ["id", "name"],
       "properties": {
         "id": { "type": "string", "pattern": "^[a-z0-9_]+$" },
         "name": { "type": "string", "minLength": 1 },
         "entity_id": {
           "type": "string",
           "pattern": "^sensor\\.",
-          "description": "The HA temperature sensor entity, e.g. sensor.lounge_temperature."
+          "description": "For a physical sensor: the HA temperature sensor entity, e.g. sensor.lounge_temperature. Required unless source.type is set."
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional. When set, this sensor's reading is derived from an attribute of another entity rather than a standalone sensor entity - e.g. an AC unit's own internal temperature. The trust model treats it identically to a physical sensor; only where the number is read from changes.",
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "enum": ["unit_attribute"],
+              "description": "'unit_attribute' reads the value from one of this room's own units."
+            },
+            "unit_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9_]+$",
+              "description": "The id of a unit in this same room whose attribute this sensor reads."
+            },
+            "attribute": {
+              "type": "string",
+              "default": "current_temperature",
+              "description": "The attribute to read from the unit's climate entity. Defaults to current_temperature."
+            }
+          }
         }
-      }
+      },
+      "oneOf": [
+        { "required": ["entity_id"], "not": { "required": ["source"] } },
+        { "required": ["source"], "not": { "required": ["entity_id"] } }
+      ]
     },
 
     "scene": {

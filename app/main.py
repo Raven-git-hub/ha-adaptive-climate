@@ -330,13 +330,29 @@ async def api_now() -> dict:
             })
         sensors_out = []
         for sconf in room.get("sensors", []):
-            s = st(sconf["entity_id"])
-            sensors_out.append({
-                "id": sconf["id"], "name": sconf.get("name", sconf["id"]),
-                "entity_id": sconf["entity_id"],
-                "reading": (s or {}).get("state"),
-                "unit": ((s or {}).get("attributes", {}) or {}).get("unit_of_measurement"),
-            })
+            source = sconf.get("source") or {}
+            if source.get("type") == "unit_attribute":
+                # virtual: read the referenced unit's current_temperature
+                uid = source.get("unit_id")
+                unit = next((u for u in room.get("units", []) if u["id"] == uid), None)
+                reading = None
+                if unit:
+                    ua = st(unit["entity_id"]) or {}
+                    reading = (ua.get("attributes") or {}).get(
+                        source.get("attribute", "current_temperature"))
+                sensors_out.append({
+                    "id": sconf["id"], "name": sconf.get("name", sconf["id"]),
+                    "entity_id": f"(from {unit['entity_id']})" if unit else "(virtual)",
+                    "reading": reading, "unit": "\u00b0C",
+                })
+            else:
+                s = st(sconf["entity_id"])
+                sensors_out.append({
+                    "id": sconf["id"], "name": sconf.get("name", sconf["id"]),
+                    "entity_id": sconf["entity_id"],
+                    "reading": (s or {}).get("state"),
+                    "unit": ((s or {}).get("attributes", {}) or {}).get("unit_of_measurement"),
+                })
 
         guard = st(guard_id(r))
         hold = st(hold_id(r))

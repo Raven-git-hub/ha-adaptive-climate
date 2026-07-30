@@ -245,7 +245,10 @@ class Runtime:
         rs.reactive_deadline = None
         if not units:
             return
-        sensors = {s["id"]: self._sensor_value(s["entity_id"]) for s in rs.room["sensors"]}
+        # Fetch fresh states so any virtual (unit-attribute) sensors can read
+        # the reference unit's current_temperature snapshot at reaction time.
+        states = {s["entity_id"]: s for s in await self.rest.states()}
+        sensors = {s["id"]: self._sensor_reading(s, rs.room, states) for s in rs.room["sensors"]}
         ts, ts_utc, local_date, _ = self._now()
         window = self._sys.get("reactive_window_seconds", 120)
         self.store.record_reactive(room_id, ts, ts_utc, local_date, rs.section or "day",
@@ -263,6 +266,28 @@ class Runtime:
             return float(v)
         except (TypeError, ValueError):
             return None
+
+    def _sensor_reading(self, sensor: dict, room: dict, states: dict) -> float | None:
+        """Physical sensor -> read its own entity state (cheap path via the
+        cache when we don't have fresh attributes). Virtual (source-based)
+        sensor -> read the referenced unit's attribute out of a states dict,
+        which the caller has just fetched. The rest of the trust model
+        doesn't need to know which is which."""
+        source = sensor.get("source")
+        if source is None:
+            return self._sensor_value(sensor["entity_id"])
+        if source.get("type") == "unit_attribute":
+            uid = source.get("unit_id")
+            unit = next((u for u in room["units"] if u["id"] == uid), None)
+            if unit is None:
+                return None
+            attrs = (states.get(unit["entity_id"], {}) or {}).get("attributes", {}) or {}
+            v = attrs.get(source.get("attribute", "current_temperature"))
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        return None
 
     def _unit_sample(self, entity_id: str, leak_on: bool, attrs: dict) -> UnitSample:
         state = self._cache.get(entity_id)
@@ -288,7 +313,7 @@ class Runtime:
         for eid, s in states.items():
             self._cache[eid] = s.get("state")
 
-        sensors = {s["id"]: self._sensor_value(s["entity_id"]) for s in rs.room["sensors"]}
+        sensors = {s["id"]: self._sensor_reading(s, rs.room, states) for s in rs.room["sensors"]}
         units = {}
         for u in rs.room["units"]:
             attrs = (states.get(u["entity_id"], {}) or {}).get("attributes", {}) or {}
@@ -356,11 +381,7 @@ class Runtime:
             attrs = (states.get(u["entity_id"], {}) or {}).get("attributes", {}) or {}
             unit_setpoints[u["id"]] = attrs.get("temperature")
         for s in rs.room["sensors"]:
-            st = states.get(s["entity_id"], {})
-            try:
-                comfort[s["id"]] = float(st.get("state"))
-            except (TypeError, ValueError):
-                comfort[s["id"]] = None
+            comfort[s["id"]] = self._sensor_reading(s, rs.room, states)
             band[s["id"]] = low_dev
             trust[s["id"]] = 0.0
 
