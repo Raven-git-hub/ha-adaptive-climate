@@ -121,18 +121,47 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Adaptive Climate", version="0.1.0", lifespan=lifespan)
 
 
+# A websocket drop is expected (HA restarts, network blips) and the client
+# now reconnects on its own. Don't flap the container to unhealthy for a
+# transient gap: report degraded only once the socket has been down past
+# this grace window without recovering - the genuinely-stuck case.
+WS_DOWN_GRACE_SECONDS = 180
+
+
 @app.get("/healthz")
 def healthz() -> JSONResponse:
-    connected = bool(getattr(state.runtime, "ws", None)
-                     and state.runtime.ws.connected)  # type: ignore[attr-defined]
+    ws = getattr(state.runtime, "ws", None)
+    connected = bool(ws and ws.connected)
     idle = state.runtime is None
-    ok = idle or connected
+
+    # How long the socket has been down, if it is. last_disconnected_at is
+    # a monotonic (event-loop) timestamp, so compare against loop time.
+    ws_down_seconds: float | None = None
+    if ws is not None and not connected:
+        last_down = getattr(ws, "last_disconnected_at", None)
+        if last_down is not None:
+            try:
+                import asyncio
+                ws_down_seconds = asyncio.get_event_loop().time() - last_down
+            except Exception:
+                ws_down_seconds = None
+
+    # Healthy when idle, connected, or only briefly disconnected (the
+    # supervisor is actively reconnecting). Stuck-down past the grace
+    # window - or down with no recovery in progress - is degraded.
+    reconnecting = (ws_down_seconds is not None
+                    and ws_down_seconds < WS_DOWN_GRACE_SECONDS)
+    ok = idle or connected or reconnecting
+
     return JSONResponse(
         status_code=200 if ok else 503,
         content={
             "status": "ok" if ok else "degraded",
             "idle": idle,
             "ha_connected": connected,
+            "ha_reconnecting": bool(reconnecting and not connected),
+            "ws_down_seconds": (round(ws_down_seconds, 1)
+                                if ws_down_seconds is not None else None),
             "error": state.error,
             "uptime_seconds": int(
                 (datetime.now(timezone.utc) - state.started_at).total_seconds()),

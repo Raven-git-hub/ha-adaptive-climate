@@ -149,6 +149,13 @@ class Runtime:
             for u in room["units"]:
                 self._unit_index[u["entity_id"]] = (room["id"], u["id"])
 
+        # Register the resubscribe hook BEFORE the first subscribe, so a
+        # drop at any point is repaired by the ws supervisor re-running it.
+        # Without this, a single websocket drop silently ends reactive
+        # detection - user setpoint corrections stop being captured - and
+        # the connection never recovers until a container restart.
+        self.ws.on_reconnect(self._resubscribe)
+        self.ws.on_status(self._on_ws_status)
         await self.ws.subscribe_states(self._on_state_change)
 
         # initial catch-up crossover for every room
@@ -177,6 +184,23 @@ class Runtime:
         self._tasks = []
 
     # ---- state-change stream --------------------------------------
+
+    async def _resubscribe(self) -> None:
+        """Re-run every websocket subscription after a (re)connect. HA's
+        subscription ids do not survive a dropped socket, so the state
+        stream must be re-established or reactive detection stays dead."""
+        await self.ws.subscribe_states(self._on_state_change)
+
+    def _on_ws_status(self, connected: bool, reason: str) -> None:
+        """Record websocket up/down transitions in the event log so a drop
+        (and its recovery) is visible in the UI's Log view, not just stdout."""
+        try:
+            ts, ts_utc, _, _ = self._now()
+            self.store.log_event(
+                ts, ts_utc, "info" if connected else "warning", "connection",
+                f"Home Assistant websocket {'up' if connected else 'down'}: {reason}")
+        except Exception as e:
+            log.warning("could not log ws status event: %s", e)
 
     def _on_state_change(self, event: dict) -> None:
         data = event.get("data", {})
