@@ -153,14 +153,42 @@ class HAWebSocket:
                                                 else ssl._create_unverified_context())
         self._ws: Any = None
         self._reader: asyncio.Task | None = None
+        self._supervisor: asyncio.Task | None = None
         self._pending: dict[int, _Pending] = {}
         self._id = 0
         self.connected = False
         self.ha_version: str | None = None
+        # Reconnect bookkeeping. A drop is normal (HA restarts, network
+        # blips); the reader used to just set connected=False and stop,
+        # leaving the socket dead forever with no restart - which silently
+        # killed reactive detection and pinned /healthz to 503. The
+        # supervisor now re-establishes the socket with backoff and
+        # replays subscriptions. See docs/DESIGN.md 12.
+        self._closing = False
+        self._on_reconnect: Callable[[], Awaitable[None]] | None = None
+        self._on_status: Callable[[bool, str], None] | None = None
+        self._reconnect_attempts = 0
+        # Exposed for /healthz to tell "reconnecting" from "stuck/never up".
+        self.last_connected_at: float | None = None
+        self.last_disconnected_at: float | None = None
+
+    def on_reconnect(self, cb: Callable[[], Awaitable[None]]) -> None:
+        """Register a coroutine replayed after every (re)connect, once the
+        reader is live. The runtime uses this to re-run subscribe_states so
+        the state_changed stream (reactive detection) survives a drop."""
+        self._on_reconnect = cb
+
+    def on_status(self, cb: Callable[[bool, str], None]) -> None:
+        """Register a callback fired on every up/down transition as
+        cb(connected: bool, reason: str). The runtime logs these as
+        `connection`-category events so drops are visible in the UI."""
+        self._on_status = cb
 
     # ---- lifecycle -------------------------------------------------
 
-    async def connect(self) -> None:
+    async def _open_once(self) -> None:
+        """One connect + auth attempt. Starts the reader and marks
+        connected; raises on any failure so the supervisor can back off."""
         try:
             self._ws = await websockets.connect(self._url, ssl=self._ssl_ctx,
                                                 open_timeout=10)
@@ -180,9 +208,87 @@ class HAWebSocket:
         # Rule from the Light cutover: reader BEFORE any subscription.
         self._reader = asyncio.create_task(self._read_loop(), name="ha-ws-reader")
         self.connected = True
+        self.last_connected_at = asyncio.get_event_loop().time()
+
+    async def connect(self) -> None:
+        """Establish the connection and keep it up. The first attempt is
+        awaited so callers still fail fast on a bad URL/token (auth errors
+        are never retried); after that a supervisor task reconnects on drop.
+
+        Idempotent: a call while already supervised is a no-op, so the
+        one-shot deploy path and the long-lived runtime path can share one
+        client without fighting over the socket."""
+        if self._supervisor and not self._supervisor.done():
+            return
+        self._closing = False
+        await self._open_once()          # fail fast on the first attempt
+        if self._on_status:
+            self._on_status(True, "connected")
+        self._supervisor = asyncio.create_task(self._supervise(), name="ha-ws-supervisor")
+
+    async def _supervise(self) -> None:
+        """Own the socket for its lifetime: wait on the reader, and when it
+        exits (a drop) reconnect with capped exponential backoff, replaying
+        the resubscribe hook each time. Runs until close(). An HAAuthError
+        is fatal - a rejected token cannot be fixed by retrying - so it
+        stops and stays down for /healthz to surface."""
+        BASE, CAP = 1.0, 60.0
+        # Replay subscriptions for the socket connect() already opened.
+        await self._after_connect()
+        while not self._closing:
+            if self._reader:
+                try:
+                    await self._reader          # returns when the socket drops
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if self._closing:
+                break
+            self.connected = False
+            self.last_disconnected_at = asyncio.get_event_loop().time()
+            if self._on_status:
+                self._on_status(False, "reader stopped; reconnecting")
+            # Reconnect with backoff until we're up again or told to close.
+            while not self._closing:
+                self._reconnect_attempts += 1
+                delay = min(CAP, BASE * (2 ** min(self._reconnect_attempts - 1, 6)))
+                await asyncio.sleep(delay)
+                if self._closing:
+                    return
+                try:
+                    await self._open_once()
+                except HAAuthError as e:
+                    log.error("ws re-auth rejected, giving up: %s", e)
+                    if self._on_status:
+                        self._on_status(False, f"auth rejected: {e}")
+                    return
+                except Exception as e:
+                    log.warning("ws reconnect attempt %d failed: %s",
+                                self._reconnect_attempts, e)
+                    continue
+                self._reconnect_attempts = 0
+                if self._on_status:
+                    self._on_status(True, "reconnected")
+                await self._after_connect()
+                break
+
+    async def _after_connect(self) -> None:
+        """Replay whatever must exist on a fresh socket (subscriptions)."""
+        if self._on_reconnect:
+            try:
+                await self._on_reconnect()
+            except Exception as e:
+                log.warning("resubscribe hook failed: %s", e)
 
     async def close(self) -> None:
+        self._closing = True
         self.connected = False
+        if self._supervisor:
+            self._supervisor.cancel()
+            try:
+                await self._supervisor
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._supervisor = None
         if self._reader:
             self._reader.cancel()
             try:
