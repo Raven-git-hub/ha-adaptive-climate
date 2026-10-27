@@ -104,11 +104,26 @@ class HA:
     _env = Environment()
     _compiled: dict[str, object] = {}
 
-    def __init__(self, room: str = ROOM, entity: str = ENTITY) -> None:
+    def __init__(self, room: str = ROOM, entity: str = ENTITY, lag: bool = False) -> None:
         self.room, self.entity = room, entity
         self.entities: dict[str, dict] = {}
         self.calls: list[tuple[str, str, dict, bool]] = []    # service, entity, data, guard on
         self.now: datetime | None = None
+        # lag: like the real units, a unit reports a new hvac mode only after
+        # a moment (here: at the next wait, or the end of the run), and
+        # offers fan modes only in cool
+        self.lag = lag
+        self.pending_mode: str | None = None
+        self.waits: list[bool] = []
+
+    def settle(self) -> None:
+        """Time passes: a lagging unit now reports the mode it was sent."""
+        if self.pending_mode is None:
+            return
+        e = self.entities[self.entity]
+        e["state"] = self.pending_mode
+        e["attributes"]["fan_modes"] = FAN_MODES if self.pending_mode == "cool" else None
+        self.pending_mode = None
 
     # -- state --
     def set(self, entity_id: str, state, **attributes) -> None:
@@ -164,7 +179,10 @@ class HA:
             e["state"] = datetime.fromtimestamp(a["timestamp"], table.T0.tzinfo).strftime(
                 "%Y-%m-%d %H:%M:%S")
         elif service == "climate.set_hvac_mode":
-            e["state"] = data["hvac_mode"]
+            if self.lag and entity_id == self.entity:
+                self.pending_mode = data["hvac_mode"]      # reported later
+            else:
+                e["state"] = data["hvac_mode"]
         elif service == "climate.set_temperature":
             a["temperature"] = data["temperature"]
         elif service == "climate.set_fan_mode":
@@ -186,6 +204,7 @@ class HA:
         if not all(self.check(c, variables) for c in automation.get("condition", [])):
             return None
         self.execute(automation["action"], variables)
+        self.settle()
         return variables
 
     def variables(self, automation: dict, overrides: dict | None = None,
@@ -222,6 +241,12 @@ class HA:
                     self.execute(step.get("default", []), variables)
             elif "delay" in step:
                 pass
+            elif "wait_template" in step:
+                self.settle()                   # waiting lets the unit report
+                done = as_boolean(self.render(step["wait_template"], variables))
+                self.waits.append(done)
+                if not done and not step.get("continue_on_timeout", True):
+                    return
             else:
                 raise AssertionError(f"unexpected action {step}")
 
@@ -581,6 +606,15 @@ def _echo_ctx(ha: HA) -> control.Context:
 # The vote fuzz (from v1's maintenance_logic_check), and the extra cases
 # ---------------------------------------------------------------------
 
+def _walk(sequence: list):
+    """Every action in a sequence, through choose blocks."""
+    for step in sequence:
+        yield step
+        for option in step.get("choose", []):
+            yield from _walk(option["sequence"])
+        yield from _walk(step.get("default", []))
+
+
 def _fuzz_votes(n: int, seed: int = 7) -> int:
     rnd = random.Random(seed)
     fails = 0
@@ -664,6 +698,50 @@ def _extra_cases() -> int:
     services = [c[0] for c in ha.calls if c[0].startswith("climate.")]
     expect(services == ["climate.set_hvac_mode", "climate.set_temperature"],
            f"no fan offered: the fan call is skipped, the rest sent ({services})")
+
+    # A unit reports its new mode only after a moment, and offers no fan
+    # modes until it is in cool (the Main Bedroom, released from a leak while
+    # still reporting dry, came up in cool on its remembered fan, high).
+    def lagging(unit: control.Unit, mode: str, **ctx_changes) -> tuple[HA, dict, dict]:
+        ctx = table._ctx(ctx_changes)
+        readings = table.READINGS["settled_warm"]
+        config, room = _config(ctx, list(readings), False)
+        ha = HA(lag=True)
+        ha.now = table.T0
+        _seed(ha, unit, ctx)
+        _context(ha, ctx, readings, table.ALMANAC)
+        ha.set(ENTITY, mode, temperature=24.0, fan_mode="high", fan_modes=None,
+               min_temp=16.0, max_temp=30.0)
+        return ha, config, room
+
+    for what, unit, mode, build in (
+            ("a leak release", control.Unit(state="leak", since=table._time(-table.m(30))), "dry",
+             lambda c, r: (g.build_leak_release_automation(c, r, r["units"][0]),
+                           {"to_state": {"state": "on"}})),
+            ("a scene", control.Unit(state="rest"), "off",
+             lambda c, r: (g.build_scene_automation(c, r, {"id": SECTION}), None)),
+            ("maintenance waking a rest", control.Unit(state="rest", since=table._time(-table.m(60))),
+             "off", lambda c, r: (g.build_maintenance_automation(c, r), None))):
+        ha, config, room = lagging(unit, mode)
+        automation, trigger = build(config, room)
+        ha.run(automation, trigger)
+        sent = _sent(ha.calls) or {}
+        expect(sent.get("hvac_mode") == "cool" and sent.get("fan_mode") == "low",
+               f"{what} with the unit still reporting {mode} (no fan modes): fan low is "
+               f"still sent once it reports cool ({sent})")
+    waits = [step for step in _walk(g.build_scene_automation(config, room, {"id": SECTION})["action"])
+             if "wait_template" in step]
+    expect(len(waits) == 1 and waits[0].get("timeout") == "00:00:30"
+           and waits[0].get("continue_on_timeout") is True,
+           "the wait for the new mode times out after 30 s and carries on")
+    ha, config, room = lagging(control.Unit(state="rest"), "off")
+    ha.settle = lambda: None                     # a unit that never reports the new mode
+    ha.run(g.build_scene_automation(config, room, {"id": SECTION}))
+    sent = _sent(ha.calls) or {}
+    expect(ha.waits == [False] and sent.get("temperature") == 22.0
+           and sent.get("fan_mode") is None and ha.states(g.guard_id(ROOM)) == "off",
+           "a unit that never reports the new mode: the wait times out, the fan is skipped, "
+           "and the run carries on and lowers the guard")
 
     ha, config, room = world(cool)
     ha.run(g.build_maintenance_automation(config, room))

@@ -449,18 +449,28 @@ def _write_unit(room: dict, unit: dict) -> dict:
     ])
 
 
+MODE_WAIT = "00:00:30"     # how long a command waits for the unit to report its new mode
+
+
 def _send_command(unit: dict) -> dict:
     """Send a unit's command, when it has one: the mode, then the setpoint
-    if the command sets one, then the fan if the unit's current mode offers
-    it (a fan call the mode rejects is skipped, as in v1)."""
+    if the command sets one, then the fan. A unit reports its new mode a
+    moment later, and offers fan modes only in some modes (none in dry or
+    off), so the fan waits for the new mode (up to MODE_WAIT, carrying on if
+    it never comes) before its guard is read; a fan call the mode rejects is
+    skipped, as in v1. Every command path - scene, maintenance, leak release
+    - sends through here."""
     e, c = unit["entity_id"], f"{_unit_var(unit)}.cmd"
     return _when(f"{{{{ {c} is not none }}}}", [
         _set("climate.set_hvac_mode", e, {"hvac_mode": f"{{{{ {c}.hvac_mode }}}}"}),
         _when(f"{{{{ {c}.temperature is not none }}}}", [
             _set("climate.set_temperature", e, {"temperature": f"{{{{ {c}.temperature }}}}"})]),
-        _when(f"{{{{ {c}.fan_mode is not none and {c}.fan_mode in "
-              f"(state_attr('{e}', 'fan_modes') or []) }}}}", [
-            _set("climate.set_fan_mode", e, {"fan_mode": f"{{{{ {c}.fan_mode }}}}"})]),
+        _when(f"{{{{ {c}.fan_mode is not none }}}}", [
+            {"wait_template": f"{{{{ states('{e}') == {c}.hvac_mode }}}}",
+             "timeout": MODE_WAIT, "continue_on_timeout": True},
+            _when(f"{{{{ {c}.fan_mode in (state_attr('{e}', 'fan_modes') or []) }}}}", [
+                _set("climate.set_fan_mode", e, {"fan_mode": f"{{{{ {c}.fan_mode }}}}"})]),
+        ]),
     ])
 
 

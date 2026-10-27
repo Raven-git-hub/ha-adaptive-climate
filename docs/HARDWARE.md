@@ -34,10 +34,15 @@ Two consequences for the generator (Phase 5):
    fan_modes from a unit in cool, not whatever mode it happens to be in, or it
    will record a false "no fan" for any unit resting in dry/fan_only.
 
-2. **Guard `set_fan_mode` anyway.** A unit coming out of `dry` or `off` may not
-   expose its fan list yet. A `set_fan_mode` call must tolerate failure/absence
-   rather than abort the crossover. Map cool -> `low`, boost -> `medium` on all
-   three units; fall back to skipping fan if the current mode rejects it.
+2. **Wait for the new mode, then guard `set_fan_mode`.** A unit reports a mode
+   change a moment after the command, and a unit coming out of `dry` or `off`
+   doesn't expose its fan list until then: releasing the Main Bedroom's leak
+   while it still reported dry skipped the fan, and it came up in cool on its
+   remembered fan, high. Every generated command therefore waits (up to 30 s)
+   for the unit to report the new mode before reading `fan_modes`. A
+   `set_fan_mode` call must still tolerate absence rather than abort the
+   crossover. Map cool -> `low`, boost -> `medium` on all three units; skip the
+   fan if the mode still rejects it.
 
 ## Setpoints: store precise, apply snapped
 
