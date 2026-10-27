@@ -129,8 +129,8 @@ The runtime's provisional seeding at crossover is retired. Instead, when the fir
 **The replay runs:**
 
 - after every reaction, so the UI updates immediately;
-- 65 minutes after each setpoint-moving reaction, to apply its comfort window;
-- on the first heartbeat in a section with no almanac;
+- 65 minutes after each setpoint-moving reaction, to apply its comfort window (on startup the runtime re-arms this for the setpoint-moving reactions of the last 65 minutes, so a restart doesn't hold the comfort update until 00:15);
+- on the first heartbeat in a section with no almanac, or on any heartbeat that can seed a unit or sensor the almanac doesn't have yet (a unit that was off at the section's first heartbeat);
 - nightly at 00:15, as a consistency check.
 
 The bootstrap state and validity delay are removed. A section is **provisional** until its first setpoint-moving reaction, then **learned**.
@@ -371,7 +371,7 @@ Phase 0 defines every v2 key in the schema up front, with defaults, so saving a 
 - `outdoor`: `source` none, `weather_entity` null, `probe_entity` null, `block_mode` shadow, `lean_per_degree` 0.1, `initial_margin` 6. `weather_entity` (a `weather.*` entity) must be set when `source` is `forecast`, and `probe_entity` (a `sensor.*` entity) when it is `probe`. Phase 4 consumes them.
 - `rooms[].heat_sources` (entity ids) and `rooms[].knobs` (`{id, name?}`, a placeholder until the hardware is settled): empty
 
-The loader moves `system.max_step_degrees` to `system.control.boost_degrees` and `system.correction_max_minutes` to `system.control.boost_max_minutes`. `bootstrap_min_days`, `validity_delay_days` and `analysis_window_days` are dropped. A scene's per-unit `mode: off` is kept and maps to the `config_off` state.
+The loader moves `system.max_step_degrees` to `system.control.boost_degrees` and `system.correction_max_minutes` to `system.control.boost_max_minutes`. `bootstrap_min_days`, `validity_delay_days`, `analysis_window_days` and `reactive_weight` are dropped. A scene's per-unit `mode: off` is kept and maps to the `config_off` state.
 
 ### Storage
 
@@ -383,7 +383,8 @@ Phase 0 gives the database a real migration path:
 - **New columns:** heartbeat outdoor value; per-unit control state and offset; reaction kind (room and unit), per-unit power before and after, and outdoor value; section-run outdoor mean, max, comfort point, lean, and the block decision as `blocked` plus the `block_mode` in force (so shadow "would have blocked" is `blocked` = 1 in `shadow`).
 - **Older rows:** treated as `kind = setpoint` with no outdoor value.
 - **CSV:** new columns are appended at the end, so old files still ingest. `section_run` is now written to CSV as well.
-- **Re-ingest:** rebuilding SQLite from CSV is a prerequisite for Gate A, not for phase 1.
+- **Re-ingest:** rebuilding SQLite from CSV is a prerequisite for Gate A, not for phase 1. Section runs reach the CSV only from phase 0, so re-ingest has to apply migration 2's rule (close an open run at the room's next run's start) to whatever it rebuilds.
+- **Migration 2 (phase 1, data only):** v1 closed a section run by its close date, so every sleep run and every run a restart interrupted stayed open. Migration 2 closes each open run except the room's latest at the next run's start; the runtime now closes the room's open run by being open, and dates a run by its planned start.
 
 ### Seeding from v1 data
 
@@ -460,3 +461,21 @@ From phase 0 planning, 27 Oct 2026:
 18. **Outdoor entities:** `outdoor.weather_entity` and `outdoor.probe_entity` are defined now, nullable, each required by its source; phase 4 consumes them.
 19. **Knob config:** `{id, name?}` is the placeholder shape until the hardware is settled.
 20. **Room-level reaction kind** is stored on the reaction as well as per unit.
+
+From phase 1, 27 Oct 2026. Where the phase brief and this document differed, the document won:
+
+21. **Setpoint-moving is by kind** (setpoint or knob turn; a NULL kind is a pre-v2 setpoint change), not by `setpoint_after` ≠ `setpoint_before`. They differ only for a window that ends where it began (22 → 23 → 22): it still makes the section learned and opens a comfort window, but leaves S and the rounding direction alone.
+22. **Rounding is to whole degrees.** The unit's `target_temp_step` is a Home Assistant attribute, in neither config nor CSV, so a deterministic replay can't know it; every unit is step 1. `round_toward` takes the step as a parameter for later.
+23. **Comfort moves at `reaction_rate`** toward the window mean, as this document says; that is halfway at the default.
+
+Decisions this document hadn't covered:
+
+24. **The seed is the replay's starting state** for every reaction, even one recorded before the seed heartbeat (harmless: such a seed was taken after the person set the unit).
+25. **The comfort window is inclusive**, 30 to 60 minutes after the recorded reaction time, and applies only once it has closed, so a replay at reaction time never uses part of one. A sensor with no seed isn't updated by it.
+26. **Band recency weighting is by day**, as in v1. A reaction's band direction is the sign of its summed `setpoint_after − setpoint_before` across units; zero teaches no band. On (cooler) and off (warmer) are handled now and stay inert until phase 2 records those kinds.
+27. **Confidence counts closed runs** that started after the room-section's last reaction, matching heartbeats and reactions to a run by time.
+28. **A heartbeat replays the room** when the section has no almanac or lacks a unit or sensor the heartbeat could seed, not only for the section's first heartbeat.
+29. **`learning.reactive_weight` is dropped** from the v2 schema; `migrate()` strips it from v1 configs, and the UI no longer shows it. Nothing reads it in v2, and no v2 config was ever saved.
+30. **Comfort replays are re-armed on startup** for setpoint-moving reactions in the last 65 minutes.
+31. **Section runs are closed by being open, not by date**, and dated by their planned start; migration 2 repairs the runs v1 left open (own commit, before phase 1).
+32. **The deploy warning in CLAUDE.md is reworded** now that phase 1 has landed: never deploy a build with phase 0 but not phase 1; otherwise deploy follows this build plan.

@@ -27,8 +27,9 @@ import json
 import sqlite3
 import sys
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -145,27 +146,28 @@ def check_fresh_store() -> None:
     assert act["section_runs"][0]["ended_at"] == f"{rd}T14:00:00+08:00"
     print("reads: recent_events + activity(day) return written data, section closed - OK")
 
-    # --- end to end: analyser over what the store recorded ---
-    sections = analyse_room(store._conn, ROOM, LearningConfig(), AS_OF)
+    # --- end to end: the reaction replay over what the store recorded ---
+    as_of = datetime.combine(AS_OF, time(0, 15), tzinfo=ZoneInfo("Asia/Hong_Kong"))
+    sections = analyse_room(store._conn, ROOM, LearningConfig(), as_of)
     day = next(s for s in sections if s.section == "day")
     sp = day.unit_setpoints["main_room_ac"]
     # reaction on living1 at reading 23.9 vs its comfort 24.9 -> band ~1.0, trust up
     b1 = day.sensor_band["living1"]
     print(f"analyser over stored data: setpoint={sp:.3f}, living1 band=±{b1:.3f} "
           f"trust={day.sensor_trust['living1']:.3f}")
-    assert 22.0 < sp <= 23.0, sp                     # pulled up by the 5x reaction
-    assert abs(b1 - 1.0) < 1e-6, b1                  # |24.9 - 23.9|
-    assert day.sensor_band["living2"] == 5.0          # never reacted -> widest
+    assert sp == 22.5, sp                            # seed 22, halfway to the chosen 23
+    assert abs(b1 - 1.0) < 1e-6, b1                  # |24.9 - 23.9|, warmer wanted, below
+    assert day.sensor_band["living2"] == 5.0          # sat at comfort -> learns nothing
     print("end-to-end observe->learn path holds together")
 
-    # --- almanac: v1 analyser states are published as v2 status ---
+    # --- almanac: status and setpoint_applied stored and served ---
     store.publish_almanac("main_room", sections)
     served = store.current_almanac("main_room", as_of=day.valid_from)["sections"]["day"]
-    assert day.state == "learning" and served["status"] == "learned", served
-    assert served["units"]["main_room_ac"] == {"setpoint": sp, "setpoint_applied": None,
+    assert served["status"] == "learned", served
+    assert served["units"]["main_room_ac"] == {"setpoint": 22.5, "setpoint_applied": 23.0,
                                                "off": False}
     assert "state" not in served and "sample_days" not in served
-    print("almanac: 'learning' published as status 'learned', setpoint_applied null - OK")
+    print("almanac: status 'learned' and setpoint_applied 23 stored and served - OK")
 
     # --- v2 columns round-trip; allowed-value lists are enforced ---
     store.record_heartbeat(

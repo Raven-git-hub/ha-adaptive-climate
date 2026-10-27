@@ -128,7 +128,7 @@
     "learning": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Learning tuning; trust-specific knobs live under system.trust. v1's analysis_window_days, bootstrap_min_days and validity_delay_days are gone: the v2 replay has no window, bootstrap or validity delay.",
+      "description": "Learning tuning; trust-specific knobs live under system.trust. v1's analysis_window_days, bootstrap_min_days, validity_delay_days and reactive_weight are gone: the v2 replay has no window, bootstrap or validity delay, and learns from reactions alone.",
       "properties": {
         "reaction_rate": {
           "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.5,
@@ -137,10 +137,6 @@
         "recency_half_life_days": {
           "type": "number", "exclusiveMinimum": 0, "default": 7,
           "description": "Half-life of a reaction's weight in band learning, over all history."
-        },
-        "reactive_weight": {
-          "type": "number", "minimum": 1, "default": 5,
-          "description": "A reactive event counts this many times a heartbeat. You correcting the system is its most valuable signal."
         }
       }
     },

@@ -11,6 +11,11 @@ template's algorithm, not that HA's own Jinja dialect accepts every
 construct verbatim (run tools/doctor.py against a live instance for that,
 once it gains a template-render check).
 
+It also renders the scene and correction setpoint templates and the skip
+condition: they must drive the almanac's setpoint_applied unrounded, only
+clamped to the unit's range (plus the correction offset), and skip a unit
+that has none.
+
     PYTHONPATH=. python tools/maintenance_logic_check.py
 """
 from __future__ import annotations
@@ -104,7 +109,59 @@ def _fuzz_scenarios(n: int, seed: int = 7) -> list:
     return out
 
 
+def check_setpoint_templates() -> int:
+    """The scene and maintenance templates drive the almanac's
+    setpoint_applied unrounded, only clamped to the unit's range (plus the
+    correction offset), never the precise setpoint; a unit with no
+    setpoint_applied, or flagged off, is skipped. Reference: plain Python."""
+    entity, alm, sec, uid = "climate.x", "sensor.ac_almanac_r", "day", "u1"
+    fails = checked = 0
+
+    def env_for(units: dict, lo: int, hi: int) -> Environment:
+        def state_attr(eid, attr):
+            if eid == alm and attr == "sections":
+                return {sec: {"units": units}}
+            return {"min_temp": lo, "max_temp": hi, "target_temp_step": 1}.get(attr)
+        env = Environment()
+        env.globals["state_attr"] = state_attr
+        return env
+
+    for applied in (15.0, 16.0, 17.0, 22.0, 23.0, 29.0, 31.0):
+        for lo, hi in ((16, 30), (18, 30)):
+            # the precise setpoint differs, to prove the template ignores it
+            units = {uid: {"setpoint": applied - 0.4, "setpoint_applied": applied}}
+            env = env_for(units, lo, hi)
+            got = float(env.from_string(g._setpoint_template(alm, sec, uid, entity)).render())
+            checked += 1
+            if got != min(max(applied, lo), hi):
+                fails += 1
+                print(f"[FAIL] scene setpoint: applied={applied} range={lo}-{hi} -> {got}")
+            for offset in (-2, 0):
+                tmpl = env.from_string(g._correction_setpoint_template(uid, entity, offset))
+                got = float(tmpl.render(unit_data=units))
+                checked += 1
+                if got != min(max(applied + offset, lo), hi):
+                    fails += 1
+                    print(f"[FAIL] correction: applied={applied} offset={offset} "
+                          f"range={lo}-{hi} -> {got}")
+
+    for units, skip in (({}, True),
+                        ({uid: {"setpoint": 22.4, "setpoint_applied": None}}, True),
+                        ({uid: {"setpoint": 22.4}}, True),
+                        ({uid: {"setpoint_applied": 22.0, "off": True}}, True),
+                        ({uid: {"setpoint_applied": 22.0}}, False)):
+        got = env_for(units, 16, 30).from_string(g._skip_condition(alm, sec, uid)).render()
+        checked += 1
+        if got != str(skip):
+            fails += 1
+            print(f"[FAIL] skip condition for {units}: {got}, expected {skip}")
+
+    print(f"{checked - fails}/{checked} setpoint template cases matched the Python reference")
+    return fails
+
+
 def main() -> int:
+    template_fails = check_setpoint_templates()
     scenarios = _hand_scenarios() + _fuzz_scenarios(40)
     fails = 0
     for i, spec in enumerate(scenarios):
@@ -117,8 +174,8 @@ def main() -> int:
             print(f"[FAIL] scenario {i}: jinja={got}  reference={ref}")
 
     print(f"{len(scenarios) - fails}/{len(scenarios)} scenarios matched the app.trust reference")
-    if fails:
-        print("MISMATCH: the generated Jinja disagrees with app.trust")
+    if fails or template_fails:
+        print("MISMATCH: the generated Jinja disagrees with its Python reference")
         return 1
     print("Jinja vote/quorum/direction logic matches app.trust exactly")
     return 0

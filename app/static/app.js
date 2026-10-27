@@ -515,7 +515,6 @@ function settingsHtml() {
   const sys = cfg.system || (cfg.system = {});
   const trust = sys.trust || (sys.trust = {});
   const ctl = sys.control || (sys.control = {});
-  const learn = cfg.learning || (cfg.learning = {});
   const ha = cfg.homeassistant || (cfg.homeassistant = {});
   return `<details class="panel"><summary>System, learning &amp; connection settings</summary>
     <div class="field-grid">
@@ -533,7 +532,6 @@ function settingsHtml() {
       <label>Boost cap (min) ${numField("system.control.boost_max_minutes", ctl.boost_max_minutes ?? 60)}</label>
       <label>High-trust deviation (\u00b0) ${numField("system.trust.high_trust_deviation", trust.high_trust_deviation ?? 0.5, {step:"0.1"})}</label>
       <label>Low-trust deviation (\u00b0) ${numField("system.trust.low_trust_deviation", trust.low_trust_deviation ?? 5.0, {step:"0.5"})}</label>
-      <label>Reactive weight (\u00d7) ${numField("learning.reactive_weight", learn.reactive_weight ?? 5)}</label>
       <label class="wide">External guard booleans (comma-separated, coexistence only)
         <input type="text" data-path="system.external_guards" data-vtype="csv" data-live="1"
           value="${escapeHtml((sys.external_guards || []).join(", "))}" /></label>

@@ -5,12 +5,18 @@ Drives app.runtime.Runtime against stub REST/WebSocket objects and a real
 Store (no Home Assistant, no network). Verifies:
   * startup catch-up fires a crossover per room (automation.trigger on the
     room's scene automation, resolved by config-id -> entity_id)
-  * a provisional almanac is seeded and pushed on first crossover
-  * a heartbeat samples every sensor and unit and records it
-  * reactive detection records a genuine user setpoint change, raising hold
+  * no provisional almanac is seeded at crossover
+  * a heartbeat samples every sensor and unit and records it, and the first
+    heartbeat in an unseeded section (or one that can seed a unit the
+    almanac lacks) replays and pushes the almanac
+  * reactive detection records a genuine user setpoint change, raising hold,
+    replays the almanac at once and again after the comfort window
   * an automation-caused change (context.parent_id set) is ignored
   * a change during the guard window is ignored
   * several changes in one reactive window record the first setpoint_before
+  * a sleep section run crossing midnight closes against its start date
+  * on restart, comfort-window replays are re-armed for recent setpoint-moving
+    reactions only
 
     PYTHONPATH=. python tools/runtime_check.py
 """
@@ -20,10 +26,13 @@ import asyncio
 import json
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import app.runtime as runtime_mod                               # noqa: E402
 from app.runtime import Runtime                                  # noqa: E402
 from app.store import Store                                      # noqa: E402
 from app.generator import SECTIONS                               # noqa: E402
@@ -94,6 +103,20 @@ class StubWS:
         pass
 
 
+def replays(store, room_id: str, reason: str) -> list[dict]:
+    return [e for e in store.recent_events(limit=1000, room_id=room_id, category="analysis")
+            if (e.get("detail") or {}).get("reason") == reason]
+
+
+async def eventually(cond, what: str, timeout: float = 5.0) -> None:
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while not cond():
+        if loop.time() > end:
+            raise AssertionError(f"timed out waiting for {what}")
+        await asyncio.sleep(0.05)
+
+
 def _state_changed(entity_id, before, after, parent_id=None, state="cool"):
     return {"event_type": "state_changed",
             "context": {"id": "c1", "parent_id": parent_id, "user_id": "u1"},
@@ -108,8 +131,10 @@ async def main() -> int:
     store = Store(tmp, SCHEMA)
     rest = StubRest(_build_states())
     ws = StubWS()
-    # tiny reactive window so the flush completes fast
+    # tiny reactive window so the flush completes fast, and a comfort-window
+    # replay one second after each reaction instead of 65 minutes
     CONFIG.setdefault("system", {})["reactive_window_seconds"] = 1
+    runtime_mod.COMFORT_REPLAY_DELAY = timedelta(seconds=1)
     rt = Runtime(CONFIG, store, rest, ws, tmp)
 
     await rt.start()
@@ -122,15 +147,11 @@ async def main() -> int:
         assert any(e.startswith(f"automation.ac_{r}_") for e in trig_entities), r
     print(f"startup: fired catch-up crossover for all 3 rooms ({len(triggers)} triggers) - OK")
 
-    # --- provisional almanac seeded + pushed ---
-    from datetime import date
-    alm = store.current_almanac("main_room", as_of=date.today())
-    assert alm["sections"], "no provisional almanac seeded"
-    seeded_section = next(iter(alm["sections"]))
-    assert alm["sections"][seeded_section]["status"] == "provisional"
-    pushes = [s for s in rest.set_states if s[0] == "sensor.ac_almanac_main_room"]
-    assert pushes, "almanac not pushed to HA"
-    print(f"startup: provisional almanac seeded ({seeded_section}) and pushed to HA - OK")
+    # --- no provisional seeding at crossover any more ---
+    for r in rt.rooms:
+        assert store.current_almanac(r, as_of=rt._today())["sections"] == {}, r
+    assert not store.recent_events(category="analysis")
+    print("startup: no provisional almanac seeded at crossover; nothing replayed yet - OK")
 
     # --- heartbeat sampling ---
     rs = rt.rooms["main_room"]
@@ -142,6 +163,38 @@ async def main() -> int:
     assert hb == 1 and hbs == 3, (hb, hbs)
     assert hbu[0] == 22.0 and hbu[1] == 1 and hbu[2] == "normal", tuple(hbu)
     print(f"heartbeat: recorded 1 heartbeat, 3 sensors, unit setpoint 22 state 'normal' - OK")
+
+    # --- the first heartbeat in an unseeded section replays and pushes ---
+    sec = rs.section
+    alm = store.current_almanac("main_room", as_of=rt._today())["sections"]
+    assert list(alm) == [sec], list(alm)
+    assert alm[sec]["status"] == "provisional"
+    assert alm[sec]["units"]["main_room_ac"]["setpoint_applied"] == 22.0
+    assert set(alm[sec]["sensors"]) == {"living1", "living2", "living3"}
+    assert len(replays(store, "main_room", "first heartbeat in section")) == 1
+    pushed = [s for s in rest.set_states if s[0] == "sensor.ac_almanac_main_room"][-1]
+    assert pushed[2]["sections"][sec]["units"]["main_room_ac"]["setpoint_applied"] == 22.0
+    await asyncio.sleep(1.05)                    # heartbeats are unique per second
+    await rt._do_heartbeat(rs)                   # nothing new to seed: no replay
+    assert len(store.recent_events(room_id="main_room", category="analysis")) == 1
+    print(f"heartbeat: the first one in '{sec}' replayed and pushed a provisional almanac "
+          f"(applied 22); the next one, with nothing new to seed, did not - OK")
+
+    bed_rs = rt.rooms["main_bedroom"]
+    bed_unit = next(s for s in rest._states
+                    if s["entity_id"] == "climate.home_s_device_2_home_s_device_2")
+    bed_unit["state"] = "off"
+    await rt._do_heartbeat(bed_rs)
+    bed_alm = store.current_almanac("main_bedroom", as_of=rt._today())["sections"]
+    assert bed_alm[bed_rs.section]["units"] == {}, bed_alm
+    bed_unit["state"] = "cool"
+    await asyncio.sleep(1.05)
+    await rt._do_heartbeat(bed_rs)
+    bed_alm = store.current_almanac("main_bedroom", as_of=rt._today())["sections"]
+    assert bed_alm[bed_rs.section]["units"]["main_bedroom_ac"]["setpoint_applied"] == 22.0
+    assert len(replays(store, "main_bedroom", "new seed in section")) == 1
+    print("heartbeat: a unit off at its section's first heartbeat is seeded by the replay "
+          "the first heartbeat with it on triggers - OK")
 
     # --- reactive: genuine user change ---
     rt._cache["input_boolean.ac_active_main_room"] = "off"
@@ -158,6 +211,15 @@ async def main() -> int:
     assert rx == 1, rx
     assert rxs == 3, rxs   # all sensors snapshotted at reaction time
     print(f"reactive: user setpoint change recorded, hold raised, 3 sensors snapshotted - OK")
+    assert len(replays(store, "main_room", "reaction")) == 1
+    alm = store.current_almanac("main_room", as_of=rt._today())["sections"][sec]
+    assert alm["status"] == "learned", alm
+    assert alm["units"]["main_room_ac"]["setpoint"] == 23.0          # 22 + 0.5 x (24 - 22)
+    assert alm["units"]["main_room_ac"]["setpoint_applied"] == 23.0
+    print("reactive: replayed at once - learned, setpoint 22 -> 23 and applied 23 - OK")
+    await eventually(lambda: replays(store, "main_room", "comfort window"),
+                     "the comfort-window replay")
+    print("reactive: replayed again once the comfort window had closed - OK")
 
     # --- reactive: automation-caused change is ignored ---
     before_rx = c.execute("SELECT COUNT(*) FROM reactive").fetchone()[0]
@@ -213,9 +275,24 @@ async def main() -> int:
 
     await rt.stop()
 
-    # --- restart with almanac already seeded + select already on-section:
-    #     catch-up must NOT re-fire the scene (no gratuitous beep) ---
-    seeded_section = seeded_section  # from above
+    # --- restart: re-arm comfort replays for recent setpoint-moving reactions ---
+    runtime_mod.COMFORT_REPLAY_DELAY = timedelta(seconds=3)
+    hk = ZoneInfo("Asia/Hong_Kong")
+
+    def record(seconds_ago: float, kind=None) -> None:
+        when = datetime.now(hk) - timedelta(seconds=seconds_ago)
+        store.record_reactive(
+            "baby_room", when.isoformat(timespec="seconds"),
+            when.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            when.date().isoformat(), "day", 120,
+            units={"baby_room_ac": runtime_mod.ReactiveUnitSample(22.0, 23.0, True)},
+            sensors={"baby": 24.0}, kind=kind)
+    record(1)                       # setpoint-moving, inside the window: re-armed
+    record(10)                      # too old: its window is already handled
+    record(2, kind="manual")        # not setpoint-moving: no comfort window
+
+    # --- restart with the select already on-section: catch-up must NOT
+    #     re-fire the scene (no gratuitous beep) ---
     rest2 = StubRest(_build_states())
     # HA now reports the scene select already sitting on the active section
     active_now, _ = __import__("app.scheduler", fromlist=["active_section_at"]).active_section_at(
@@ -228,7 +305,16 @@ async def main() -> int:
     await rt2.start()
     refires = [c for c in rest2.service_calls if c[:2] == ("automation", "trigger")]
     assert refires == [], f"restart re-fired scenes (would beep): {refires}"
-    print("restart: almanac present + already in section -> no scene re-fire (no beep) - OK")
+    print("restart: already in section -> no scene re-fire (no beep) - OK")
+    # (main_room's own reactions above are also under 3 s old, so re-armed too)
+    baby = [t.get_name() for t in rt2._followups if t.get_name() == "ac-comfort-baby_room"]
+    assert len(baby) == 1, [t.get_name() for t in rt2._followups]
+    await eventually(lambda: replays(store, "baby_room", "comfort window"),
+                     "the re-armed comfort-window replay")
+    await asyncio.sleep(0.5)
+    assert len(replays(store, "baby_room", "comfort window")) == 1
+    print("restart: one comfort replay re-armed (the recent setpoint change, not the old "
+          "one or the manual one), and it ran - OK")
     await rt2.stop()
     store.close()
     print("\nALL RUNTIME CHECKS PASSED")

@@ -22,7 +22,6 @@
     }
   },
   "learning": {
-    "reactive_weight": 5,
     "reaction_rate": 0.5,
     "recency_half_life_days": 7
   },

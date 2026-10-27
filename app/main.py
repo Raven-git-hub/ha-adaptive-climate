@@ -69,20 +69,6 @@ def _raw_config() -> dict:
     return blank()
 
 
-def _learning_config(cfg: dict) -> LearningConfig:
-    learn = cfg.get("learning", {})
-    trust = cfg.get("system", {}).get("trust", {})
-    base = LearningConfig()
-    return LearningConfig(
-        analysis_window_days=learn.get("analysis_window_days", base.analysis_window_days),
-        bootstrap_min_days=learn.get("bootstrap_min_days", base.bootstrap_min_days),
-        validity_delay_days=learn.get("validity_delay_days", base.validity_delay_days),
-        reactive_weight=learn.get("reactive_weight", base.reactive_weight),
-        high_trust_deviation=trust.get("high_trust_deviation", base.high_trust_deviation),
-        low_trust_deviation=trust.get("low_trust_deviation", base.low_trust_deviation),
-    )
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -234,16 +220,16 @@ async def api_run_analysis() -> dict:
     if not state.store:
         raise HTTPException(503, "store not ready")
     if state.runtime is not None:
-        await state.runtime.run_analysis()  # type: ignore[attr-defined]
+        await state.runtime.run_analysis("manual")  # type: ignore[attr-defined]
         return {"ok": True, "via": "runtime"}
     cfg = _raw_config()
-    lc = _learning_config(cfg)
-    today = date.today()
+    lc = LearningConfig.from_config(cfg)
+    now = datetime.now().astimezone()
     built = {}
     for room in cfg.get("rooms", []):
         if not room.get("enabled", True):
             continue
-        sections = analyse_room(state.store._conn, room, lc, today)
+        sections = analyse_room(state.store._conn, room, lc, now)
         state.store.publish_almanac(room["id"], sections)
         built[room["id"]] = [s.section for s in sections]
     return {"ok": True, "built": built}

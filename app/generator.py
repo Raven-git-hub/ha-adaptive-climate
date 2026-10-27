@@ -158,20 +158,22 @@ def _skip_condition(alm: str, section: str, unit_id: str) -> str:
     """True when there is nothing safe to drive the unit to: either the
     almanac's off flag is set (reserved; the analyser never sets this
     today - scene-level off is handled separately, statically, below) or
-    no setpoint has been learned yet. In BOTH cases the correct action is
-    to leave the unit alone, not command it off - see _drive_unit."""
+    the unit has no seed yet, so no applied setpoint. In BOTH cases the
+    correct action is to leave the unit alone, not command it off - see
+    _drive_unit."""
     return (_unit_lookup(alm, section, unit_id)
-            + "{{ (u.get('off')) or (u.get('setpoint') is none) }}")
+            + "{{ (u.get('off')) or (u.get('setpoint_applied') is none) }}")
 
 
 def _setpoint_template(alm: str, section: str, unit_id: str, entity: str) -> str:
+    """The almanac's setpoint_applied, clamped to the unit's range. It is
+    already a whole degree, rounded toward the last reaction, so the
+    template never rounds (docs/ALMANAC_FORMAT.md)."""
     return (_unit_lookup(alm, section, unit_id) +
-            "{% set sp = u.get('setpoint') %}"
-            "{% set step = state_attr('<<E>>','target_temp_step') or 1 %}"
+            "{% set sp = u.get('setpoint_applied') %}"
             "{% set lo = state_attr('<<E>>','min_temp') or 16 %}"
             "{% set hi = state_attr('<<E>>','max_temp') or 30 %}"
-            "{% set snapped = ((sp / step) | round(0)) * step %}"
-            "{{ [[snapped, lo] | max, hi] | min }}"
+            "{{ [[sp, lo] | max, hi] | min }}"
             ).replace("<<E>>", entity)
 
 
@@ -212,7 +214,7 @@ def _drive_mode_actions_live(unit: dict, hvac_mode: str, offset: float, fan_mode
         _set("climate.set_hvac_mode", e, {"hvac_mode": hvac_mode}),
         {"choose": [{
             "conditions": [{"condition": "template", "value_template":
-                            "{{ (unit_data.get('" + uid + "') or {}).get('setpoint') is not none }}"}],
+                            "{{ (unit_data.get('" + uid + "') or {}).get('setpoint_applied') is not none }}"}],
             "sequence": [_set("climate.set_temperature", e,
                               {"temperature": _correction_setpoint_template(uid, e, offset)})],
         }], "default": []},
@@ -242,7 +244,7 @@ def _drive_dry_actions_literal(alm: str, section: str, unit: dict) -> list:
         {"choose": [{
             "conditions": [{"condition": "template",
                             "value_template": _unit_lookup(alm, section, uid)
-                                              + "{{ u.get('setpoint') is not none }}"}],
+                                              + "{{ u.get('setpoint_applied') is not none }}"}],
             "sequence": [_set("climate.set_temperature", e,
                               {"temperature": _setpoint_template(alm, section, uid, e)})],
         }], "default": []},
@@ -508,15 +510,15 @@ def _vote_expr(room: dict, low_dev: float) -> str:
 
 
 def _correction_setpoint_template(unit_id: str, entity: str, offset: float) -> str:
+    """setpoint_applied plus a whole-degree offset, clamped to the unit's
+    range; no rounding, as the applied value is already whole."""
     return (
         "{% set u = unit_data.get('<<U>>') or {} %}"
-        "{% set sp = u.get('setpoint') %}"
-        "{% set step = state_attr('<<E>>','target_temp_step') or 1 %}"
+        "{% set sp = u.get('setpoint_applied') %}"
         "{% set lo = state_attr('<<E>>','min_temp') or 16 %}"
         "{% set hi = state_attr('<<E>>','max_temp') or 30 %}"
         "{% set target = sp + (<<OFF>>) %}"
-        "{% set snapped = ((target / step) | round(0)) * step %}"
-        "{{ [[snapped, lo] | max, hi] | min }}"
+        "{{ [[target, lo] | max, hi] | min }}"
     ).replace("<<U>>", unit_id).replace("<<E>>", entity).replace("<<OFF>>", repr(offset))
 
 
@@ -530,7 +532,7 @@ def _correction_gate_template(room: str, unit: dict) -> str:
         leak_clause = f" and states('{leak_id(room, uid)}') != 'on'"
     return (
         "{{ vote.direction in ('warm','cool')"
-        f" and (unit_data.get('{uid}') or {{}}).get('setpoint') is not none"
+        f" and (unit_data.get('{uid}') or {{}}).get('setpoint_applied') is not none"
         f" and not (unit_data.get('{uid}') or {{}}).get('off', false)"
         f" and states('{entity}') not in ('off','unavailable','unknown')"
         f"{leak_clause} }}}}"

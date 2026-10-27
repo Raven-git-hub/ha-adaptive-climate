@@ -65,10 +65,11 @@ def main() -> int:
     assert out["system"]["control"]["boost_max_minutes"] == 45
     assert "max_step_degrees" not in out["system"]
     assert "correction_max_minutes" not in out["system"]
-    assert out["learning"] == {"reactive_weight": 4, "reaction_rate": 0.5,
-                               "recency_half_life_days": 7}, out["learning"]
+    assert out["learning"] == {"reaction_rate": 0.5, "recency_half_life_days": 7}, \
+        out["learning"]
     print("migration: max_step_degrees/correction_max_minutes move under system.control "
-          "with their values; the three v1 learning keys are dropped - OK")
+          "with their values; the four v1 learning keys (window, bootstrap, delay, "
+          "reactive_weight) are dropped - OK")
 
     # --- only v2's new keys are defaulted ---
     sparse = copy.deepcopy(V1)
@@ -100,6 +101,9 @@ def main() -> int:
     leftover = copy.deepcopy(V2)
     leftover["learning"]["bootstrap_min_days"] = 7
     expect_error(leftover, "bootstrap_min_days")
+    stale_weight = copy.deepcopy(V2)
+    stale_weight["learning"]["reactive_weight"] = 5
+    expect_error(stale_weight, "reactive_weight")
     leftover = copy.deepcopy(V2)
     leftover["system"]["correction_max_minutes"] = 60
     expect_error(leftover, "correction_max_minutes")

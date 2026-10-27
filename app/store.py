@@ -234,11 +234,6 @@ MIGRATIONS: list[tuple[str, Callable[[sqlite3.Connection, _Schema], None]]] = [
     ("phase0", _migration_2),
 ]
 
-# The v1 analyser's almanac states, until phase 1's replay emits status.
-_STATUS_FROM_STATE = {"provisional": "provisional", "bootstrap": "provisional",
-                      "learning": "learned", "learned": "learned"}
-
-
 def _now_pair() -> tuple[str, str]:
     n = datetime.now().astimezone()
     return (n.isoformat(timespec="seconds"),
@@ -549,6 +544,14 @@ class Store:
         raise NotImplementedError("CSV re-ingest (recovery path) - required before Gate A")
 
     # --- reads -----------------------------------------------------
+    def reactions_since(self, room_id: str, since_utc: str) -> list[tuple[str, str | None]]:
+        """(ts_utc, kind) of the room's reactions at or after since_utc, oldest
+        first. The runtime uses it at startup to re-arm comfort replays."""
+        with self._lock:
+            return [(r["ts_utc"], r["kind"]) for r in self._conn.execute(
+                "SELECT ts_utc, kind FROM reactive WHERE room_id=? AND ts_utc>=? "
+                "ORDER BY ts_utc, id", (room_id, since_utc))]
+
     def recent_events(self, limit: int = 200, room_id: str | None = None,
                       category: str | None = None,
                       severity: str | None = None) -> list[dict]:
@@ -634,8 +637,7 @@ class Store:
                     cur = self._conn.execute(
                         "INSERT INTO almanac(room_id,section,valid_from,status,"
                         "confidence,built_at) VALUES(?,?,?,?,?,?)",
-                        (room_id, sa.section, vf, _STATUS_FROM_STATE.get(sa.state, sa.state),
-                         sa.confidence, built_at))
+                        (room_id, sa.section, vf, sa.status, sa.confidence, built_at))
                     aid = cur.lastrowid
                     self._conn.executemany(
                         "INSERT INTO almanac_unit(almanac_id,unit_id,setpoint,"

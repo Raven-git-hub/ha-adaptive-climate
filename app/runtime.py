@@ -10,17 +10,21 @@ Observation (passive):
   * reactive detection - a state_changed subscription; a user setpoint
     change (NOT automation-caused) opens a consolidation window, snapshots
     every sensor, and records one reactive event, raising ac_hold so
-    maintenance stands down until the next crossover.
+    maintenance stands down until the next crossover (until phase 3b).
+
+Learning (docs/V2_DESIGN.md, Rebuilding) - replay_room() re-runs the
+reaction replay for a room and pushes the result:
+  * right after each recorded reaction;
+  * 65 minutes after each setpoint-moving reaction, once its comfort window
+    has closed (re-armed at startup for reactions in the last 65 minutes);
+  * on a heartbeat that can seed something the almanac lacks: a section
+    with no almanac, or a unit or sensor not yet in it;
+  * nightly at 00:15, as a consistency check.
 
 Control (active):
   * scheduler loop - level-triggered; every tick, ask the scheduler which
     section should be active per room and fire the crossover (automation
     .trigger on the room's scene automation) when the answer changes.
-  * provisional seeding - on a crossover into a section with no almanac yet,
-    sample current state and publish a provisional almanac so behaviour
-    appears immediately.
-  * nightly analysis - at 00:15 local, rebuild every room's almanac and
-    push it to HA.
   * almanac push - the almanac lives on sensor.ac_almanac_<room> as state
     attributes; API-set states do not survive an HA restart, so re-push on
     a timer and on homeassistant_start.
@@ -38,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from app.analyser import LearningConfig, SectionAlmanac, analyse_room
+from app.analyser import LearningConfig, analyse_room, is_setpoint_moving
 from app.generator import (almanac_id, guard_id, hold_id, scene_automation_id,
                            scene_select_id)
 from app.scheduler import active_section_at
@@ -50,6 +54,8 @@ SCHEDULER_TICK_SECONDS = 20
 ALMANAC_PUSH_SECONDS = 300
 GUARD_DEFER_POLL_SECONDS = 2
 GUARD_DEFER_MAX_SECONDS = 60
+# The comfort window closes 60 minutes after a reaction; replay 5 later.
+COMFORT_REPLAY_DELAY = timedelta(minutes=65)
 OFFISH = ("off", "unavailable", "unknown", None)
 
 
@@ -93,22 +99,13 @@ class Runtime:
         self._automation_entity: dict[str, str] = {}   # config id -> automation.<entity>
         self._tasks: list[asyncio.Task] = []
         self._unit_index: dict[str, tuple[str, str]] = {}   # unit entity -> (room_id, unit_id)
+        self._followups: set[asyncio.Task] = set()          # pending comfort-window replays
         self._stopping = False
 
     # ---- config helpers -------------------------------------------
 
     def _learning_config(self) -> LearningConfig:
-        learn = self.config.get("learning", {})
-        trust = self.config.get("system", {}).get("trust", {})
-        base = LearningConfig()
-        return LearningConfig(
-            analysis_window_days=learn.get("analysis_window_days", base.analysis_window_days),
-            bootstrap_min_days=learn.get("bootstrap_min_days", base.bootstrap_min_days),
-            validity_delay_days=learn.get("validity_delay_days", base.validity_delay_days),
-            reactive_weight=learn.get("reactive_weight", base.reactive_weight),
-            high_trust_deviation=trust.get("high_trust_deviation", base.high_trust_deviation),
-            low_trust_deviation=trust.get("low_trust_deviation", base.low_trust_deviation),
-        )
+        return LearningConfig.from_config(self.config)
 
     @property
     def _sys(self) -> dict:
@@ -164,6 +161,18 @@ class Runtime:
             section, started = active_section_at(rs.profile, now, self.tz)
             await self._crossover(rs, section, started, catch_up=True)
 
+        # A restart drops pending comfort-window replays; re-arm them for the
+        # setpoint-moving reactions of the last 65 minutes rather than wait
+        # for the nightly replay.
+        now = self._now()[3]
+        since = (now - COMFORT_REPLAY_DELAY).astimezone(ZoneInfo("UTC")).isoformat(
+            timespec="seconds")
+        for room_id in self.rooms:
+            for ts_utc, kind in self.store.reactions_since(room_id, since):
+                if is_setpoint_moving(kind):
+                    self._schedule_comfort_replay(
+                        room_id, datetime.fromisoformat(ts_utc) + COMFORT_REPLAY_DELAY)
+
         self._tasks = [
             asyncio.create_task(self._scheduler_loop(), name="ac-scheduler"),
             asyncio.create_task(self._heartbeat_loop(), name="ac-heartbeat"),
@@ -174,14 +183,16 @@ class Runtime:
 
     async def stop(self) -> None:
         self._stopping = True
-        for t in self._tasks:
+        pending = self._tasks + list(self._followups)
+        for t in pending:
             t.cancel()
-        for t in self._tasks:
+        for t in pending:
             try:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
         self._tasks = []
+        self._followups.clear()
 
     # ---- state-change stream --------------------------------------
 
@@ -277,14 +288,18 @@ class Runtime:
         # the reference unit's current_temperature snapshot at reaction time.
         states = {s["entity_id"]: s for s in await self.rest.states()}
         sensors = {s["id"]: self._sensor_reading(s, rs.room, states) for s in rs.room["sensors"]}
-        ts, ts_utc, local_date, _ = self._now()
+        ts, ts_utc, local_date, now = self._now()
         window = self._sys.get("reactive_window_seconds", 120)
+        kind = None     # phase 2 records kinds; until then every reaction is a setpoint change
         self.store.record_reactive(room_id, ts, ts_utc, local_date, rs.section or "day",
-                                   window, units, sensors, suspended_maint=True)
+                                   window, units, sensors, suspended_maint=True, kind=kind)
         self.store.log_event(ts, ts_utc, "info", "reactive",
                              f"user changed {', '.join(units)} in {rs.room['name']}",
                              room_id=room_id, detail={"units": {u: v.__dict__ for u, v in units.items()}})
         log.info("reactive recorded for %s: %s", room_id, list(units))
+        await self.replay_room(room_id, "reaction")
+        if is_setpoint_moving(kind):
+            self._schedule_comfort_replay(room_id, now + COMFORT_REPLAY_DELAY)
 
     # ---- heartbeat ------------------------------------------------
 
@@ -349,9 +364,27 @@ class Runtime:
             units[u["id"]] = self._unit_sample(u["entity_id"], leak_on, attrs)
 
         ts, ts_utc, local_date, _ = self._now()
+        section = rs.section or "day"
         self.store.record_heartbeat(room_id, ts, ts_utc, local_date,
-                                    rs.section or "day", sensors, units,
+                                    section, sensors, units,
                                     deferred_ms=deferred_ms)
+        reason = self._seed_reason(room_id, section, sensors, units)
+        if reason:
+            await self.replay_room(room_id, reason)
+
+    def _seed_reason(self, room_id: str, section: str, sensors: dict, units: dict) -> str | None:
+        """Why this heartbeat should trigger a replay, if it can seed
+        something the almanac in force lacks: the section itself, or a unit
+        (on, with a setpoint) or sensor (with a reading) not in it yet."""
+        alm = self.store.current_almanac(room_id, as_of=self._today())["sections"].get(section)
+        known_units = set((alm or {}).get("units", {}))
+        known_sensors = set((alm or {}).get("sensors", {}))
+        seedable = any(u.is_on and u.setpoint is not None and uid not in known_units
+                       for uid, u in units.items()) or \
+            any(t is not None and sid not in known_sensors for sid, t in sensors.items())
+        if not seedable:
+            return None
+        return "first heartbeat in section" if alm is None else "new seed in section"
 
     # ---- crossover / control --------------------------------------
 
@@ -367,16 +400,16 @@ class Runtime:
         # catch-up restart inside the same run leaves that run open.
         self.store.close_section_run(room_id, ts, keep=(run_date, section))
 
-        seeded = await self._seed_provisional_if_needed(rs, section)
-
         # On startup catch-up, the world may already be in the right section
         # (a plain restart, not real downtime). If HA's scene select already
-        # shows this section AND we didn't just have to seed a fresh almanac,
-        # don't re-fire the scene - re-driving the units is needless, and it
-        # makes the ACs beep on every restart. A genuine missed crossover
-        # (select disagrees) still re-fires, which is the point of catch-up.
+        # shows this section, don't re-fire the scene - re-driving the units
+        # is needless, and it makes the ACs beep on every restart. A genuine
+        # missed crossover (select disagrees) still re-fires, which is the
+        # point of catch-up. There is no provisional seeding here any more:
+        # a section with no almanac is seeded by the replay its first
+        # heartbeat triggers, and until then the scene leaves the units alone.
         already_here = self._cache.get(scene_select_id(room_id)) == section
-        refire = not (catch_up and already_here and not seeded)
+        refire = not (catch_up and already_here)
 
         if refire:
             entity = self._automation_entity.get(scene_automation_id(room_id, section))
@@ -399,41 +432,14 @@ class Runtime:
         rs.section, rs.section_started = section, started
         log.info("crossover %s -> %s%s", room_id, section, note)
 
-    async def _seed_provisional_if_needed(self, rs: RoomState, section: str) -> bool:
-        """Seed a provisional almanac from current state if none is in force
-        for this section. Returns True if it seeded, False if one existed."""
-        room_id = rs.room["id"]
-        current = self.store.current_almanac(room_id, as_of=date.today())
-        if section in current.get("sections", {}):
-            return False  # already have something in force for this section
-
-        low_dev = self._sys.get("trust", {}).get("low_trust_deviation", 5.0)
-        states = {s["entity_id"]: s for s in await self.rest.states()}
-        unit_setpoints, comfort, band, trust = {}, {}, {}, {}
-        for u in rs.room["units"]:
-            attrs = (states.get(u["entity_id"], {}) or {}).get("attributes", {}) or {}
-            unit_setpoints[u["id"]] = attrs.get("temperature")
-        for s in rs.room["sensors"]:
-            comfort[s["id"]] = self._sensor_reading(s, rs.room, states)
-            band[s["id"]] = low_dev
-            trust[s["id"]] = 0.0
-
-        sa = SectionAlmanac(section=section, state="provisional", valid_from=date.today(),
-                            sample_days=0, confidence=None,
-                            unit_setpoints=unit_setpoints, unit_off={},
-                            sensor_comfort=comfort, sensor_band=band, sensor_trust=trust)
-        self.store.publish_almanac(room_id, [sa])
-        await self._push_almanac(room_id)
-        ts, ts_utc, _, _ = self._now()
-        self.store.log_event(ts, ts_utc, "info", "almanac",
-                             f"seeded provisional {section} for {rs.room['name']}",
-                             room_id=room_id)
-        return True
-
     # ---- almanac push ---------------------------------------------
 
+    def _today(self) -> date:
+        """Today in HA's time zone, the one the replay dates almanacs in."""
+        return date.fromisoformat(self._now()[2])
+
     async def _push_almanac(self, room_id: str) -> None:
-        alm = self.store.current_almanac(room_id, as_of=date.today())
+        alm = self.store.current_almanac(room_id, as_of=self._today())
         sections = alm.get("sections", {})
         await self._safe_set_state(
             almanac_id(room_id),
@@ -441,19 +447,44 @@ class Runtime:
             attributes={"sections": sections, "room_id": room_id,
                         "updated": self._now()[0]})
 
-    # ---- analysis -------------------------------------------------
+    # ---- learning -------------------------------------------------
 
-    async def run_analysis(self) -> None:
-        lc = self._learning_config()
-        today = date.today()
-        for rs in self.rooms.values():
-            sections = analyse_room(self.store._conn, rs.room, lc, today)
-            self.store.publish_almanac(rs.room["id"], sections)
-            await self._push_almanac(rs.room["id"])
-            ts, ts_utc, _, _ = self._now()
-            self.store.log_event(ts, ts_utc, "info", "analysis",
-                                 f"rebuilt almanac for {rs.room['name']}: "
-                                 f"{len(sections)} section(s)", room_id=rs.room["id"])
+    async def replay_room(self, room_id: str, reason: str) -> None:
+        """Re-run the reaction replay for one room as of now, publish it and
+        push it to HA. A failure is logged and leaves the almanac in force."""
+        rs = self.rooms[room_id]
+        ts, ts_utc, _, now = self._now()
+        try:
+            sections = analyse_room(self.store._conn, rs.room, self._learning_config(), now)
+            self.store.publish_almanac(room_id, sections)
+            await self._push_almanac(room_id)
+        except Exception as e:
+            log.warning("replay for %s (%s) failed: %s", room_id, reason, e)
+            self.store.log_event(ts, ts_utc, "warning", "analysis",
+                                 f"replay for {rs.room['name']} ({reason}) failed: {e}",
+                                 room_id=room_id, detail={"reason": reason})
+            return
+        self.store.log_event(ts, ts_utc, "info", "analysis",
+                             f"replayed almanac for {rs.room['name']} ({reason}): "
+                             f"{len(sections)} section(s)", room_id=room_id,
+                             detail={"reason": reason,
+                                     "sections": [s.section for s in sections]})
+
+    def _schedule_comfort_replay(self, room_id: str, due: datetime) -> None:
+        """Replay the room at `due`, once a reaction's comfort window has
+        closed. Pending replays are lost on restart; start() re-arms them."""
+        async def later() -> None:
+            delay = (due - datetime.now(self.tz)).total_seconds()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await self.replay_room(room_id, "comfort window")
+        task = asyncio.create_task(later(), name=f"ac-comfort-{room_id}")
+        self._followups.add(task)
+        task.add_done_callback(self._followups.discard)
+
+    async def run_analysis(self, reason: str = "nightly") -> None:
+        for room_id in self.rooms:
+            await self.replay_room(room_id, reason)
 
     # ---- loops ----------------------------------------------------
 

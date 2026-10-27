@@ -26,9 +26,9 @@ v1-only detail in them (heartbeat-fed learning, the Warming/fan_only path,
 bootstrap and validity delay, the room-level correction timer) as outgoing.
 The v1 state is tagged `v1.0-poc`.
 
-**Do not deploy v2 to Home Assistant until phase 1 has landed; phase 0 empties
+**Never deploy a v2 build that has phase 0 but not phase 1: phase 0 empties
 the almanac and only phase 1's replay-on-first-heartbeat refills it from
-history.**
+history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
 
 ## Architecture at a glance
 
@@ -52,12 +52,12 @@ history.**
 | Module | Responsibility |
 |---|---|
 | `app/trust.py` | Pure-function core: sensor trust, comfort band, quorum evaluation |
-| `app/analyser.py` | Learns setpoints + per-sensor comfort/trust/band from history |
+| `app/analyser.py` | Deterministic replay of reactions from a seed: setpoints, applied setpoints, per-sensor comfort/band/trust, confidence |
 | `app/generator.py` | Builds HA helpers and automations (scene, maintenance, leak, watchdog) from config + almanac |
 | `app/scheduler.py` | Clock-only section-boundary computation (no sun-based triggers) |
 | `app/ha.py` | Home Assistant REST + WebSocket client |
 | `app/deploy.py` | Reconciles generated helpers/automations into HA; owns the `ac_*` namespace; manifest-based automation pruning |
-| `app/runtime.py` | Observer + control loop: scheduler, reactive detector, almanac push, leak latch |
+| `app/runtime.py` | Observer + control loop: scheduler, reactive detector, replay triggers, almanac push |
 | `app/store.py` | CSV + SQLite storage, event log, almanac persistence |
 | `app/main.py` | FastAPI app, lifespan wiring |
 | `app/config.py` | Config loading: v1 → v2 migration, v2 defaults, schema validation (cross-reference checks still to come — Roadmap Phase 9) |
@@ -109,9 +109,10 @@ python tools/doctor.py                     # check a real Home Assistant (6-step
 python tools/sweep.py                       # a year of section-boundary computation
 python tools/store_check.py                 # store writes + reads, into the analyser; migrations
 python tools/config_check.py                # config v1 -> v2 migration, defaults, validation
-python tools/analyser_demo.py               # the trust-model worked example
+python tools/analyser_demo.py               # reaction replay: worked examples + acceptance checks
+python tools/compare_analyser.py DATA_DIR   # frozen v1 vs v2 almanacs on a COPY of a data dir (migrates it)
 python tools/render_generated.py            # render helpers + automations
-python tools/maintenance_logic_check.py     # quorum Jinja vs the app.trust core
+python tools/maintenance_logic_check.py     # quorum + setpoint Jinja vs their Python references
 python tools/deploy_reconcile_check.py      # deploy create / reuse / prune
 python tools/runtime_check.py               # runtime observer + control loop
 python tools/leak_response_check.py         # leak detection / DRY / release automations

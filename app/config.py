@@ -33,8 +33,10 @@ CURRENT_VERSION = 2
 # v1 -> v2: system keys that moved under system.control, as (old, new).
 _MOVED_TO_CONTROL = (("max_step_degrees", "boost_degrees"),
                      ("correction_max_minutes", "boost_max_minutes"))
-# v1 learning keys v2 drops: the replay has no window, bootstrap or delay.
-_DROPPED_LEARNING = ("analysis_window_days", "bootstrap_min_days", "validity_delay_days")
+# v1 learning keys v2 drops: the replay has no window, bootstrap or delay,
+# and learns from reactions alone, so no reaction-vs-heartbeat weight.
+_DROPPED_LEARNING = ("analysis_window_days", "bootstrap_min_days", "validity_delay_days",
+                     "reactive_weight")
 # New keys inside objects that also hold v1 keys (only these get defaults).
 _NEW_LEARNING = ("reaction_rate", "recency_half_life_days")
 _NEW_ROOM = ("heat_sources", "knobs")
