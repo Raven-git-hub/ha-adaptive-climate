@@ -383,9 +383,12 @@ async def main() -> int:
     # --- restart: re-arm comfort replays for recent setpoint-moving reactions ---
     runtime_mod.COMFORT_REPLAY_DELAY = timedelta(seconds=3)
     hk = ZoneInfo("Asia/Hong_Kong")
+    # One clock reading for all three, so 1 s and 2 s ago are always
+    # different seconds (reactions are unique per room and second).
+    now = datetime.now(hk)
 
     def record(seconds_ago: float, kind=None, after: float = 23.0) -> None:
-        when = datetime.now(hk) - timedelta(seconds=seconds_ago)
+        when = now - timedelta(seconds=seconds_ago)
         store.record_reactive(
             "baby_room", when.isoformat(timespec="seconds"),
             when.astimezone(timezone.utc).isoformat(timespec="seconds"),
