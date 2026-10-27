@@ -28,8 +28,10 @@ yet implemented - it needs a live-verified "list automations" path we
 don't have from this sandbox; today's report always ends with a manual
 reminder instead of a possibly-wrong automatic scan. See docs/DEPLOY.md.
 
-check() verifies every referenced entity exists; deploy() refuses to
-proceed if any are missing.
+check() is the dry run: it verifies every referenced entity exists and,
+given the WebSocket client and the data dir, reports exactly what deploy()
+would create, reuse, update, remove and write, from the same plan, without
+writing anything. deploy() refuses to proceed if any entity is missing.
 """
 
 from __future__ import annotations
@@ -57,6 +59,7 @@ def slug(text: str) -> str:
 
 @dataclass
 class DeployReport:
+    dry_run: bool = False            # check(): what deploy() would do, nothing written
     helpers_created: list[str] = field(default_factory=list)
     helpers_reused: list[str] = field(default_factory=list)
     helpers_updated: list[str] = field(default_factory=list)
@@ -74,6 +77,7 @@ class DeployReport:
     def as_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
+            "dry_run": self.dry_run,
             "helpers_created": self.helpers_created,
             "helpers_reused": self.helpers_reused,
             "helpers_updated": self.helpers_updated,
@@ -111,11 +115,15 @@ def save_manifest(data_dir: str | Path, manifest: dict) -> None:
 
 
 # ---------------------------------------------------------------------
-# check() - dry run: entity existence only. No writes, no HA mutation.
+# check() - the dry run. No writes, no HA mutation.
 # ---------------------------------------------------------------------
 
-async def check(config: dict, rest: HARest) -> DeployReport:
-    report = DeployReport()
+async def check(config: dict, rest: HARest, ws: HAWebSocket | None = None,
+                data_dir: str | Path | None = None) -> DeployReport:
+    """Entity existence and the holds that are on; with `ws` and `data_dir`,
+    also the plan deploy() would carry out, built by the same code with
+    writing switched off."""
+    report = DeployReport(dry_run=True)
     try:
         states = {s["entity_id"]: s for s in await rest.states()}
     except Exception as e:
@@ -145,6 +153,14 @@ async def check(config: dict, rest: HARest) -> DeployReport:
         report.problems.append(
             f"{len(report.missing_entities)} configured entities were not found in "
             "Home Assistant; fix the config before deploying")
+        return report
+    if ws is not None and data_dir is not None:
+        rendered = g.render_all(config)
+        await _reconcile_helpers(rendered["helpers"], ws, report, apply=False)
+        await _reconcile_automations(rendered["automations"], rest,
+                                     load_manifest(data_dir), report, apply=False)
+        report.notes.append("dry run: the lists are what Deploy would do now; nothing "
+                            "was written")
     return report
 
 
@@ -153,7 +169,9 @@ async def check(config: dict, rest: HARest) -> DeployReport:
 # ---------------------------------------------------------------------
 
 async def _reconcile_helpers(rendered_helpers: list[dict], ws: HAWebSocket,
-                             report: DeployReport) -> None:
+                             report: DeployReport, apply: bool = True) -> None:
+    """List-diff our helpers. apply=False plans only (the dry run): the
+    report says what would happen, and nothing is written."""
     for domain in HELPER_DOMAINS:
         desired = [h for h in rendered_helpers if h["domain"] == domain]
         desired_ids = {h["object_id"] for h in desired}
@@ -175,13 +193,15 @@ async def _reconcile_helpers(rendered_helpers: list[dict], ws: HAWebSocket,
                     report.helpers_reused.append(label)
                     continue
                 try:
-                    await ws.update_helper(domain, oid, payload)
+                    if apply:
+                        await ws.update_helper(domain, oid, payload)
                     report.helpers_updated.append(label)
                 except HAError as e:
                     report.problems.append(f"could not update {label}: {e}")
                 continue
             try:
-                await ws.create_helper(domain, payload)
+                if apply:
+                    await ws.create_helper(domain, payload)
                 report.helpers_created.append(label)
             except HAError as e:
                 report.problems.append(f"could not create {label}: {e}")
@@ -193,28 +213,34 @@ async def _reconcile_helpers(rendered_helpers: list[dict], ws: HAWebSocket,
                 continue
             label = f"{domain}.{oid}"
             try:
-                await ws.delete_helper(domain, oid)
+                if apply:
+                    await ws.delete_helper(domain, oid)
                 report.helpers_removed.append(label)
             except HAError as err:
                 report.problems.append(f"could not remove stale helper {label}: {err}")
 
 
 async def _reconcile_automations(rendered_automations: list[dict], rest: HARest,
-                                 manifest: dict, report: DeployReport) -> None:
+                                 manifest: dict, report: DeployReport,
+                                 apply: bool = True) -> None:
+    """Write every desired automation (always upserted) and prune the ones
+    our manifest says we wrote before. apply=False plans only."""
     desired = {a["id"]: a for a in rendered_automations}
 
     for aid, cfg in desired.items():
         try:
-            await rest.set_automation(aid, cfg)
+            if apply:
+                await rest.set_automation(aid, cfg)
             report.automations_written.append(aid)
         except Exception as e:
             report.problems.append(f"could not write automation {aid}: {e}")
 
     previously_deployed = set(manifest.get("automations", []))
     stale = previously_deployed - set(desired)
-    for aid in stale:
+    for aid in sorted(stale):
         try:
-            await rest.delete_automation(aid)
+            if apply:
+                await rest.delete_automation(aid)
             report.automations_removed.append(aid)
         except Exception as e:
             report.problems.append(f"could not remove stale automation {aid}: {e}")
@@ -264,6 +290,7 @@ async def deploy(config: dict, rest: HARest, ws: HAWebSocket,
                  data_dir: str | Path) -> DeployReport:
     check_report = await check(config, rest)
     if check_report.missing_entities:
+        check_report.dry_run = False
         check_report.problems.append("deploy aborted: fix missing entities first")
         return check_report
 

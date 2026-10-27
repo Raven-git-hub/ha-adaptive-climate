@@ -102,8 +102,10 @@ the current section's scene automation in HA to start a room at once).
 - **For the v1 → v2 cutover, follow `docs/V2_CUTOVER.md`**, including
   `tools/doctor.py --v2-preflight` and the rollback steps.
 - **Run `/api/deploy/check` (or the Config page's "Check deploy" button)
-  first.** It only verifies entity existence — no writes — and is safe to run
-  any time.
+  first.** It is the dry run: it verifies entity existence, names any hold
+  that is on, and lists exactly what Deploy would create, reuse, update,
+  remove and write, from the same plan with writing switched off
+  (`"dry_run": true`). It writes nothing and is safe to run any time.
 - Deploying installs real automations that call real `climate.*` services on
   your real thermostats from the next crossover on. Deploy itself sends no
   command, and new units are hands off (`manual`) until their room's next

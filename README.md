@@ -211,7 +211,7 @@ login (it lives on your LAN). All five views are built:
   backed by a live list from Home Assistant with a found/not-found indicator,
   degrading to free-text entry while idle. A **Raw JSON** toggle exposes the
   same document directly for anything the form doesn't cover yet. **Validate &
-  Save**, **Check deploy** (entity-existence dry run, no writes), and **Deploy
+  Save**, **Check deploy** (a dry run listing what Deploy would do, no writes), and **Deploy
   to Home Assistant** all validate against the same schema the backend
   enforces.
 - **Log** — everything the container did and when, filterable by room, category

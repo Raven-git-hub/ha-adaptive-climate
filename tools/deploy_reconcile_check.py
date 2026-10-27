@@ -7,13 +7,15 @@ install (create, prune the v1 helpers, leave foreign ones alone, set the
 starting values of what was created), idempotent reuse, an in-place
 update when offset_cap changes, and ledger-based pruning when a room is
 removed from config. Deploy only ever touches `ac_*` and sends no command
-to any unit.
+to any unit. Before each deploy, check() - the dry run - must write nothing
+and list exactly what that deploy then does.
 
     PYTHONPATH=. python tools/deploy_reconcile_check.py
 """
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sys
 import tempfile
@@ -72,6 +74,32 @@ class StubWS:
         self.store[domain].pop(helper_id, None)
 
 
+PLAN = ("helpers_created", "helpers_reused", "helpers_updated", "helpers_removed",
+        "automations_written", "automations_removed")
+dry_runs = []
+
+
+async def check_then_deploy(cfg, rest, ws, tmp):
+    """The dry run first: it must write nothing, and its lists must be
+    exactly what the real deploy that follows then does."""
+    manifest = d._manifest_path(tmp)
+    before = (copy.deepcopy(ws.store), len(ws.updates), len(rest.set_calls),
+              len(rest.delete_calls), len(rest.service_calls),
+              manifest.read_text() if manifest.exists() else None)
+    dry = await d.check(cfg, rest, ws, tmp)
+    after = (copy.deepcopy(ws.store), len(ws.updates), len(rest.set_calls),
+             len(rest.delete_calls), len(rest.service_calls),
+             manifest.read_text() if manifest.exists() else None)
+    assert dry.dry_run and dry.ok, dry.problems
+    assert after == before, "the dry run wrote something"
+    real = await d.deploy(cfg, rest, ws, tmp)
+    for key in PLAN:
+        assert sorted(getattr(dry, key)) == sorted(getattr(real, key)), \
+            f"{key}: check said {sorted(getattr(dry, key))}, deploy did {sorted(getattr(real, key))}"
+    dry_runs.append({k: len(getattr(dry, k)) for k in PLAN})
+    return real
+
+
 async def main() -> int:
     cfg = json.loads((Path(__file__).resolve().parent.parent /
                       "examples" / "config.example.json").read_text())
@@ -96,7 +124,7 @@ async def main() -> int:
     ws.store["input_number"]["foreign_level"] = {"name": "foreign_level"}
 
     # deploy 1: from a v1 install
-    r1 = await d.deploy(cfg, rest, ws, tmp)
+    r1 = await check_then_deploy(cfg, rest, ws, tmp)
     assert r1.ok, r1.problems
     assert len(r1.helpers_created) == n_helpers, len(r1.helpers_created)
     assert len(r1.automations_written) == n_automations, len(r1.automations_written)
@@ -151,7 +179,7 @@ async def main() -> int:
 
     # deploy 2: identical config -> idempotent, nothing pruned, nothing set
     rest.service_calls.clear()
-    r2 = await d.deploy(cfg, rest, ws, tmp)
+    r2 = await check_then_deploy(cfg, rest, ws, tmp)
     assert r2.helpers_created == r2.helpers_updated == r2.helpers_removed == []
     assert len(r2.helpers_reused) == n_helpers
     assert r2.automations_removed == []
@@ -163,7 +191,7 @@ async def main() -> int:
     # deploy 3: a wider offset cap updates the offset helpers in place
     cfg3 = json.loads(json.dumps(cfg))
     cfg3["system"]["control"]["offset_cap"] = cap + 1
-    r3 = await d.deploy(cfg3, rest, ws, tmp)
+    r3 = await check_then_deploy(cfg3, rest, ws, tmp)
     assert sorted(r3.helpers_updated) == sorted(
         f"input_number.ac_offset_{r['id']}_{u['id']}" for r in cfg["rooms"] for u in r["units"])
     assert all(p["min"] == -(cap + 1) and p["max"] == cap + 1 for _, _, p in ws.updates)
@@ -174,7 +202,7 @@ async def main() -> int:
     # deploy 4: baby_room removed -> only its own artifacts prune
     cfg4 = json.loads(json.dumps(cfg3))
     cfg4["rooms"] = [r for r in cfg4["rooms"] if r["id"] != "baby_room"]
-    r4 = await d.deploy(cfg4, rest, ws, tmp)
+    r4 = await check_then_deploy(cfg4, rest, ws, tmp)
     assert len(r4.automations_removed) == 9, r4.automations_removed
     assert all("baby_room" in a for a in r4.automations_removed)
     assert len(r4.helpers_removed) == 9, r4.helpers_removed
@@ -183,6 +211,11 @@ async def main() -> int:
     assert "foreign_clock" in ws.store["input_datetime"]
     print("deploy 4 (baby_room removed): pruned exactly its 9 automations + 9 helpers, "
           "other rooms and foreign helpers untouched - OK")
+
+    print(f"check (the dry run) before each of the 4 deploys wrote nothing and listed exactly "
+          f"what the deploy then did: {[r['helpers_created'] for r in dry_runs]} created, "
+          f"{[r['helpers_removed'] for r in dry_runs]} removed, "
+          f"{[r['automations_written'] for r in dry_runs]} written - OK")
 
     print("\nALL DEPLOY RECONCILIATION TESTS PASSED")
     return 0

@@ -105,21 +105,23 @@ that behaviour. If the last item fails, delete any `ac_preflight_*` helper by ha
 
 ## 5. Deploy, and turn off any hold (15:40, about 20 minutes before 16:00)
 
-UI: **Config** → **Check deploy** (a dry run, no writes), then **Deploy to Home
-Assistant**. Or:
+UI: **Config** → **Check deploy** (the dry run: it writes nothing, and lists what
+the deploy will do), then **Deploy to Home Assistant**. Or:
 
 ```bash
 curl -s localhost:8098/api/deploy/check | python3 -m json.tool
 curl -s -X POST localhost:8098/api/deploy | python3 -m json.tool
 ```
 
-For the example config the report reads `"ok": true` with:
+For the example config both reports read `"ok": true` with the same lists (the
+check's says `"dry_run": true`):
 
 - `helpers_created`: 18, six per unit (`ac_state_`, `ac_base_`, `ac_offset_`,
   `ac_since_`, `ac_grace_until_`, `ac_unblocked_`)
 - `helpers_removed`: the three `input_datetime.ac_correction_started_<room>`
 - `automations_written`: 27 (6 scenes, maintenance and watchdog per room, and the
-  new `ac_manual_<room>_<unit>` per unit)
+  new `ac_manual_<room>_<unit>` per unit), plus the leak trip and release pair
+  for each unit with leak detection (29 with one)
 - `notes`: one line per room whose `input_boolean.ac_hold_<room>` is on.
 
 **Turn off every hold the notes name** (Settings → Devices & services → Helpers →

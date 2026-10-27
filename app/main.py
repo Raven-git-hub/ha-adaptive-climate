@@ -297,12 +297,16 @@ async def api_entities(domain: str) -> dict:
 
 @app.get("/api/deploy/check")
 async def api_deploy_check() -> dict:
-    """Dry run: entity existence only. No writes to Home Assistant."""
+    """Dry run: what POST /api/deploy would create, reuse, update, remove
+    and write, from the same plan, plus entity existence and any hold that
+    is on. No writes to Home Assistant."""
     from app.deploy import check
-    rest, _ = _ha_clients()
+    rest, ws = _ha_clients()
     try:
-        report = await check(_raw_config(), rest)
+        await ws.connect()
+        report = await check(_raw_config(), rest, ws, DATA_DIR)
     finally:
+        await ws.close()
         await rest.close()
     return report.as_dict()
 
