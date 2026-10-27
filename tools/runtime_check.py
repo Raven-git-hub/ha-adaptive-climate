@@ -80,6 +80,10 @@ class StubRest:
 class StubWS:
     def __init__(self):
         self.callback = None
+    def on_reconnect(self, cb):
+        pass
+    def on_status(self, cb):
+        pass
     async def connect(self):
         pass
     async def subscribe_states(self, callback):
