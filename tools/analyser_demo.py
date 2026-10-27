@@ -9,6 +9,8 @@ docs/V2_DESIGN.md and docs/TRUST_MODEL.md:
   * 300 quiet heartbeats leave the seed unchanged
   * rounding goes toward the last reaction, both ways, keeps its direction
     while S doesn't move, and rounds half up before there is one
+  * a reaction is setpoint-moving when a setpoint changed, whatever its kind:
+    an `on` with a new setpoint sets the direction and opens a window
   * the replay is deterministic, whatever order the rows were written in
   * the comfort window: accepted, disqualified by a second reaction, by too
     few heartbeats or by a boost heartbeat, and kept to its section across
@@ -181,6 +183,39 @@ def check_rounding() -> None:
        "to 22.5, so 22 applies")
 
 
+def check_on_with_setpoint() -> None:
+    print("setpoint-moving by setpoint change, whatever the kind")
+    window = [t(1, 14, 30), t(1, 14, 40), t(1, 14, 50)]
+
+    sc = Scenario()
+    sc.beat(t(1, 8), setpoint=22.0)
+    sc.react(t(1, 10), 22.0, 21.0)               # S 21.5, direction down: applies 21
+    sc.react(t(1, 14), 21.0, 23.0, kind="on")    # turned on at a new setpoint
+    for when in window:
+        sc.beat(when, setpoint=23.0, readings={"wall": 23.0, "door": 24.0})
+    day = sc.replay(t(1, 23))["day"]
+    assert day.unit_setpoints == {"ac": 22.25}, day.unit_setpoints
+    assert day.unit_setpoints_applied == {"ac": 23.0}    # up; the old rule floored to 22
+    assert day.sensor_comfort == {"wall": 24.0, "door": 24.5}, day.sensor_comfort
+    ok("an `on` that also sets 21 -> 23 moves S to 22.25, turns the direction up "
+       "(applies 23) and opens a comfort window")
+
+    sc = Scenario()
+    sc.beat(t(1, 8), setpoint=22.0)
+    sc.react(t(1, 14), 22.0, 22.0, kind="on")   # turned on, setpoint untouched
+    for when in window:
+        sc.beat(when, setpoint=22.0, readings={"wall": 23.0, "door": 24.0})
+    day = sc.replay(t(1, 23))["day"]
+    assert day.status == "provisional"
+    assert day.unit_setpoints == {"ac": 22.0} and day.unit_setpoints_applied == {"ac": 22.0}
+    assert day.sensor_comfort == {"wall": 25.0, "door": 25.0}, day.sensor_comfort
+    sc.react(t(1, 10), 22.0, 21.0)              # an earlier cooler correction...
+    day = sc.replay(t(1, 23))["day"]
+    assert day.unit_setpoints_applied == {"ac": 21.0}     # ...whose direction the on keeps
+    ok("an `on` with no setpoint change moves nothing: still provisional, no comfort "
+       "window, and an earlier direction stands")
+
+
 def check_deterministic() -> None:
     print("determinism")
 
@@ -332,6 +367,7 @@ def main() -> int:
     check_headline()
     check_quiet_heartbeats()
     check_rounding()
+    check_on_with_setpoint()
     check_deterministic()
     check_comfort_window()
     check_band_direction()

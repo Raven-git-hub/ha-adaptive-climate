@@ -35,6 +35,9 @@ Per room and section:
   status      provisional until the first setpoint-moving reaction, then
               learned.
 
+A setpoint-moving reaction is a setpoint change or knob turn, or a reaction
+of any kind in which a unit's setpoint changed (an `on` with a new setpoint).
+
 Pure over a sqlite connection, a room dict and an as_of datetime. Nothing
 after as_of is read, so the same database and as_of give the same almanac.
 Run tools/analyser_demo.py for the worked examples.
@@ -117,9 +120,19 @@ class _Reaction:
 # Pure helpers
 # ---------------------------------------------------------------------
 
-def is_setpoint_moving(kind: str | None) -> bool:
-    """A setpoint change or a knob turn (docs/V2_DESIGN.md)."""
-    return kind in SETPOINT_MOVING_KINDS
+def changed_setpoint(units: dict) -> bool:
+    """Did any unit's setpoint change? units: {unit_id: (before, after)}.
+    A missing value on either side counts as no change."""
+    return any(before is not None and after is not None and abs(after - before) >= _EPS
+               for before, after in units.values())
+
+
+def is_setpoint_moving(kind: str | None, units: dict | None = None) -> bool:
+    """A setpoint change or knob turn, or a reaction of any kind in which a
+    unit's setpoint changed - an `on` that comes with a new setpoint, say
+    (docs/V2_DESIGN.md). It moves S, sets the rounding direction, makes the
+    section learned and opens a comfort window."""
+    return kind in SETPOINT_MOVING_KINDS or changed_setpoint(units or {})
 
 
 def round_toward(value: float, direction: int, step: float = 1.0) -> float:
@@ -282,7 +295,7 @@ def _replay_section(conn, room_id: str, section: str, unit_seeds: dict, sensor_s
     # Reactions at their own time; comfort windows once they have closed.
     events = [(r.at, 1, r.id, r) for r in here]
     events += [(r.at + COMFORT_WINDOW[1], 0, r.id, r) for r in here
-               if is_setpoint_moving(r.kind) and r.at + COMFORT_WINDOW[1] <= as_of]
+               if is_setpoint_moving(r.kind, r.units) and r.at + COMFORT_WINDOW[1] <= as_of]
     for _, order, _, r in sorted(events, key=lambda e: e[:3]):
         if order == 0:                               # a comfort window closes
             means = _comfort_window(conn, room_id, r, room_reactions)
@@ -304,14 +317,16 @@ def _replay_section(conn, room_id: str, section: str, unit_seeds: dict, sensor_s
                         (want < 0 and dev >= cfg.high_trust_deviation):
                     samples[sid].append((abs(dev), weight))
 
-        moving = is_setpoint_moving(r.kind)
+        # A unit whose setpoint changed makes this a setpoint-moving reaction
+        # whatever its kind (an `on` with a new setpoint included): S moves
+        # and the rounding direction follows how it moved. On/off alone, or
+        # manual, leaves both alone.
         for uid, (before, after) in r.units.items():
-            if uid not in setpoint or before is None or after is None \
-                    or abs(after - before) < _EPS:
+            if uid not in setpoint or not changed_setpoint({uid: (before, after)}):
                 continue
             s_before = setpoint[uid]
             setpoint[uid] = s_before + rate * (after - s_before)
-            if moving and abs(after - s_before) >= _EPS:
+            if abs(after - s_before) >= _EPS:
                 direction[uid] = 1 if after > s_before else -1
 
     band: dict[str, float] = {}
@@ -327,7 +342,8 @@ def _replay_section(conn, room_id: str, section: str, unit_seeds: dict, sensor_s
     last_reaction = here[-1].at if here else None
     return SectionAlmanac(
         section=section,
-        status="learned" if any(is_setpoint_moving(r.kind) for r in here) else "provisional",
+        status="learned" if any(is_setpoint_moving(r.kind, r.units) for r in here)
+        else "provisional",
         valid_from=as_of.date(),
         confidence=_confidence(conn, room_id, section, room_reactions, last_reaction, as_of),
         unit_setpoints=setpoint,

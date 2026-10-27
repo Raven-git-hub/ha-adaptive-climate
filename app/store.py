@@ -544,13 +544,19 @@ class Store:
         raise NotImplementedError("CSV re-ingest (recovery path) - required before Gate A")
 
     # --- reads -----------------------------------------------------
-    def reactions_since(self, room_id: str, since_utc: str) -> list[tuple[str, str | None]]:
-        """(ts_utc, kind) of the room's reactions at or after since_utc, oldest
-        first. The runtime uses it at startup to re-arm comfort replays."""
+    def reactions_since(self, room_id: str, since_utc: str) -> list[tuple[str, str | None, dict]]:
+        """(ts_utc, kind, {unit_id: (setpoint_before, setpoint_after)}) of the
+        room's reactions at or after since_utc, oldest first. The runtime uses
+        it at startup to re-arm comfort replays."""
         with self._lock:
-            return [(r["ts_utc"], r["kind"]) for r in self._conn.execute(
-                "SELECT ts_utc, kind FROM reactive WHERE room_id=? AND ts_utc>=? "
-                "ORDER BY ts_utc, id", (room_id, since_utc))]
+            heads = self._conn.execute(
+                "SELECT id, ts_utc, kind FROM reactive WHERE room_id=? AND ts_utc>=? "
+                "ORDER BY ts_utc, id", (room_id, since_utc)).fetchall()
+            return [(h["ts_utc"], h["kind"], {
+                u["unit_id"]: (u["setpoint_before"], u["setpoint_after"])
+                for u in self._conn.execute(
+                    "SELECT unit_id, setpoint_before, setpoint_after FROM reactive_unit "
+                    "WHERE reactive_id=?", (h["id"],))}) for h in heads]
 
     def recent_events(self, limit: int = 200, room_id: str | None = None,
                       category: str | None = None,

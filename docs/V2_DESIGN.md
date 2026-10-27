@@ -63,7 +63,7 @@ Every reaction kind, the knob included, is grouped by the existing 120-second ex
 
 The reaction kind is stored per unit: `setpoint`, `on`, `off`, `manual`, `knob_turn` or `knob_press` (a knob long press records as `off`). The room-level kind is derived from the units' kinds when the reaction is recorded, and stored with it. A unit turned on and given a new setpoint in the same window is one reaction of kind `on`; setpoint learning still applies to it, because its `setpoint_after` changed.
 
-A **setpoint-moving reaction** is a setpoint change or a knob turn.
+A **setpoint-moving reaction** is a setpoint change or a knob turn, or a reaction of any kind in which a unit's setpoint changed (an `on` that comes with a new setpoint, say). It moves S, sets the rounding direction, makes the section learned and opens a comfort window.
 
 ### Setpoint
 
@@ -78,7 +78,7 @@ S_chosen is the person's raw value, whatever offset or boost was active at the t
 The stored value stays fractional. The applied value, `setpoint_applied`, rounds to a whole degree **toward the direction of the latest setpoint-moving reaction**, which is the sign of S_chosen − S_before. A correction from 22 to 23 stores 22.5 and applies 23, so a 1° correction always shows the next day. Plain rounding would send 22.5 back to 22, repeating the v1 bug.
 
 - **The direction is how S moved, not the gesture.** If S is 23 and the unit is boosting at 21 when a person sets 22, the gesture is warmer but S moves down to 22.5, so 22 is applied.
-- **If S didn't move,** the previous direction stands. On/off and manual reactions never change it.
+- **If S didn't move,** the previous direction stands. On/off and manual reactions change it only when they changed a setpoint too.
 - **A seed alone** has no direction yet and rounds half up.
 
 ### Per-sensor comfort readings
@@ -479,3 +479,7 @@ Decisions this document hadn't covered:
 30. **Comfort replays are re-armed on startup** for setpoint-moving reactions in the last 65 minutes.
 31. **Section runs are closed by being open, not by date**, and dated by their planned start; migration 2 repairs the runs v1 left open (own commit, before phase 1).
 32. **The deploy warning in CLAUDE.md is reworded** now that phase 1 has landed: never deploy a build with phase 0 but not phase 1; otherwise deploy follows this build plan.
+
+From phase 2 planning, 27 Oct 2026:
+
+33. **Setpoint-moving also means "a setpoint changed"**, whatever the kind; this replaces the definition in 21. An `on` (or `off`, or `manual`) reaction in which a unit's setpoint changed moves S, sets the rounding direction, makes the section learned and opens a comfort window; without a setpoint change it does none of these. It closes the hole where turning a unit on at a new setpoint moved S but kept an old rounding direction, so the next day applied a degree off what the person chose.

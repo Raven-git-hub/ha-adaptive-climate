@@ -62,8 +62,9 @@ from a **seed**:
   rate. The window belongs to the reaction's section even if it runs into the
   next one.
 
-A **setpoint-moving reaction** is a setpoint change or a knob turn. A section is
-**provisional** until its first one, then **learned**.
+A **setpoint-moving reaction** is a setpoint change or a knob turn, or a
+reaction of any kind in which a unit's setpoint changed (an `on` with a new
+setpoint). A section is **provisional** until its first one, then **learned**.
 
 ## Trust and the comfort band
 

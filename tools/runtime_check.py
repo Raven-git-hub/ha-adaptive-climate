@@ -279,17 +279,17 @@ async def main() -> int:
     runtime_mod.COMFORT_REPLAY_DELAY = timedelta(seconds=3)
     hk = ZoneInfo("Asia/Hong_Kong")
 
-    def record(seconds_ago: float, kind=None) -> None:
+    def record(seconds_ago: float, kind=None, after: float = 23.0) -> None:
         when = datetime.now(hk) - timedelta(seconds=seconds_ago)
         store.record_reactive(
             "baby_room", when.isoformat(timespec="seconds"),
             when.astimezone(timezone.utc).isoformat(timespec="seconds"),
             when.date().isoformat(), "day", 120,
-            units={"baby_room_ac": runtime_mod.ReactiveUnitSample(22.0, 23.0, True)},
+            units={"baby_room_ac": runtime_mod.ReactiveUnitSample(22.0, after, after != 22.0)},
             sensors={"baby": 24.0}, kind=kind)
     record(1)                       # setpoint-moving, inside the window: re-armed
     record(10)                      # too old: its window is already handled
-    record(2, kind="manual")        # not setpoint-moving: no comfort window
+    record(2, kind="manual", after=22.0)   # no setpoint change: no comfort window
 
     # --- restart with the select already on-section: catch-up must NOT
     #     re-fire the scene (no gratuitous beep) ---

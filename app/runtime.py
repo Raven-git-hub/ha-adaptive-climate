@@ -168,8 +168,8 @@ class Runtime:
         since = (now - COMFORT_REPLAY_DELAY).astimezone(ZoneInfo("UTC")).isoformat(
             timespec="seconds")
         for room_id in self.rooms:
-            for ts_utc, kind in self.store.reactions_since(room_id, since):
-                if is_setpoint_moving(kind):
+            for ts_utc, kind, units in self.store.reactions_since(room_id, since):
+                if is_setpoint_moving(kind, units):
                     self._schedule_comfort_replay(
                         room_id, datetime.fromisoformat(ts_utc) + COMFORT_REPLAY_DELAY)
 
@@ -298,7 +298,8 @@ class Runtime:
                              room_id=room_id, detail={"units": {u: v.__dict__ for u, v in units.items()}})
         log.info("reactive recorded for %s: %s", room_id, list(units))
         await self.replay_room(room_id, "reaction")
-        if is_setpoint_moving(kind):
+        if is_setpoint_moving(kind, {u: (v.setpoint_before, v.setpoint_after)
+                                     for u, v in units.items()}):
             self._schedule_comfort_replay(room_id, now + COMFORT_REPLAY_DELAY)
 
     # ---- heartbeat ------------------------------------------------
