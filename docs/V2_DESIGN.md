@@ -171,7 +171,7 @@ System transitions:
 The manual-change automation applies these per unit, straight away, so they hold even while the container is down. The container records the same change as a reaction for learning.
 
 - **Setpoint change, unit on:** base = the chosen value, offset 0, state `cool`, `since` = now. The grace period starts.
-- **Setpoint change, unit off:** the state stays as it is (`rest` stays `rest`, `user_off` stays `user_off`, and so on), base = the chosen value and offset 0. No grace period starts and `since` is kept, so a rest still keeps its minimum time. The new base applies the next time the unit cools.
+- **Setpoint change, unit off or in `manual`:** the state stays as it is (`rest` stays `rest`, `user_off` stays `user_off`, `manual` stays `manual`, and so on), base = the chosen value and offset 0. No grace period starts and `since` is kept, so a rest still keeps its minimum time. The new base applies the next time the unit cools.
 - **Turned off:** state `user_off`.
 - **Turned on:** state `cool`, base = the unit's current setpoint, offset 0, `since` = now. The grace period starts. `input_boolean.ac_unblocked_<room>_<unit>` turns on, so the cooling block is ignored for that unit for the rest of the section.
 - **Mode or fan change while on:** state `manual`. Logged, not learned.
@@ -513,3 +513,7 @@ From phase 3a, 27 Oct 2026:
 49. **Grace has its own helper**, `input_datetime.ac_grace_until_<room>_<unit>` (created in 3b), set to the person's change + `person_grace_minutes` and cleared at a section change, instead of being counted from `since`, which minimum times and the boost cap also use. It only ever holds a unit in `cool`, because only a setpoint change or turn-on with the unit on starts it, and both leave the unit in `cool`. It holds against a cooling block as well as votes; a leak still wins.
 50. **A setpoint change on a unit that is off keeps its state**, replacing "state `cool`" in Person reactions: `rest` stays `rest`, `user_off` stays `user_off`, and so on. Base = the new setpoint and offset 0, with no grace and `since` kept, so the new base applies the next time the unit cools. The manual-change automation therefore passes the unit's power after the change. In `user_off` or `config_off` the stored base rarely matters, since a turn-on sets the base to the unit's current setpoint and a section change resets it.
 51. **The knob:** a turn counts as a setpoint change and a press changes nothing in control, ready for phase 8.
+
+From phase 3b planning, 27 Oct 2026:
+
+52. **A setpoint change in `manual` keeps `manual`**, as decision 50 does for a unit that is off: base = the new setpoint, offset 0, no grace, `since` kept. A person who chose dry or fan_only and then changed the temperature keeps the mode they chose until the section changes; before this, the unit went to `cool` and the next transition would have overridden their mode. A knob turn is treated the same.

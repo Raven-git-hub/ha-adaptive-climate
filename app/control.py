@@ -218,6 +218,11 @@ def _kept_off(power_after: bool) -> bool:
     return not power_after
 
 
+def _kept_manual(state: str) -> bool:
+    """So does one made while a person has the unit in manual."""
+    return state == "manual"
+
+
 # ---------------------------------------------------------------------
 # The three entry points
 # ---------------------------------------------------------------------
@@ -300,8 +305,9 @@ def on_person_change(kind: str, unit: Unit, new_setpoint: float | None, power_af
         return unit
     grace = now + timedelta(minutes=ctx.config.person_grace_minutes)
     if kind in ("setpoint", "knob_turn"):
-        if _kept_off(power_after):
-            # changed while off: remember it for the next time the unit cools
+        if _kept_off(power_after) or _kept_manual(unit.state):
+            # changed while off, or in manual: remember it for the next time
+            # the unit cools
             return replace(unit, base=new_setpoint, offset=0)
         return replace(unit, state="cool", base=new_setpoint, offset=0, since=now,
                        grace_until=grace)

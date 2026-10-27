@@ -287,6 +287,13 @@ SCENARIOS = [
         person("setpoint", {"state": "user_off", "base": 20.0, "offset": 0, "grace_until": None},
                setpoint=20.0, power_after=False)],
       unit={"state": "user_off", "offset": 1}),
+    s("setpoint change in manual stays manual, with no grace", [
+        person("setpoint", {"state": "manual", "base": 25.0, "offset": 0, "grace_until": None,
+                            "since": -m(15)}, setpoint=25.0),
+        person("knob_turn", {"state": "manual", "base": 26.0, "grace_until": None},
+               setpoint=26.0, at=m(1)),
+        step("cold", {"state": "manual"}, None, at=m(2))],
+      unit={"state": "manual", "offset": 2, "since": -m(15)}),
     s("a knob turn counts as a setpoint change; a knob press changes nothing", [
         person("knob_turn", {"state": "cool", "base": 23.0, "grace_until": m(30)}, setpoint=23.0),
         person("knob_press", {"state": "cool", "base": 23.0}, at=m(5))],
@@ -434,6 +441,9 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
          {"_kept_off": lambda power_after: False},
          ["setpoint change while resting stays rest, and wakes later at the new base",
           "setpoint change while user_off stays user_off"]),
+        ("a setpoint change in manual keeps manual",
+         {"_kept_manual": lambda state: False},
+         ["setpoint change in manual stays manual, with no grace"]),
     ]
 
 
