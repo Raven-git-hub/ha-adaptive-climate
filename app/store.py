@@ -10,10 +10,21 @@ per-sensor temperature (heartbeat_sensor) and per-unit climate state
 (heartbeat_unit), and the reactive tables capture a per-sensor snapshot
 at reaction time - the raw material for the trust model.
 
-STATUS: observation writes are Phase 8 stubs; almanac persistence is
-implemented (Phase 4 needs it to save and serve what the analyser builds).
-Schema is final in schema/storage.schema.sql; almanac JSON shape is in
-docs/ALMANAC_FORMAT.md.
+Schema versions: schema/storage.schema.sql is the current shape. A fresh
+database runs it and is stamped PRAGMA user_version = len(MIGRATIONS). An
+older database is backed up next to itself, then brought forward by the
+numbered MIGRATIONS below, each in one transaction with foreign keys off
+that must pass foreign_key_check and integrity_check before it commits;
+anything else rolls it back and leaves the database as it was. Migrations
+recreate changed tables from the schema file's own CREATE text, so a
+migrated database is identical to a fresh one.
+
+CSV columns are only ever appended, never reordered, so a file started by
+an older version keeps its shorter header and re-ingest can map columns by
+position. Per-unit fields live inside the JSON `units` column.
+
+STATUS: CSV re-ingest (ingest_csv) is not implemented; it is a Gate A
+prerequisite (docs/V2_DESIGN.md). Almanac JSON shape: docs/ALMANAC_FORMAT.md.
 """
 
 from __future__ import annotations
@@ -21,11 +32,34 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import logging
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Callable
+
+log = logging.getLogger("adaptive_climate.store")
+
+
+# ---------------------------------------------------------------------
+# CSV column order per record kind. Append only: never reorder or remove.
+# ---------------------------------------------------------------------
+
+HEARTBEAT_CSV = ["ts", "ts_utc", "section", "occupied", "any_unit_on",
+                 "deferred_ms", "sensors", "units",
+                 "outdoor_temp"]                                    # v2
+REACTIVE_CSV = ["ts", "ts_utc", "section", "window_seconds", "occupied",
+                "suspended_maint", "units", "sensors",
+                "kind", "outdoor_temp"]                             # v2
+# One row when a section run starts and one when it closes. Re-ingest
+# merges a day file's rows per section in order; a blank field leaves the
+# earlier value, matching record_section_run's upsert.
+SECTION_RUN_CSV = ["section", "planned_start", "actual_start", "ended_at",
+                   "outcome", "outcome_reason", "outdoor_mean", "outdoor_max",
+                   "comfort_point", "lean", "blocked", "block_mode"]
 
 
 @dataclass(frozen=True)
@@ -36,7 +70,9 @@ class UnitSample:
     fan_mode: str | None
     setpoint: float | None
     current_temp: float | None
-    ac_state: str | None            # normal | cooling | warming | leak
+    ac_state: str | None                # v1 inferred: normal | cooling | warming | leak
+    control_state: str | None = None    # v2 state helper: cool | boost | rest | ...
+    control_offset: int | None = None   # v2 section offset, whole steps
 
 
 @dataclass(frozen=True)
@@ -49,6 +85,139 @@ class ReactiveUnitSample:
     setpoint_before: float | None
     setpoint_after: float | None
     changed: bool
+    kind: str | None = None             # v2: setpoint | on | off | manual | knob_turn | knob_press
+    power_before: bool | None = None    # v2: unit on at the window's start
+    power_after: bool | None = None     # v2: unit on at the window's end
+
+
+class StoreError(Exception):
+    """The database can't be opened or migrated; the message says why."""
+
+
+# ---------------------------------------------------------------------
+# The schema file, split into statements
+# ---------------------------------------------------------------------
+
+_CREATE_RE = re.compile(
+    r"CREATE\s+(TABLE|INDEX|UNIQUE\s+INDEX|VIEW)\s+(\w+)(?:\s+ON\s+(\w+))?", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class _Statement:
+    kind: str           # table | index | view | pragma
+    name: str | None
+    table: str | None   # for an index, the table it is on
+    sql: str
+
+
+class _Schema:
+    """schema/storage.schema.sql as individual statements, so a migration
+    can recreate one table (and its indexes) from exactly the text a fresh
+    database is built from."""
+
+    def __init__(self, text: str) -> None:
+        self.statements: list[_Statement] = []
+        buf = ""
+        for line in text.splitlines(keepends=True):
+            buf += line
+            if sqlite3.complete_statement(buf):
+                self.statements.append(self._classify(buf.strip()))
+                buf = ""
+        if re.sub(r"--[^\n]*", "", buf).strip():
+            raise StoreError("storage schema ends in an incomplete statement")
+
+    @staticmethod
+    def _classify(sql: str) -> _Statement:
+        body = re.sub(r"--[^\n]*", "", sql).strip()
+        if body.upper().startswith("PRAGMA"):
+            return _Statement("pragma", None, None, sql)
+        m = _CREATE_RE.match(body)
+        if not m:
+            raise StoreError(f"unexpected statement in storage schema: {body[:60]!r}")
+        kind = m.group(1).split()[-1].lower()
+        return _Statement(kind, m.group(2), m.group(3) if kind == "index" else m.group(2), sql)
+
+    def pragmas(self) -> list[str]:
+        return [s.sql for s in self.statements if s.kind == "pragma"]
+
+    def objects(self) -> list[str]:
+        return [s.sql for s in self.statements if s.kind != "pragma"]
+
+    def create(self, name: str) -> str:
+        for s in self.statements:
+            if s.kind in ("table", "view") and s.name == name:
+                return s.sql
+        raise StoreError(f"storage schema has no table or view {name!r}")
+
+    def indexes(self, table: str) -> list[str]:
+        return [s.sql for s in self.statements if s.kind == "index" and s.table == table]
+
+
+# ---------------------------------------------------------------------
+# Migrations. Migration n takes a database from user_version n-1 to n.
+# Each runs inside one transaction with foreign keys off and the legacy
+# rename behaviour on (a rename must not rewrite other tables' REFERENCES).
+# ---------------------------------------------------------------------
+
+def _recreate(conn: sqlite3.Connection, schema: _Schema, name: str) -> None:
+    conn.execute(schema.create(name))
+    for sql in schema.indexes(name):
+        conn.execute(sql)
+
+
+def _rebuild_table(conn: sqlite3.Connection, schema: _Schema, name: str) -> None:
+    """Recreate `name` from the schema file and copy its rows across for
+    every column the old and new shapes share. Ids are copied, so child
+    rows stay attached. The old table's indexes go with it."""
+    old = f"_old_{name}"
+    conn.execute(f"ALTER TABLE {name} RENAME TO {old}")
+    conn.execute(schema.create(name))
+    new_cols = [r[1] for r in conn.execute(f"PRAGMA table_info({name})")]
+    old_cols = {r[1] for r in conn.execute(f"PRAGMA table_info({old})")}
+    cols = ", ".join(c for c in new_cols if c in old_cols)
+    conn.execute(f"INSERT INTO {name} ({cols}) SELECT {cols} FROM {old}")
+    conn.execute(f"DROP TABLE {old}")
+    for sql in schema.indexes(name):
+        conn.execute(sql)
+
+
+def _migration_1(conn: sqlite3.Connection, schema: _Schema) -> None:
+    """v1 (v1.0-poc) -> v2 shape.
+
+    The almanac is derived, so it is dropped and recreated empty (status
+    provisional/learned, setpoint_applied). Tables whose columns or allowed
+    values change are rebuilt with their rows: new nullable columns for
+    outdoor and control data and reaction kinds, new event categories,
+    and section_run as an ingest_file kind."""
+    conn.execute("DROP VIEW current_almanac")
+    for name in ("almanac_sensor", "almanac_unit", "almanac"):
+        conn.execute(f"DROP TABLE {name}")
+    for name in ("almanac", "almanac_unit", "almanac_sensor"):
+        _recreate(conn, schema, name)
+    for name in ("heartbeat", "heartbeat_unit", "reactive", "reactive_unit",
+                 "section_run", "event", "ingest_file"):
+        _rebuild_table(conn, schema, name)
+    conn.execute(schema.create("current_almanac"))
+
+
+# (label for the pre-migration backup file, migration). Append only.
+MIGRATIONS: list[tuple[str, Callable[[sqlite3.Connection, _Schema], None]]] = [
+    ("v1", _migration_1),
+]
+
+# The v1 analyser's almanac states, until phase 1's replay emits status.
+_STATUS_FROM_STATE = {"provisional": "provisional", "bootstrap": "provisional",
+                      "learning": "learned", "learned": "learned"}
+
+
+def _now_pair() -> tuple[str, str]:
+    n = datetime.now().astimezone()
+    return (n.isoformat(timespec="seconds"),
+            n.astimezone(timezone.utc).isoformat(timespec="seconds"))
+
+
+def _int_or_none(v) -> int | None:
+    return None if v is None else int(v)
 
 
 class Store:
@@ -58,15 +227,97 @@ class Store:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "csv").mkdir(parents=True, exist_ok=True)
 
-        fresh = not self.db_path.exists() or self.db_path.stat().st_size == 0
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        if fresh:
-            self._conn.executescript(Path(schema_path).read_text())
-            self._conn.commit()
-        else:
-            self._conn.execute("PRAGMA foreign_keys = ON")
+        self.backup_path: Path | None = None    # set when this open migrated the database
+        try:
+            self._prepare(_Schema(Path(schema_path).read_text()))
+        except BaseException:
+            self._conn.close()
+            raise
+        self._conn.execute("PRAGMA foreign_keys = ON")
+
+    # --- schema creation and migration ------------------------------
+    def _prepare(self, schema: _Schema) -> None:
+        latest = len(MIGRATIONS)
+        has_tables = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchone()
+        if not has_tables:
+            for sql in schema.pragmas():
+                self._conn.execute(sql)
+            self._transaction(lambda: [self._conn.execute(sql) for sql in schema.objects()],
+                              latest)
+            return
+
+        current = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if current > latest:
+            raise StoreError(f"{self.db_path} is at storage version {current}, newer than "
+                             f"this code understands ({latest}); refusing to open it")
+        if current == latest:
+            return
+
+        self.backup_path = self._backup(MIGRATIONS[current][0])
+        for n in range(current + 1, latest + 1):
+            fn = MIGRATIONS[n - 1][1]
+            try:
+                self._transaction(lambda: fn(self._conn, schema), n)
+            except Exception as e:
+                raise StoreError(
+                    f"storage migration {n} failed and was rolled back, so the database is "
+                    f"unchanged at storage version {n - 1} (backup at {self.backup_path}): {e}"
+                ) from e
+        ts, ts_utc = _now_pair()
+        self.log_event(ts, ts_utc, "info", "storage",
+                       f"database migrated from storage version {current} to {latest}; "
+                       f"backup at {self.backup_path}",
+                       detail={"from": current, "to": latest, "backup": str(self.backup_path)})
+        log.info("migrated %s from storage version %d to %d (backup %s)",
+                 self.db_path, current, latest, self.backup_path)
+
+    def _transaction(self, work: Callable[[], object], version: int) -> None:
+        """Run work() in one transaction, check foreign keys and integrity,
+        stamp user_version and commit; roll back on any failure."""
+        conn = self._conn
+        saved = conn.isolation_level
+        conn.isolation_level = None                     # explicit BEGIN/COMMIT below
+        conn.execute("PRAGMA foreign_keys = OFF")       # a no-op inside a transaction
+        conn.execute("PRAGMA legacy_alter_table = ON")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            work()
+            problems = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if problems:
+                raise StoreError(f"foreign_key_check found {len(problems)} problem(s), "
+                                 f"first {tuple(problems[0])}")
+            integrity = [r[0] for r in conn.execute("PRAGMA integrity_check")]
+            if integrity != ["ok"]:
+                raise StoreError(f"integrity_check failed: {'; '.join(integrity[:3])}")
+            conn.execute(f"PRAGMA user_version = {int(version)}")
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            conn.isolation_level = saved
+
+    def _backup(self, label: str) -> Path:
+        """Copy the database to <name>.<label>-backup-<timestamp> next to it,
+        via SQLite's online backup so committed WAL content is included."""
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        base = f"{self.db_path.name}.{label}-backup-{stamp}"
+        path, n = self.db_path.with_name(base), 1
+        while path.exists():
+            path, n = self.db_path.with_name(f"{base}-{n}"), n + 1
+        dst = sqlite3.connect(path)
+        try:
+            self._conn.backup(dst)
+        finally:
+            dst.close()
+        return path
 
     # --- CSV archive helper ----------------------------------------
     def _append_csv(self, room_id: str, local_date: str, kind: str,
@@ -87,25 +338,26 @@ class Store:
                          sensors: dict[str, float | None],
                          units: dict[str, UnitSample],
                          occupied: bool | None = None,
-                         deferred_ms: int = 0) -> int:
+                         deferred_ms: int = 0,
+                         outdoor_temp: float | None = None) -> int:
         any_on = 1 if any(u.is_on for u in units.values()) else 0
         # CSV archive first (per-sensor/per-unit encoded as JSON columns)
         self._append_csv(
-            room_id, local_date, "heartbeat",
-            ["ts", "ts_utc", "section", "occupied", "any_unit_on",
-             "deferred_ms", "sensors", "units"],
+            room_id, local_date, "heartbeat", HEARTBEAT_CSV,
             [ts, ts_utc, section,
              "" if occupied is None else int(occupied), any_on, deferred_ms,
              json.dumps(sensors),
-             json.dumps({uid: u.__dict__ for uid, u in units.items()})])
+             json.dumps({uid: u.__dict__ for uid, u in units.items()}),
+             outdoor_temp])
         with self._lock:
             try:
                 cur = self._conn.execute(
                     "INSERT INTO heartbeat(room_id,ts,ts_utc,local_date,section,"
-                    "sensor_n,occupied,any_unit_on,deferred_ms) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    "sensor_n,occupied,any_unit_on,deferred_ms,outdoor_temp) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (room_id, ts, ts_utc, local_date, section, len(sensors),
-                     None if occupied is None else int(occupied), any_on, deferred_ms))
+                     None if occupied is None else int(occupied), any_on, deferred_ms,
+                     outdoor_temp))
                 hb = cur.lastrowid
                 self._conn.executemany(
                     "INSERT INTO heartbeat_sensor(heartbeat_id,sensor_id,temperature) "
@@ -113,9 +365,11 @@ class Store:
                     [(hb, sid, t) for sid, t in sensors.items()])
                 self._conn.executemany(
                     "INSERT INTO heartbeat_unit(heartbeat_id,unit_id,is_on,hvac_mode,"
-                    "fan_mode,setpoint,current_temp,ac_state) VALUES(?,?,?,?,?,?,?,?)",
+                    "fan_mode,setpoint,current_temp,ac_state,control_state,control_offset) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     [(hb, uid, int(u.is_on), u.hvac_mode, u.fan_mode, u.setpoint,
-                      u.current_temp, u.ac_state) for uid, u in units.items()])
+                      u.current_temp, u.ac_state, u.control_state, u.control_offset)
+                     for uid, u in units.items()])
                 self._conn.commit()
                 return hb
             except sqlite3.Error:
@@ -127,27 +381,32 @@ class Store:
                         units: dict[str, ReactiveUnitSample],
                         sensors: dict[str, float | None],
                         occupied: bool | None = None,
-                        suspended_maint: bool = False) -> int:
+                        suspended_maint: bool = False,
+                        kind: str | None = None,
+                        outdoor_temp: float | None = None) -> int:
         self._append_csv(
-            room_id, local_date, "reactive",
-            ["ts", "ts_utc", "section", "window_seconds", "occupied",
-             "suspended_maint", "units", "sensors"],
+            room_id, local_date, "reactive", REACTIVE_CSV,
             [ts, ts_utc, section, window_seconds,
              "" if occupied is None else int(occupied), int(suspended_maint),
              json.dumps({uid: u.__dict__ for uid, u in units.items()}),
-             json.dumps(sensors)])
+             json.dumps(sensors),
+             kind, outdoor_temp])
         with self._lock:
             try:
                 cur = self._conn.execute(
                     "INSERT INTO reactive(room_id,ts,ts_utc,local_date,section,"
-                    "window_seconds,occupied,suspended_maint) VALUES(?,?,?,?,?,?,?,?)",
+                    "window_seconds,occupied,suspended_maint,kind,outdoor_temp) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (room_id, ts, ts_utc, local_date, section, window_seconds,
-                     None if occupied is None else int(occupied), int(suspended_maint)))
+                     None if occupied is None else int(occupied), int(suspended_maint),
+                     kind, outdoor_temp))
                 rid = cur.lastrowid
                 self._conn.executemany(
                     "INSERT INTO reactive_unit(reactive_id,unit_id,setpoint_before,"
-                    "setpoint_after,changed) VALUES(?,?,?,?,?)",
-                    [(rid, uid, u.setpoint_before, u.setpoint_after, int(u.changed))
+                    "setpoint_after,changed,kind,power_before,power_after) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    [(rid, uid, u.setpoint_before, u.setpoint_after, int(u.changed),
+                      u.kind, _int_or_none(u.power_before), _int_or_none(u.power_after))
                      for uid, u in units.items()])
                 self._conn.executemany(
                     "INSERT INTO reactive_sensor(reactive_id,sensor_id,temperature) "
@@ -164,26 +423,47 @@ class Store:
                            actual_start: str | None = None,
                            ended_at: str | None = None,
                            outcome: str = "ran",
-                           outcome_reason: str | None = None) -> None:
+                           outcome_reason: str | None = None,
+                           outdoor_mean: float | None = None,
+                           outdoor_max: float | None = None,
+                           comfort_point: float | None = None,
+                           lean: float | None = None,
+                           blocked: bool | None = None,
+                           block_mode: str | None = None) -> None:
         """Upsert one room/date/section run. Called at crossover."""
+        self._append_csv(
+            room_id, local_date, "section_run", SECTION_RUN_CSV,
+            [section, planned_start, actual_start, ended_at, outcome, outcome_reason,
+             outdoor_mean, outdoor_max, comfort_point, lean, _int_or_none(blocked),
+             block_mode])
         with self._lock:
             self._conn.execute(
                 "INSERT INTO section_run(room_id,local_date,section,planned_start,"
-                "actual_start,ended_at,outcome,outcome_reason) VALUES(?,?,?,?,?,?,?,?) "
+                "actual_start,ended_at,outcome,outcome_reason,outdoor_mean,outdoor_max,"
+                "comfort_point,lean,blocked,block_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(room_id,local_date,section) DO UPDATE SET "
                 "planned_start=COALESCE(excluded.planned_start,section_run.planned_start),"
                 "actual_start=COALESCE(excluded.actual_start,section_run.actual_start),"
                 "ended_at=COALESCE(excluded.ended_at,section_run.ended_at),"
                 "outcome=excluded.outcome,"
-                "outcome_reason=COALESCE(excluded.outcome_reason,section_run.outcome_reason)",
+                "outcome_reason=COALESCE(excluded.outcome_reason,section_run.outcome_reason),"
+                "outdoor_mean=COALESCE(excluded.outdoor_mean,section_run.outdoor_mean),"
+                "outdoor_max=COALESCE(excluded.outdoor_max,section_run.outdoor_max),"
+                "comfort_point=COALESCE(excluded.comfort_point,section_run.comfort_point),"
+                "lean=COALESCE(excluded.lean,section_run.lean),"
+                "blocked=COALESCE(excluded.blocked,section_run.blocked),"
+                "block_mode=COALESCE(excluded.block_mode,section_run.block_mode)",
                 (room_id, local_date, section, planned_start, actual_start,
-                 ended_at, outcome, outcome_reason))
+                 ended_at, outcome, outcome_reason, outdoor_mean, outdoor_max,
+                 comfort_point, lean, _int_or_none(blocked), block_mode))
             self._conn.commit()
 
     def close_section_run(self, room_id: str, local_date: str, section: str,
                           ended_at: str) -> None:
         """Stamp the end of a section when the next one fires, so Analysis
         target bands stop at the real boundary (a Light cutover lesson)."""
+        self._append_csv(room_id, local_date, "section_run", SECTION_RUN_CSV,
+                         [section, None, None, ended_at] + [None] * 8)
         with self._lock:
             self._conn.execute(
                 "UPDATE section_run SET ended_at=? WHERE room_id=? AND local_date=? "
@@ -219,9 +499,9 @@ class Store:
             self._conn.commit()
 
     def ingest_csv(self, *a, **k):
-        # Reverse path (rebuild SQLite from the CSV archive). Deferred; the
-        # forward CSV+SQLite write path above is what the runtime needs.
-        raise NotImplementedError("Phase 8 - CSV re-ingest (recovery path, later)")
+        # Reverse path (rebuild SQLite from the CSV archive). Not built yet;
+        # it is a Gate A prerequisite in docs/V2_DESIGN.md.
+        raise NotImplementedError("CSV re-ingest (recovery path) - required before Gate A")
 
     # --- reads -----------------------------------------------------
     def recent_events(self, limit: int = 200, room_id: str | None = None,
@@ -294,7 +574,7 @@ class Store:
         return {"room_id": room_id, "day": day, "heartbeats": heartbeats,
                 "reactions": reactions, "section_runs": runs}
 
-    # --- almanac persistence (implemented) -------------------------
+    # --- almanac persistence ---------------------------------------
     def publish_almanac(self, room_id: str, sections: list) -> None:
         """Persist a list of SectionAlmanac (app.analyser). Idempotent on
         (room_id, section, valid_from): re-running a day overwrites."""
@@ -307,15 +587,16 @@ class Store:
                         "DELETE FROM almanac WHERE room_id=? AND section=? AND valid_from=?",
                         (room_id, sa.section, vf))
                     cur = self._conn.execute(
-                        "INSERT INTO almanac(room_id,section,valid_from,state,"
-                        "sample_days,confidence,built_at) VALUES(?,?,?,?,?,?,?)",
-                        (room_id, sa.section, vf, sa.state, sa.sample_days,
+                        "INSERT INTO almanac(room_id,section,valid_from,status,"
+                        "confidence,built_at) VALUES(?,?,?,?,?,?)",
+                        (room_id, sa.section, vf, _STATUS_FROM_STATE.get(sa.state, sa.state),
                          sa.confidence, built_at))
                     aid = cur.lastrowid
                     self._conn.executemany(
-                        "INSERT INTO almanac_unit(almanac_id,unit_id,setpoint,off) "
-                        "VALUES(?,?,?,?)",
+                        "INSERT INTO almanac_unit(almanac_id,unit_id,setpoint,"
+                        "setpoint_applied,off) VALUES(?,?,?,?,?)",
                         [(aid, uid, sa.unit_setpoints.get(uid),
+                          sa.unit_setpoints_applied.get(uid),
                           int(sa.unit_off.get(uid, False)))
                          for uid in sa.unit_setpoints])
                     self._conn.executemany(
@@ -336,8 +617,8 @@ class Store:
         as_of_str = (as_of or date.today()).isoformat()
         with self._lock:
             headers = self._conn.execute(
-                "SELECT a.id, a.section, a.valid_from, a.state, a.sample_days, "
-                "a.confidence FROM almanac a JOIN ("
+                "SELECT a.id, a.section, a.valid_from, a.status, a.confidence "
+                "FROM almanac a JOIN ("
                 "  SELECT section, MAX(valid_from) vf FROM almanac "
                 "  WHERE room_id=? AND valid_from<=? GROUP BY section) latest "
                 "ON latest.section=a.section AND latest.vf=a.valid_from "
@@ -346,9 +627,10 @@ class Store:
             sections: dict = {}
             for h in headers:
                 units = {r["unit_id"]: {"setpoint": r["setpoint"],
+                                        "setpoint_applied": r["setpoint_applied"],
                                         "off": bool(r["off"])}
                          for r in self._conn.execute(
-                             "SELECT unit_id,setpoint,off FROM almanac_unit "
+                             "SELECT unit_id,setpoint,setpoint_applied,off FROM almanac_unit "
                              "WHERE almanac_id=?", (h["id"],))}
                 sensors = {r["sensor_id"]: {"comfort": r["comfort"],
                                             "band": r["band"], "trust": r["trust"]}
@@ -356,8 +638,8 @@ class Store:
                              "SELECT sensor_id,comfort,band,trust FROM almanac_sensor "
                              "WHERE almanac_id=?", (h["id"],))}
                 sections[h["section"]] = {
-                    "state": h["state"], "valid_from": h["valid_from"],
-                    "sample_days": h["sample_days"], "confidence": h["confidence"],
+                    "status": h["status"], "valid_from": h["valid_from"],
+                    "confidence": h["confidence"],
                     "units": units, "sensors": sensors,
                 }
         return {"room_id": room_id, "sections": sections}

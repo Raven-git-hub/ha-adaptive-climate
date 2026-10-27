@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "homeassistant": {
+    "base_url": "http://192.168.1.251:8123",
+    "verify_ssl": true
+  },
+  "system": {
+    "temperature_unit": "C",
+    "heartbeat_interval_minutes": 10,
+    "reactive_min_delta": 0.5,
+    "max_step_degrees": 2.0,
+    "correction_max_minutes": 60,
+    "trust": {
+      "high_trust_deviation": 0.5,
+      "low_trust_deviation": 5.0
+    }
+  },
+  "learning": {
+    "analysis_window_days": 21,
+    "bootstrap_min_days": 7,
+    "validity_delay_days": 2,
+    "reactive_weight": 5
+  },
+  "rooms": [
+    {
+      "id": "main_room",
+      "name": "Main Room",
+      "enabled": true,
+      "schedule_profile": "default",
+      "units": [
+        {
+          "id": "main_room_ac",
+          "name": "Main Room AC",
+          "entity_id": "climate.lounge_lounge"
+        }
+      ],
+      "sensors": [
+        { "id": "living1", "name": "Living Room Temp",         "entity_id": "sensor.living_room_temp" },
+        { "id": "living2", "name": "Living Room Temperature 1", "entity_id": "sensor.living_room_temperature_1_temperature" },
+        { "id": "living3", "name": "Living Room Temperature 2", "entity_id": "sensor.living_room_temperature_2_temperature" }
+      ],
+      "presence_sensors": []
+    },
+    {
+      "id": "main_bedroom",
+      "name": "Main Bedroom",
+      "enabled": true,
+      "schedule_profile": "default",
+      "units": [
+        {
+          "id": "main_bedroom_ac",
+          "name": "Main Bedroom AC",
+          "entity_id": "climate.home_s_device_2_home_s_device_2"
+        }
+      ],
+      "sensors": [
+        { "id": "bed_main", "name": "Main Bedroom Temperature", "entity_id": "sensor.main_bedroom_temperature_temperature" },
+        { "id": "bed_2",    "name": "Bedroom Temperature",      "entity_id": "sensor.bedroom_temperature_2" }
+      ],
+      "presence_sensors": []
+    },
+    {
+      "id": "baby_room",
+      "name": "Baby Room",
+      "enabled": true,
+      "schedule_profile": "default",
+      "units": [
+        {
+          "id": "baby_room_ac",
+          "name": "Baby Room AC",
+          "entity_id": "climate.baby_room_ac"
+        }
+      ],
+      "sensors": [
+        { "id": "baby", "name": "Baby Room Temperature", "entity_id": "sensor.baby_room_temperature_temperature" }
+      ],
+      "presence_sensors": []
+    }
+  ],
+  "schedule_profiles": [
+    {
+      "id": "default",
+      "name": "Default",
+      "sections": [
+        { "id": "sunrise",   "name": "Sunrise",   "trigger": { "type": "clock", "time": "05:30" } },
+        { "id": "day",       "name": "Day",       "trigger": { "type": "clock", "time": "08:00" } },
+        { "id": "afternoon", "name": "Afternoon", "trigger": { "type": "clock", "time": "14:00" } },
+        { "id": "sunset",    "name": "Sunset",    "trigger": { "type": "clock", "time": "16:00" } },
+        { "id": "night",     "name": "Night",     "trigger": { "type": "clock", "time": "20:30" } },
+        { "id": "sleep",     "name": "Sleep",     "trigger": { "type": "clock", "time": "22:00" } }
+      ]
+    }
+  ]
+}

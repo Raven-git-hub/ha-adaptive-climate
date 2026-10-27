@@ -42,8 +42,8 @@ table.almanac th { color: var(--muted); font-weight: 600; }
 table.almanac tr.empty td { color: var(--muted); }
 .comfort { font-variant-numeric: tabular-nums; }
 .state { text-transform: capitalize; font-size: .8em; padding: .1rem .4rem; border-radius: 4px; }
-.state.bootstrap { background: #3a2f12; color: var(--warn); }
-.state.learning { background: #123a2a; color: #4fd6a0; }
+.state.provisional { background: #3a2f12; color: var(--warn); }
+.state.learned { background: #123a2a; color: #4fd6a0; }
 .trust { display: inline-block; width: 46px; height: 6px; background: var(--band);
   border-radius: 3px; margin-left: .3rem; overflow: hidden; vertical-align: middle; }
 .trust > span { display: block; height: 100%; background: var(--accent); }

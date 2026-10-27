@@ -75,7 +75,7 @@ function renderRoom(room, sections) {
       <p class="placeholder">No almanac yet — observing (provisional).</p></section>`;
   }
   const units = room.units, sensors = room.sensors;
-  const head = `<tr><th>Section</th><th>State</th>
+  const head = `<tr><th>Section</th><th>Status</th>
     ${units.map((u) => `<th>${u.name}<br><span class="muted">setpoint</span></th>`).join("")}
     ${sensors.map((s) => `<th>${s.name}<br><span class="muted">comfort · band · trust</span></th>`).join("")}</tr>`;
 
@@ -94,7 +94,7 @@ function renderRoom(room, sections) {
         <span class="muted">±${fmt(v.band)}</span>
         <span class="trust"><span style="width:${Math.round(t * 100)}%"></span></span></td>`;
     }).join("");
-    return `<tr><td>${sec}</td><td><span class="state ${d.state}">${d.state}</span></td>${uCells}${sCells}</tr>`;
+    return `<tr><td>${sec}</td><td><span class="state ${d.status}">${d.status}</span></td>${uCells}${sCells}</tr>`;
   }).join("");
 
   return `<section class="room"><h2>${room.name}</h2>
@@ -514,6 +514,7 @@ function leakField(path, val, domain) {
 function settingsHtml() {
   const sys = cfg.system || (cfg.system = {});
   const trust = sys.trust || (sys.trust = {});
+  const ctl = sys.control || (sys.control = {});
   const learn = cfg.learning || (cfg.learning = {});
   const ha = cfg.homeassistant || (cfg.homeassistant = {});
   return `<details class="panel"><summary>System, learning &amp; connection settings</summary>
@@ -528,13 +529,10 @@ function settingsHtml() {
         </select></label>
       <label>Heartbeat interval (min) ${numField("system.heartbeat_interval_minutes", sys.heartbeat_interval_minutes ?? 10)}</label>
       <label>Reactive min delta (\u00b0) ${numField("system.reactive_min_delta", sys.reactive_min_delta ?? 0.5, {step:"0.1"})}</label>
-      <label>Max maintenance step (\u00b0) ${numField("system.max_step_degrees", sys.max_step_degrees ?? 2.0, {step:"0.5"})}</label>
-      <label>Correction cap (min) ${numField("system.correction_max_minutes", sys.correction_max_minutes ?? 60)}</label>
+      <label>Boost step (\u00b0) ${numField("system.control.boost_degrees", ctl.boost_degrees ?? 2.0, {step:"0.5"})}</label>
+      <label>Boost cap (min) ${numField("system.control.boost_max_minutes", ctl.boost_max_minutes ?? 60)}</label>
       <label>High-trust deviation (\u00b0) ${numField("system.trust.high_trust_deviation", trust.high_trust_deviation ?? 0.5, {step:"0.1"})}</label>
       <label>Low-trust deviation (\u00b0) ${numField("system.trust.low_trust_deviation", trust.low_trust_deviation ?? 5.0, {step:"0.5"})}</label>
-      <label>Analysis window (days) ${numField("learning.analysis_window_days", learn.analysis_window_days ?? 21)}</label>
-      <label>Bootstrap min days ${numField("learning.bootstrap_min_days", learn.bootstrap_min_days ?? 7)}</label>
-      <label>Validity delay (days) ${numField("learning.validity_delay_days", learn.validity_delay_days ?? 2)}</label>
       <label>Reactive weight (\u00d7) ${numField("learning.reactive_weight", learn.reactive_weight ?? 5)}</label>
       <label class="wide">External guard booleans (comma-separated, coexistence only)
         <input type="text" data-path="system.external_guards" data-vtype="csv" data-live="1"

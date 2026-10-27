@@ -24,8 +24,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.analyser import LearningConfig, analyse_room
-from app.config import blank, save
-from app.store import Store
+from app.config import ConfigError, blank, migrate, save, validate
+from app.store import Store, StoreError
 
 logging.basicConfig(
     level=os.environ.get("AC_LOG_LEVEL", "info").upper(),
@@ -52,14 +52,20 @@ state = State()
 
 
 def _raw_config() -> dict:
-    """Lightweight read of the live config JSON (no validation - Phase 9
-    does that). Enough for the UI to enumerate rooms and for the analyser
-    to know each room's units and sensors."""
+    """Lightweight read of the live config JSON, migrated to version 2 with
+    v2's new keys defaulted. Not validated, so a broken file still loads
+    for the UI to show and fix. A file on disk stays version 1 until the
+    next Save writes it back as version 2."""
     if CONFIG_PATH.exists():
         try:
-            return json.loads(CONFIG_PATH.read_text())
+            raw = json.loads(CONFIG_PATH.read_text())
         except json.JSONDecodeError:
             return blank()
+        try:
+            return migrate(raw)
+        except ConfigError as e:
+            log.warning("config at %s could not be migrated: %s", CONFIG_PATH, e)
+            return raw
     return blank()
 
 
@@ -80,7 +86,16 @@ def _learning_config(cfg: dict) -> LearningConfig:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    state.store = Store(DATA_DIR, SCHEMA_DIR / "storage.schema.sql")
+    try:
+        state.store = Store(DATA_DIR, SCHEMA_DIR / "storage.schema.sql")
+    except StoreError as e:
+        # A failed migration rolled back and left the database untouched.
+        # Stay up but degraded (no runtime) rather than crash: a restart
+        # loop would retry the migration, and take a new backup, every time.
+        state.error = f"storage unavailable: {e}"
+        log.error(state.error)
+        yield
+        return
     if not CONFIG_PATH.exists():
         save(blank(), CONFIG_PATH)
         log.info("wrote a blank config to %s", CONFIG_PATH)
@@ -151,7 +166,7 @@ def healthz() -> JSONResponse:
     # window - or down with no recovery in progress - is degraded.
     reconnecting = (ws_down_seconds is not None
                     and ws_down_seconds < WS_DOWN_GRACE_SECONDS)
-    ok = idle or connected or reconnecting
+    ok = (idle or connected or reconnecting) and state.store is not None
 
     return JSONResponse(
         status_code=200 if ok else 503,
@@ -241,11 +256,12 @@ def api_get_config() -> dict:
 
 @app.post("/api/config")
 def api_save_config(cfg: dict) -> dict:
+    """Migrate (a version 1 payload is accepted), validate against the
+    version 2 schema, and save the version 2 result."""
     try:
-        import jsonschema
-        schema = json.loads((SCHEMA_DIR / "config.schema.json").read_text())
-        jsonschema.validate(cfg, schema)
-    except Exception as e:
+        cfg = migrate(cfg, SCHEMA_DIR / "config.schema.json")
+        validate(cfg, SCHEMA_DIR / "config.schema.json")
+    except ConfigError as e:
         raise HTTPException(400, f"config did not validate: {e}")
     save(cfg, CONFIG_PATH)
     return {"ok": True}

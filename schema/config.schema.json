@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptive-climate/schema/config.v1.json",
+  "$id": "https://adaptive-climate/schema/config.v2.json",
   "title": "Adaptive Climate Configuration",
   "description": "Single source of truth for the Adaptive Climate container. Everything downstream is a pure function of this document: the helper/automation generator, the section scheduler, the analyser, and the UI. Learned data (almanacs) is NOT stored here - it lives in the almanac store and is regenerated nightly.",
   "type": "object",
@@ -8,8 +8,8 @@
   "required": ["version", "homeassistant", "system", "rooms", "schedule_profiles"],
   "properties": {
     "version": {
-      "const": 1,
-      "description": "Schema version. Bumped only on breaking changes; the container migrates forward on load."
+      "const": 2,
+      "description": "Schema version. Bumped only on breaking changes; the container migrates forward on load (app/config.py migrates version 1)."
     },
 
     "homeassistant": {
@@ -58,13 +58,36 @@
           "type": "number", "minimum": 0, "maximum": 20, "default": 0.5,
           "description": "A unit's setpoint only counts as genuinely changed if |after - before| exceeds this many degrees. Filters out rounding noise and transition echo."
         },
-        "max_step_degrees": {
-          "type": "number", "minimum": 0.1, "maximum": 10, "default": 2.0,
-          "description": "Maintenance nudges the setpoint by at most this many degrees per step (the '2 degrees at a time' rule)."
-        },
-        "correction_max_minutes": {
-          "type": "integer", "minimum": 1, "maximum": 240, "default": 60,
-          "description": "Safety cap: corrective action stops after this long even if the quorum is still met, or at the first heartbeat the tally drops below quorum - whichever comes first."
+        "control": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The v2 cool-or-rest state machine. See docs/V2_DESIGN.md, Control.",
+          "properties": {
+            "boost_degrees": {
+              "type": "number", "minimum": 0.1, "maximum": 10, "default": 2.0,
+              "description": "Boost cools at base + offset minus this many degrees (v1: system.max_step_degrees)."
+            },
+            "boost_max_minutes": {
+              "type": "integer", "minimum": 1, "maximum": 240, "default": 60,
+              "description": "Boost cap: after this long in boost the unit returns to cool at offset -1 (v1: system.correction_max_minutes)."
+            },
+            "cool_min_heartbeats": {
+              "type": "integer", "minimum": 0, "maximum": 12, "default": 1,
+              "description": "Minimum time in cool or boost, in heartbeats; met at (n - 0.5) x the heartbeat interval. A section change overrides it."
+            },
+            "rest_min_heartbeats": {
+              "type": "integer", "minimum": 0, "maximum": 12, "default": 2,
+              "description": "Minimum time in rest, in heartbeats; met at (n - 0.5) x the heartbeat interval. A section change overrides it."
+            },
+            "person_grace_minutes": {
+              "type": "integer", "minimum": 0, "maximum": 240, "default": 30,
+              "description": "After a person's setpoint change or turn-on, no transition into boost or rest for this long."
+            },
+            "offset_cap": {
+              "type": "integer", "minimum": 0, "maximum": 10, "default": 3,
+              "description": "The section offset is capped at plus or minus this many whole steps; the boost step goes on top."
+            }
+          }
         },
         "trust": {
           "type": "object",
@@ -105,25 +128,63 @@
     "learning": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Analyser tuning. Defaults reproduce the proven Light behaviour for setpoint learning; trust-specific knobs live under system.trust.",
+      "description": "Learning tuning; trust-specific knobs live under system.trust. v1's analysis_window_days, bootstrap_min_days and validity_delay_days are gone: the v2 replay has no window, bootstrap or validity delay.",
       "properties": {
-        "analysis_window_days": {
-          "type": "integer", "minimum": 1, "default": 21,
-          "description": "Rolling window for the nightly rebuild (three weeks)."
+        "reaction_rate": {
+          "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.5,
+          "description": "Each setpoint-moving reaction moves the learned setpoint (and a comfort reading, from an accepted window) this fraction of the way toward what the person chose."
         },
-        "bootstrap_min_days": {
-          "type": "integer", "minimum": 1, "default": 7,
-          "description": "Below this many days of data the almanac is published immediately (bootstrap); at or above it, publication waits the validity delay (learning)."
-        },
-        "validity_delay_days": {
-          "type": "integer", "minimum": 0, "default": 2,
-          "description": "In the learning state, a new almanac only takes effect after this delay, so a single odd day cannot swing behaviour."
+        "recency_half_life_days": {
+          "type": "number", "exclusiveMinimum": 0, "default": 7,
+          "description": "Half-life of a reaction's weight in band learning, over all history."
         },
         "reactive_weight": {
           "type": "number", "minimum": 1, "default": 5,
           "description": "A reactive event counts this many times a heartbeat. You correcting the system is its most valuable signal."
         }
       }
+    },
+
+    "outdoor": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Outdoor input: it leans each sensor's trigger edges and can block cooling for a section. See docs/V2_DESIGN.md, Outdoor temperature.",
+      "properties": {
+        "source": {
+          "enum": ["forecast", "probe", "none"], "default": "none",
+          "description": "'forecast' reads weather_entity's hourly forecast at each section change; 'probe' reads probe_entity as a 30-minute rolling mean; 'none' means no lean and no block."
+        },
+        "weather_entity": {
+          "type": ["string", "null"], "pattern": "^weather\\.", "default": null,
+          "description": "A weather.* entity with an hourly forecast. Required when source is 'forecast'."
+        },
+        "probe_entity": {
+          "type": ["string", "null"], "pattern": "^sensor\\.", "default": null,
+          "description": "An outdoor temperature sensor.* entity. Required when source is 'probe'."
+        },
+        "block_mode": {
+          "enum": ["off", "shadow", "active"], "default": "shadow",
+          "description": "'shadow' computes and logs the cooling block without applying it; 'active' applies it."
+        },
+        "lean_per_degree": {
+          "type": "number", "minimum": 0, "maximum": 1, "default": 0.1,
+          "description": "k: how far, in band widths per degree of (room comfort point - outdoor), the trigger edges lean."
+        },
+        "initial_margin": {
+          "type": "number", "minimum": 2, "maximum": 10, "default": 6,
+          "description": "Starting per-room block margin M in degrees; it then learns from reactions, within 2 to 10."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["source"], "properties": { "source": { "const": "forecast" } } },
+          "then": { "required": ["weather_entity"], "properties": { "weather_entity": { "type": "string" } } }
+        },
+        {
+          "if": { "required": ["source"], "properties": { "source": { "const": "probe" } } },
+          "then": { "required": ["probe_entity"], "properties": { "probe_entity": { "type": "string" } } }
+        }
+      ]
     },
 
     "rooms": {
@@ -174,6 +235,19 @@
           "items": { "type": "string" },
           "default": [],
           "description": "RESERVED. Optional occupancy sensors. Not yet used - reserved so occupancy can be added without a schema migration. See docs/DESIGN.md open decisions."
+        },
+        "heat_sources": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-z_]+\\.[a-z0-9_]+$" },
+          "uniqueItems": true,
+          "default": [],
+          "description": "Entities such as heater plugs. While any is on, cooling is blocked for this room regardless of the forecast."
+        },
+        "knobs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/knob" },
+          "default": [],
+          "description": "Household knobs assigned to this room; each drives every unit in it. Shape is a placeholder until the hardware is settled (docs/V2_DESIGN.md, phase 8)."
         },
         "scenes": {
           "type": "object",
@@ -250,6 +324,16 @@
         { "required": ["entity_id"], "not": { "required": ["source"] } },
         { "required": ["source"], "not": { "required": ["entity_id"] } }
       ]
+    },
+
+    "knob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_]+$", "description": "Stable knob id, as carried by its ESPHome events." },
+        "name": { "type": "string", "minLength": 1 }
+      }
     },
 
     "scene": {

@@ -1,20 +1,43 @@
 """
 Adaptive Climate - config loader.
 
-Validates config against schema/config.schema.json, applies defaults,
-and runs cross-reference checks the schema cannot express (e.g. a room's
-schedule_profile must exist; every scene unit id must be a real unit in
-that room). The loaded Config is the typed view the rest of the app uses.
+Loads a config of either version, migrates version 1 forward to 2, fills
+in the keys v2 added, and validates against schema/config.schema.json.
+The loaded Config is the typed view the rest of the app uses.
 
-STATUS: skeleton.
+Defaults are filled only for the keys v2 introduced (learning.reaction_rate
+and recency_half_life_days, system.control.*, outdoor.*, rooms[].heat_sources
+and rooms[].knobs), read from the schema so each lives in one place. v1
+keys are left as written: the code that reads them carries its own
+fallbacks, and some differ from the schema's documented default (a scene's
+transition_seconds falls back to 0 in the generator but documents 120), so
+filling them would change behaviour.
+
+STATUS: migration, defaults and schema validation are implemented. The
+cross-reference checks the schema cannot express (a room's
+schedule_profile must exist; every scene unit id must be a real unit in
+that room) and the typed accessors are still to come (Roadmap Phase 9).
 """
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schema" / "config.schema.json"
+CURRENT_VERSION = 2
+
+# v1 -> v2: system keys that moved under system.control, as (old, new).
+_MOVED_TO_CONTROL = (("max_step_degrees", "boost_degrees"),
+                     ("correction_max_minutes", "boost_max_minutes"))
+# v1 learning keys v2 drops: the replay has no window, bootstrap or delay.
+_DROPPED_LEARNING = ("analysis_window_days", "bootstrap_min_days", "validity_delay_days")
+# New keys inside objects that also hold v1 keys (only these get defaults).
+_NEW_LEARNING = ("reaction_rate", "recency_half_life_days")
+_NEW_ROOM = ("heat_sources", "knobs")
 
 
 class ConfigError(Exception):
@@ -68,13 +91,13 @@ class Config:
 
 def blank() -> dict:
     """A minimal valid config: no rooms, the default schedule profile."""
-    return {
-        "version": 1,
+    return migrate({
+        "version": CURRENT_VERSION,
         "homeassistant": {"base_url": "http://homeassistant.local:8123"},
         "system": {},
         "rooms": [],
         "schedule_profiles": [_default_profile()],
-    }
+    })
 
 
 def _default_profile() -> dict:
@@ -90,13 +113,107 @@ def _default_profile() -> dict:
     }
 
 
-def load(path: str | Path, schema_path: str | Path) -> Config:
-    """Load, validate, default and cross-check. TODO(Phase 9)."""
-    raise NotImplementedError("Phase 9")
+def _load_schema(schema_path: str | Path) -> dict:
+    return json.loads(Path(schema_path).read_text())
 
 
-def loads(text: str, schema_path: str | Path) -> Config:
-    raise NotImplementedError("Phase 9")
+# ---------------------------------------------------------------------
+# Migration and defaults
+# ---------------------------------------------------------------------
+
+def migrate(cfg: dict, schema_path: str | Path = SCHEMA_PATH) -> dict:
+    """Return a version-2 copy of `cfg` (version 1 or 2) with v2's new keys
+    defaulted. Never mutates its argument. On a v2 config it only fills
+    new keys that are missing, so it is idempotent. Does not validate."""
+    if not isinstance(cfg, dict):
+        raise ConfigError("config must be a JSON object")
+    out = copy.deepcopy(cfg)
+    version = out.get("version")
+    if version == 1:
+        _v1_to_v2(out)
+    elif version != CURRENT_VERSION:
+        raise ConfigError(f"unsupported config version {version!r} "
+                          f"(expected 1 or {CURRENT_VERSION})")
+    _fill_new_defaults(out, _load_schema(schema_path))
+    return out
+
+
+def _v1_to_v2(cfg: dict) -> None:
+    cfg["version"] = 2
+    system = cfg.setdefault("system", {})
+    if isinstance(system, dict):
+        control = system.setdefault("control", {})
+        for old, new in _MOVED_TO_CONTROL:
+            if old in system:
+                value = system.pop(old)
+                if isinstance(control, dict):
+                    control.setdefault(new, value)
+    learning = cfg.get("learning")
+    if isinstance(learning, dict):
+        for key in _DROPPED_LEARNING:
+            learning.pop(key, None)
+
+
+def _fill(obj: Any, props: dict, keys: tuple[str, ...] | None = None) -> None:
+    """Set each listed property (all of `props` when keys is None) that is
+    missing from obj to its schema default."""
+    if not isinstance(obj, dict):
+        return   # malformed; validation reports it
+    for key in (keys if keys is not None else tuple(props)):
+        if key not in obj and "default" in props[key]:
+            obj[key] = copy.deepcopy(props[key]["default"])
+
+
+def _fill_new_defaults(cfg: dict, schema: dict) -> None:
+    props = schema["properties"]
+    _fill(cfg.setdefault("learning", {}), props["learning"]["properties"], _NEW_LEARNING)
+    system = cfg.setdefault("system", {})
+    if isinstance(system, dict):
+        _fill(system.setdefault("control", {}),
+              props["system"]["properties"]["control"]["properties"])
+    _fill(cfg.setdefault("outdoor", {}), props["outdoor"]["properties"])
+    room_props = schema["$defs"]["room"]["properties"]
+    rooms = cfg.get("rooms")
+    for room in rooms if isinstance(rooms, list) else []:
+        _fill(room, room_props, _NEW_ROOM)
+
+
+# ---------------------------------------------------------------------
+# Validation and loading
+# ---------------------------------------------------------------------
+
+def validate(cfg: dict, schema_path: str | Path = SCHEMA_PATH) -> None:
+    """Raise ConfigError if `cfg` is not a valid version-2 config."""
+    import jsonschema
+
+    outdoor = cfg.get("outdoor") if isinstance(cfg, dict) else None
+    if isinstance(outdoor, dict):
+        # The schema enforces these too; checked first for a clearer message.
+        for source, key in (("forecast", "weather_entity"), ("probe", "probe_entity")):
+            if outdoor.get("source") == source and not outdoor.get(key):
+                raise ConfigError(f"outdoor.{key}: required when outdoor.source is '{source}'")
+
+    validator = jsonschema.Draft202012Validator(_load_schema(schema_path))
+    error = jsonschema.exceptions.best_match(validator.iter_errors(cfg))
+    if error is not None:
+        where = ".".join(str(p) for p in error.absolute_path) or "config"
+        raise ConfigError(f"{where}: {error.message}")
+
+
+def loads(text: str, schema_path: str | Path = SCHEMA_PATH) -> Config:
+    """Parse, migrate to version 2, default and validate."""
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"config is not valid JSON: {e}") from e
+    cfg = migrate(raw, schema_path)
+    validate(cfg, schema_path)
+    return Config(raw=cfg)
+
+
+def load(path: str | Path, schema_path: str | Path = SCHEMA_PATH) -> Config:
+    """Load, migrate, default and validate the config file at `path`."""
+    return loads(Path(path).read_text(), schema_path)
 
 
 def save(cfg: dict, path: str | Path) -> None:

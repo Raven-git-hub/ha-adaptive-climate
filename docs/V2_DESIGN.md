@@ -61,7 +61,7 @@ A change is a person's when it carries no `context.parent_id`, `ac_active` is of
 
 Every reaction kind, the knob included, is grouped by the existing 120-second extending window (`system.reactive_window_seconds`): each further change extends the window, and the whole window is recorded as one reaction. Per unit, the record keeps the **first** `setpoint_before` in the window and the last `setpoint_after`. (v1 overwrites `setpoint_before` on every change; phase 0 fixes this.)
 
-The reaction kind is stored per unit: `setpoint`, `on`, `off`, `manual`, `knob_turn` or `knob_press` (a knob long press records as `off`). The room-level kind is derived from the units' kinds, not stored separately. A unit turned on and given a new setpoint in the same window is one reaction of kind `on`; setpoint learning still applies to it, because its `setpoint_after` changed.
+The reaction kind is stored per unit: `setpoint`, `on`, `off`, `manual`, `knob_turn` or `knob_press` (a knob long press records as `off`). The room-level kind is derived from the units' kinds when the reaction is recorded, and stored with it. A unit turned on and given a new setpoint in the same window is one reaction of kind `on`; setpoint learning still applies to it, because its `setpoint_after` changed.
 
 A **setpoint-moving reaction** is a setpoint change or a knob turn.
 
@@ -367,9 +367,9 @@ Phase 0 defines every v2 key in the schema up front, with defaults, so saving a 
 
 - `learning.reaction_rate`: 0.5
 - `learning.recency_half_life_days`: 7, kept for band learning (v1's analyser used it, but the schema never listed it)
-- `system.control`: `boost_degrees` 2, `boost_max_minutes` 60, `person_grace_minutes` 30
-- `outdoor`: `source` none, `block_mode` shadow, `lean_per_degree` 0.1, `initial_margin` 6
-- `rooms[].heat_sources` and `rooms[].knobs`: empty
+- `system.control`: `boost_degrees` 2, `boost_max_minutes` 60, `cool_min_heartbeats` 1, `rest_min_heartbeats` 2, `person_grace_minutes` 30, `offset_cap` 3
+- `outdoor`: `source` none, `weather_entity` null, `probe_entity` null, `block_mode` shadow, `lean_per_degree` 0.1, `initial_margin` 6. `weather_entity` (a `weather.*` entity) must be set when `source` is `forecast`, and `probe_entity` (a `sensor.*` entity) when it is `probe`. Phase 4 consumes them.
+- `rooms[].heat_sources` (entity ids) and `rooms[].knobs` (`{id, name?}`, a placeholder until the hardware is settled): empty
 
 The loader moves `system.max_step_degrees` to `system.control.boost_degrees` and `system.correction_max_minutes` to `system.control.boost_max_minutes`. `bootstrap_min_days`, `validity_delay_days` and `analysis_window_days` are dropped. A scene's per-unit `mode: off` is kept and maps to the `config_off` state.
 
@@ -377,9 +377,10 @@ The loader moves `system.max_step_degrees` to `system.control.boost_degrees` and
 
 Phase 0 gives the database a real migration path:
 
-- **Versioned migrations:** `PRAGMA user_version`, with numbered migrations run at startup.
-- **Rebuilt tables:** SQLite can't change a column's allowed values in place, so tables whose lists change are rebuilt. The almanac is derived, so it is dropped and recreated; `event` is rebuilt by copying its rows.
-- **New columns:** heartbeat outdoor value; per-unit control state and offset; per-unit reaction kind and outdoor value; section-run outdoor mean, max, comfort point, lean and block decision.
+- **Versioned migrations:** `PRAGMA user_version`, with numbered migrations run at startup. A fresh database runs the schema file and is stamped with the latest version; an older one is migrated to the identical shape.
+- **Safety:** before migrating an existing database, the store copies it to `<name>.v1-backup-<timestamp>` next to it and logs the path as a `storage` event. Each migration runs in one transaction with foreign keys off and must pass `foreign_key_check` and `integrity_check` before it commits; otherwise it rolls back, leaving the database as it was, and the app stays up without a runtime rather than restart into the same failure.
+- **Rebuilt tables:** SQLite can't change a column's allowed values in place, so tables whose lists change are rebuilt from the schema file's own CREATE text, rows copied. The almanac is derived, so it is dropped and recreated empty; `event` is rebuilt by copying its rows, with new `control`, `block`, `outdoor` and `storage` categories.
+- **New columns:** heartbeat outdoor value; per-unit control state and offset; reaction kind (room and unit), per-unit power before and after, and outdoor value; section-run outdoor mean, max, comfort point, lean, and the block decision as `blocked` plus the `block_mode` in force (so shadow "would have blocked" is `blocked` = 1 in `shadow`).
 - **Older rows:** treated as `kind = setpoint` with no outdoor value.
 - **CSV:** new columns are appended at the end, so old files still ingest. `section_run` is now written to CSV as well.
 - **Re-ingest:** rebuilding SQLite from CSV is a prerequisite for Gate A, not for phase 1.
@@ -398,7 +399,7 @@ Phases 0 to 5 are built and checked offline against the existing harnesses, then
 
 | Phase | Scope | Check |
 | --- | --- | --- |
-| 0 · Foundations | Storage migrations (`user_version`; `almanac` and `event` rebuilt); `section_run` written to CSV; every v2 config key with defaults, and the v1 config migration; `setpoint_before` keeps the first value in a window | `store_check` migrates a v1 database and keeps its events; a v1 config loads migrated and a v2 config saves; a two-step setpoint change records its first `setpoint_before` |
+| 0 · Foundations | Storage migrations (`user_version`, backup first, checked transaction, rollback; `almanac` and `event` rebuilt); `section_run` written to CSV; every v2 config key with defaults, and the v1 config migration; `setpoint_before` keeps the first value in a window | `store_check` migrates a v1 database keeping every row, finds it identical to a fresh one, and sees a forced failure leave it untouched; `config_check` migrates the v1 example to exactly the v2 example; a three-step setpoint change records its first `setpoint_before` |
 | 1 · Learning flip | Analyser becomes a replay of reactions from per-unit and per-sensor seeds; rounding toward the latest setpoint-moving reaction; comfort from accepted readings; confidence; the runtime's provisional seeding retired | `analyser_demo` applies a 1° correction the next day; `compare_analyser` diffs v1 and v2 almanacs |
 | 2 · On/off as reactions | Runtime detects a person turning units on or off, or changing mode or fan; reaction kind stored per unit | `runtime_check` records person on/off and still ignores the system's own changes; on plus a setpoint change in one window is one `on` reaction |
 | 3a · Cool-or-rest control | `app/control.py`, generator Jinja, the new unit helpers and the manual-change automation; maintenance raises the guard; the Warming/fan_only path is removed | Jinja matches `app/control.py` for every state, edge and person reaction |
@@ -451,3 +452,11 @@ From the review of this design against the v1 code, 27 Oct 2026:
 13. **Confidence:** 1 − 0.5^(quiet / 3). Only setpoint-moving reactions make a section learned.
 14. **On/off:** off → any non-off mode counts as on. Kind is stored per unit, and on plus a setpoint change in one window is one `on` reaction that still teaches the setpoint.
 15. **State machine:** leak beats everything; commands are sent only on transitions; minimum times are counted in heartbeats; the ±3 cap excludes the boost step. The boost config keys move under `system.control`.
+
+From phase 0 planning, 27 Oct 2026:
+
+16. **Migration safety:** back up the database before migrating; one transaction per migration, checked with `foreign_key_check` and `integrity_check`, rolled back on failure; the backup path is logged.
+17. **No deploy before phase 1:** phase 0 empties the almanac, and only phase 1's replay-on-first-heartbeat refills it from history.
+18. **Outdoor entities:** `outdoor.weather_entity` and `outdoor.probe_entity` are defined now, nullable, each required by its source; phase 4 consumes them.
+19. **Knob config:** `{id, name?}` is the placeholder shape until the hardware is settled.
+20. **Room-level reaction kind** is stored on the reaction as well as per unit.

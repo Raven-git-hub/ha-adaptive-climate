@@ -19,12 +19,11 @@ for display and tie-breaking; the quorum count itself is unweighted.
   "room_id": "main_room",
   "sections": {
     "day": {
-      "state": "learning",
+      "status": "learned",
       "valid_from": "2026-08-03",
-      "sample_days": 8,
       "confidence": 1.0,
       "units": {
-        "main_room_ac": { "setpoint": 21.46, "off": false }
+        "main_room_ac": { "setpoint": 21.46, "setpoint_applied": null, "off": false }
       },
       "sensors": {
         "living1": { "comfort": 25.0, "band": 1.0, "trust": 0.889 },
@@ -38,18 +37,22 @@ for display and tie-breaking; the quorum count itself is unweighted.
 
 ## Field notes
 
-- **state** — `bootstrap` (< `bootstrap_min_days`, published immediately) or
-  `learning` (>= that, published with the validity delay). `provisional` is a
-  runtime seed, not an analyser output, so it does not appear here.
+- **status** (v2, phase 0) — `provisional` or `learned` (docs/V2_DESIGN.md).
+  It replaces v1's `state`, and v1's `sample_days` is gone. Until phase 1's
+  replay lands, the store publishes the v1 analyser's `bootstrap` and the
+  runtime's provisional seed as `provisional`, and `learning` as `learned`.
 - **valid_from** — the date this almanac comes into force. For `learning` it is
   `as_of + validity_delay_days`, so a fresh build does not swing behaviour the
   same night; for `bootstrap` it is the build date. The store's
   `current_almanac(room, as_of)` returns, per section, the newest row whose
-  `valid_from <= as_of`.
+  `valid_from <= as_of`. (The validity delay goes in phase 1.)
 - **units[].setpoint** — the learned setpoint, stored precise. The generator /
   runtime snaps it to the unit's `target_temp_step` and clamps to the unit's
   `[min_temp, max_temp]` before calling `climate.set_temperature`
   (docs/HARDWARE.md). `null` means no opinion yet - leave the unit as it is.
+- **units[].setpoint_applied** (v2) — the whole-degree value to drive, already
+  rounded toward the latest setpoint-moving reaction, so templates never
+  round. `null` until phase 1's learner fills it; nothing reads it yet.
 - **units[].off** — an explicit forced-off for this section. Scene "off" comes
   from config and is baked into the automation directly; this flag mirrors it so
   the two agree once an almanac exists.

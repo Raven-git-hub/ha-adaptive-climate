@@ -26,6 +26,10 @@ v1-only detail in them (heartbeat-fed learning, the Warming/fan_only path,
 bootstrap and validity delay, the room-level correction timer) as outgoing.
 The v1 state is tagged `v1.0-poc`.
 
+**Do not deploy v2 to Home Assistant until phase 1 has landed; phase 0 empties
+the almanac and only phase 1's replay-on-first-heartbeat refills it from
+history.**
+
 ## Architecture at a glance
 
 - **CSV is the archive; SQLite is the query layer.** Every observation is
@@ -56,7 +60,7 @@ The v1 state is tagged `v1.0-poc`.
 | `app/runtime.py` | Observer + control loop: scheduler, reactive detector, almanac push, leak latch |
 | `app/store.py` | CSV + SQLite storage, event log, almanac persistence |
 | `app/main.py` | FastAPI app, lifespan wiring |
-| `app/config.py` | Config loading (validation/cross-reference checks still partial — see Roadmap Phase 9) |
+| `app/config.py` | Config loading: v1 → v2 migration, v2 defaults, schema validation (cross-reference checks still to come — Roadmap Phase 9) |
 | `app/static/` | Vanilla-JS UI (no build step) — Now / Analysis / Almanac / Config / Log tabs |
 
 ### Key docs
@@ -75,6 +79,14 @@ The v1 state is tagged `v1.0-poc`.
   `schema/storage.schema.sql` are load-bearing — changes there ripple through
   the generator, analyser, and deploy. Check `docs/ALMANAC_FORMAT.md` too if
   touching almanac shape.
+- **Storage changes go through a numbered migration.** `storage.schema.sql`
+  is the current shape; `app/store.py` `MIGRATIONS` brings older databases to
+  it (backup first, one checked transaction each, rollback on failure).
+  Changing a CREATE there needs a new migration, and `tools/store_check.py`
+  must still find fresh and migrated databases identical.
+- **Config changes keep v1 loadable.** `app/config.py` migrates version 1 to
+  2 and fills defaults only for keys v2 added; `tools/config_check.py` pins
+  the v1 example migrating to exactly the v2 example.
 - **Helper/automation ids derive from stable room/unit ids, not display
   names.** The friendly name must slugify to the object id referenced by
   generated automations; deploy verifies this and refuses to deploy a broken
@@ -95,7 +107,8 @@ The v1 state is tagged `v1.0-poc`.
 ```bash
 python tools/doctor.py                     # check a real Home Assistant (6-step diagnostic; needs live HA)
 python tools/sweep.py                       # a year of section-boundary computation
-python tools/store_check.py                 # store writes + reads, into the analyser
+python tools/store_check.py                 # store writes + reads, into the analyser; migrations
+python tools/config_check.py                # config v1 -> v2 migration, defaults, validation
 python tools/analyser_demo.py               # the trust-model worked example
 python tools/render_generated.py            # render helpers + automations
 python tools/maintenance_logic_check.py     # quorum Jinja vs the app.trust core
@@ -128,10 +141,12 @@ up — deploy and the UI see it immediately.
 ## Known gaps (don't be surprised by these; check `docs/ROADMAP.md` first)
 
 - Config editing in the UI is raw JSON; a structured picker is still to come.
-- CSV re-ingest (rebuilding SQLite from the CSV archive) is not implemented.
+- CSV re-ingest (rebuilding SQLite from the CSV archive) is not implemented;
+  it is a prerequisite for v2's Gate A.
 - Foreign-automation conflict detection is manual — deploy prunes only its own
   `ac_*` artifacts and reminds the user to check for conflicts by hand.
-- The full config loader (validation + cross-reference checks, Phase 9) is
-  partial; the runtime currently reads a lightweight view of the config.
+- The config loader migrates, defaults and schema-validates, but the
+  cross-reference checks (Phase 9) are still missing; the runtime reads the
+  migrated config as a plain dict.
 - User-customisable AC state profiles and HA add-on packaging are future work
   (Phases 16–17).

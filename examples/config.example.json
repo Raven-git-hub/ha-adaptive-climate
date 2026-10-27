@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "homeassistant": {
     "base_url": "http://192.168.1.251:8123",
     "verify_ssl": true
@@ -8,18 +8,31 @@
     "temperature_unit": "C",
     "heartbeat_interval_minutes": 10,
     "reactive_min_delta": 0.5,
-    "max_step_degrees": 2.0,
-    "correction_max_minutes": 60,
     "trust": {
       "high_trust_deviation": 0.5,
       "low_trust_deviation": 5.0
+    },
+    "control": {
+      "boost_degrees": 2.0,
+      "boost_max_minutes": 60,
+      "cool_min_heartbeats": 1,
+      "rest_min_heartbeats": 2,
+      "person_grace_minutes": 30,
+      "offset_cap": 3
     }
   },
   "learning": {
-    "analysis_window_days": 21,
-    "bootstrap_min_days": 7,
-    "validity_delay_days": 2,
-    "reactive_weight": 5
+    "reactive_weight": 5,
+    "reaction_rate": 0.5,
+    "recency_half_life_days": 7
+  },
+  "outdoor": {
+    "source": "none",
+    "weather_entity": null,
+    "probe_entity": null,
+    "block_mode": "shadow",
+    "lean_per_degree": 0.1,
+    "initial_margin": 6
   },
   "rooms": [
     {
@@ -39,7 +52,9 @@
         { "id": "living2", "name": "Living Room Temperature 1", "entity_id": "sensor.living_room_temperature_1_temperature" },
         { "id": "living3", "name": "Living Room Temperature 2", "entity_id": "sensor.living_room_temperature_2_temperature" }
       ],
-      "presence_sensors": []
+      "presence_sensors": [],
+      "heat_sources": [],
+      "knobs": []
     },
     {
       "id": "main_bedroom",
@@ -57,7 +72,9 @@
         { "id": "bed_main", "name": "Main Bedroom Temperature", "entity_id": "sensor.main_bedroom_temperature_temperature" },
         { "id": "bed_2",    "name": "Bedroom Temperature",      "entity_id": "sensor.bedroom_temperature_2" }
       ],
-      "presence_sensors": []
+      "presence_sensors": [],
+      "heat_sources": [],
+      "knobs": []
     },
     {
       "id": "baby_room",
@@ -74,7 +91,9 @@
       "sensors": [
         { "id": "baby", "name": "Baby Room Temperature", "entity_id": "sensor.baby_room_temperature_temperature" }
       ],
-      "presence_sensors": []
+      "presence_sensors": [],
+      "heat_sources": [],
+      "knobs": []
     }
   ],
   "schedule_profiles": [

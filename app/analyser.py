@@ -58,6 +58,7 @@ class SectionAlmanac:
     sample_days: int = 0
     confidence: float | None = None
     unit_setpoints: dict[str, float | None] = field(default_factory=dict)
+    unit_setpoints_applied: dict[str, float | None] = field(default_factory=dict)  # phase 1 fills
     unit_off: dict[str, bool] = field(default_factory=dict)
     sensor_comfort: dict[str, float | None] = field(default_factory=dict)
     sensor_band: dict[str, float] = field(default_factory=dict)

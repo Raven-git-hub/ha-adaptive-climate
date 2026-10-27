@@ -444,7 +444,7 @@ def build_watchdog_automation(config: dict, room: dict) -> dict:
 #     reset to now() every heartbeat the quorum is NOT met (idle clock);
 #     left untouched while it IS met, so elapsed-since-idle approximates
 #     how long correction has been continuously warranted. Once elapsed
-#     passes correction_max_minutes, correction pauses until a heartbeat
+#     passes control.boost_max_minutes, correction pauses until a heartbeat
 #     drops back below quorum and resets the clock.
 # ---------------------------------------------------------------------
 
@@ -582,8 +582,11 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
     alm = almanac_id(r)
     trust_cfg = config.get("system", {}).get("trust", {})
     low_dev = trust_cfg.get("low_trust_deviation", 5.0)
-    interval = config.get("system", {}).get("heartbeat_interval_minutes", 10)
-    max_minutes = config.get("system", {}).get("correction_max_minutes", 60)
+    system = config.get("system", {})
+    interval = system.get("heartbeat_interval_minutes", 10)
+    # config v2 moved v1's correction_max_minutes to control.boost_max_minutes
+    max_minutes = system.get("control", {}).get(
+        "boost_max_minutes", system.get("correction_max_minutes", 60))
     started = correction_started_id(r)
 
     variables = {

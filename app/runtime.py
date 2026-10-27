@@ -242,7 +242,11 @@ class Runtime:
             return
 
         rs = self.rooms[room_id]
-        rs.reactive_units[unit_id] = ReactiveUnitSample(before, after, True)
+        # One record per window: keep the setpoint the unit had before the
+        # window's FIRST change, and the latest value it was changed to.
+        first = rs.reactive_units.get(unit_id)
+        rs.reactive_units[unit_id] = ReactiveUnitSample(
+            first.setpoint_before if first else before, after, True)
         window = self._sys.get("reactive_window_seconds", 120)
         rs.reactive_deadline = datetime.now(self.tz) + timedelta(seconds=window)
         if rs.reactive_task is None or rs.reactive_task.done():

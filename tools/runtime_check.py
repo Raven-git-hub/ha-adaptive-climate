@@ -10,6 +10,7 @@ Store (no Home Assistant, no network). Verifies:
   * reactive detection records a genuine user setpoint change, raising hold
   * an automation-caused change (context.parent_id set) is ignored
   * a change during the guard window is ignored
+  * several changes in one reactive window record the first setpoint_before
 
     PYTHONPATH=. python tools/runtime_check.py
 """
@@ -126,7 +127,7 @@ async def main() -> int:
     alm = store.current_almanac("main_room", as_of=date.today())
     assert alm["sections"], "no provisional almanac seeded"
     seeded_section = next(iter(alm["sections"]))
-    assert alm["sections"][seeded_section]["state"] == "provisional"
+    assert alm["sections"][seeded_section]["status"] == "provisional"
     pushes = [s for s in rest.set_states if s[0] == "sensor.ac_almanac_main_room"]
     assert pushes, "almanac not pushed to HA"
     print(f"startup: provisional almanac seeded ({seeded_section}) and pushed to HA - OK")
@@ -167,6 +168,21 @@ async def main() -> int:
     rt._on_state_change(_state_changed("climate.home_s_device_2_home_s_device_2", 22.0, 25.0))
     assert not rt.rooms["main_bedroom"].reactive_units, "guarded change wrongly buffered"
     print("reactive: automation-caused and guard-window changes correctly ignored - OK")
+
+    # --- reactive: three changes in one window are one record that keeps
+    #     the FIRST setpoint_before and the LAST setpoint_after ---
+    for before, after in ((22.0, 23.0), (23.0, 24.0), (24.0, 25.0)):
+        rt._on_state_change(_state_changed("climate.lounge_lounge", before, after))
+    buffered = rt.rooms["main_room"].reactive_units["main_room_ac"]
+    assert (buffered.setpoint_before, buffered.setpoint_after) == (22.0, 25.0), buffered
+    await asyncio.sleep(1.5)  # let the flush window elapse
+    rows = c.execute(
+        "SELECT ru.setpoint_before, ru.setpoint_after FROM reactive r "
+        "JOIN reactive_unit ru ON ru.reactive_id = r.id "
+        "WHERE r.room_id='main_room' ORDER BY r.id").fetchall()
+    assert len(rows) == 2, [tuple(r) for r in rows]   # the earlier reaction + this window
+    assert tuple(rows[-1]) == (22.0, 25.0), tuple(rows[-1])
+    print("reactive: 22->23->24->25 in one window recorded once as before 22, after 25 - OK")
 
     await rt.stop()
 
