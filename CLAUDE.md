@@ -16,6 +16,16 @@ Read `docs/DESIGN.md` for inherited architectural principles and the specific
 departures Climate makes from Light. Read `docs/ROADMAP.md` for what's done,
 what's in progress, and what's intentionally deferred.
 
+## v2 (branch `v2`)
+
+On branch `v2`, **`docs/V2_DESIGN.md` is the source of truth.** Read it first.
+Wherever it conflicts with `docs/DESIGN.md`, `docs/TRUST_MODEL.md`,
+`docs/ALMANAC_FORMAT.md` or `README.md`, V2_DESIGN.md wins. Those documents
+still describe v1 and are rewritten as each v2 phase lands, so treat any
+v1-only detail in them (heartbeat-fed learning, the Warming/fan_only path,
+bootstrap and validity delay, the room-level correction timer) as outgoing.
+The v1 state is tagged `v1.0-poc`.
+
 ## Architecture at a glance
 
 - **CSV is the archive; SQLite is the query layer.** Every observation is
@@ -51,7 +61,8 @@ what's in progress, and what's intentionally deferred.
 
 ### Key docs
 
-- `docs/DESIGN.md` — inherited principles + climate-specific departures (read first)
+- `docs/V2_DESIGN.md` — v2 design and build plan; on branch `v2` it overrides the docs below where they conflict
+- `docs/DESIGN.md` — inherited principles + climate-specific departures (read after V2_DESIGN.md)
 - `docs/TRUST_MODEL.md` — the sensor trust model and quorum, with a worked example
 - `docs/ALMANAC_FORMAT.md` — the almanac JSON contract shared across modules
 - `docs/DEPLOY.md` — reconciliation strategy, ownership model, safety notes
