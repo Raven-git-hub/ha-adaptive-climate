@@ -53,7 +53,7 @@ def main() -> int:
     print("schema: virtual sensor (source only) validates - OK")
 
     # 2. Generator: vote template reads from state_attr for virtual, states for physical
-    vote = g._vote_expr(lounge, low_dev=5.0)
+    vote = g._votes_expr(lounge)
     # physical living1/2/3 must appear as states('sensor.*')
     assert "states('sensor.living_room_temp')" in vote
     # virtual must appear as state_attr(...'current_temperature')

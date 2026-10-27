@@ -21,9 +21,11 @@ pointer to the principle; where climate departs, the departure is the point.
    clock change and paused VM all take the same path. No catch-up routine.
 
 4. **Two booleans, two meanings.** `ac_active_<room>` = an AC automation is
-   mid-change, ignore what you see (lives seconds). `ac_hold_<room>` = a human
-   intervened, maintenance stands down until the next crossover (lives hours).
-   Conflating them would let a reactive event silently stop observation.
+   mid-change, ignore what you see (lives seconds); scenes, maintenance and the
+   leak automations raise it around every command. `ac_hold_<room>` = a manual
+   pause a person flips (v2: the system never raises or clears it); while it is
+   on, scenes and maintenance send no commands. Conflating them would let a
+   reactive event silently stop observation.
 
 5. **Heartbeats defer, they do not skip.** A heartbeat that lands during a guard
    window waits for the guard to clear rather than sampling a mid-transition
@@ -56,12 +58,14 @@ pointer to the principle; where climate departs, the departure is the point.
     surfaced. `section_run` records planned vs. actual so a collapsed or missed
     section is a row with a reason, not silence.
 
-12. **Reactive detection ignores automation-caused changes.** A setpoint change
-    counts as a human intervention only when it was not caused by an automation —
-    established by the guard boolean being on, or by the change carrying a
-    `context.parent_id`. Otherwise our own maintenance loop, or a coexisting
-    system during cutover, would be learned from at 5× weight and corrupt the
-    almanac.
+12. **Reactive detection ignores automation-caused changes.** A change counts as
+    a human intervention only when it was not caused by an automation —
+    established by the guard boolean being on, by the change carrying a
+    `context.parent_id`, or (v2) by the unit now showing the command its state
+    helper implies, which is our own command arriving after the guard came down
+    (`app.control.matches_command`; HA's manual-change automation applies the
+    same test). Otherwise our own maintenance loop, or a coexisting system
+    during cutover, would be learned from and corrupt the almanac.
 
 13. **Helpers are named from the room's stable id, not its display name.** The
     friendly name must slugify to the object id the generated automations
@@ -87,26 +91,47 @@ and "believe this sensor more".
 
 ### D3. The AC unit is a state machine, not a dimmer
 
-Light nudged one number. A climate unit is put into one of four states —
-Normal / Cooling / Warming / Leak — each a distinct (fan speed, mode, setpoint
-offset) triple, chosen by where the measured temperature sits relative to the
-comfort band. The state table is in the README and fixed for now;
-user-customisable profiles are on the roadmap. This makes the generated scene
-and maintenance automations richer than Light's brightness nudge, and makes the
-per-unit stored sample a small record (is_on, hvac_mode, fan_mode, setpoint,
-current_temp) rather than a single 0–255 int.
+Light nudged one number. Each climate unit has a state, kept in Home Assistant
+helpers so it survives container downtime (v2, phase 3; `docs/V2_DESIGN.md`,
+Control): `cool` (cool, fan low, base + offset), `boost` (cool, fan medium,
+base + offset − the boost step), `rest` (off, waiting), `user_off` and `manual`
+(a person turned it off or chose another mode or fan; hands off until the
+section changes), `config_off` (the section's scene forces it off) and `leak`
+(dry, latched). The system only ever cools a unit or turns it off, apart from
+leak protection: v1's Warming state (fan_only) is gone.
+
+The **base** is the section's setpoint (`setpoint_applied` at the section
+change, or what a person chose since); the **offset** builds up in whole steps
+within a section (−1 after a boost, +1 after a rest, capped at ±3) and resets at
+the next section change. Commands are clamped to the unit's own range and sent
+only on transitions. The per-unit helpers are `ac_state`, `ac_base`,
+`ac_offset`, `ac_since`, `ac_grace_until` and `ac_unblocked`, all named
+`<room>_<unit>` from stable ids. The README has the state table; the per-unit
+stored sample stays a small record (is_on, hvac_mode, fan_mode, setpoint,
+current_temp, plus the state and offset helpers).
 
 ### D4. The maintenance loop is quorum-based
 
 Light nudged whenever measured lux left a simple margin around the target.
-Climate tallies per-sensor votes and acts only when the quorum is met, stopping
-when the tally falls below quorum or after one hour. See `docs/TRUST_MODEL.md`
-for the voting rules. **Decided:** the quorum loop runs in **Home Assistant
-templates**, on HA's own clock, preserving principle 2 (HA owns behaviour) and
-surviving container downtime. The container's job is to publish an almanac
-carrying everything the template needs — per-unit setpoint, per-sensor comfort
-and band — in the shape fixed by `docs/ALMANAC_FORMAT.md`. The generated
-maintenance template is Phase 5.
+Climate tallies per-sensor votes: a sensor votes when it is past either of its
+trigger edges (one band width from its comfort reading until phase 5 leans
+them), all votes count toward one pooled quorum, and the trust-weighted
+majority picks the direction, too warm or too cold. See `docs/TRUST_MODEL.md`
+for the voting rules. Too warm boosts a cooling unit; too cold rests it; a boost
+or rest ends when the sensors still on its side fall below the quorum (a boost
+also after `boost_max_minutes`), with minimum times in heartbeats to protect the
+compressor and a grace period after a person's change.
+
+**Decided:** the loop runs in **Home Assistant templates**, on HA's own clock,
+preserving principle 2 (HA owns behaviour) and surviving container downtime.
+The logic is `app/control.py`, pure Python, rendered as Jinja by the generator:
+the scene runs the section change, maintenance runs the votes and one step per
+unit, and a per-unit manual-change automation applies a person's change to the
+unit's helpers straight away. `tools/control_logic_check.py` replays
+`tools/control_check.py`'s scenario table through the generated automations
+against `app/control.py`. The container's job is to publish an almanac carrying
+everything the templates need — per-unit `setpoint_applied`, per-sensor comfort,
+band and trust — in the shape fixed by `docs/ALMANAC_FORMAT.md`.
 
 ### D5. Sun machinery removed entirely
 
@@ -131,14 +156,14 @@ trigger for the user to wire their own sensor into by hand.
 
 **The boolean is not a passive record - it drives the AC.** The leak automation
 raises `input_boolean.ac_leak_<room>_<unit>` and, in the same action list,
-immediately drives the unit into Leak mode (DRY, fan LOW if supported, the
-almanac setpoint if known - reusing the maintenance automation's live
-`unit_data` variable pattern rather than a literal section, since this fires
-from an event, not a crossover). The maintenance automation already skips
-correcting a unit while its leak boolean is on. Critically, **every scene
-(crossover) automation for a leak-enabled unit checks the leak boolean before
-anything else** - ahead of even an explicit forced-off scene - and re-asserts
-DRY if it's on, instead of driving the unit back to Normal. Without this, a
+immediately puts the unit's state helper in `leak` and drives it to DRY (fan
+LOW if supported, its base or the almanac setpoint if known), under the guard
+and regardless of the hold. Maintenance checks the latch before anything else
+too, so a latch raised by hand still wins, and holds a unit in `leak` without
+re-sending. Critically, **every scene (crossover) automation for a leak-enabled
+unit checks the leak boolean before anything else** - ahead of even an explicit
+forced-off scene - and re-asserts DRY if it's on, instead of driving the unit
+back to cooling. Without this, a
 scheduled boundary landing while a leak was still active would have silently
 reverted the unit to Cool, which was a real defect caught after the picker
 shipped (see `tools/leak_response_check.py`).
@@ -146,9 +171,10 @@ shipped (see `tools/leak_response_check.py`).
 Leak mode is a **latch**: release requires the user's confirmation
 (`input_boolean.ac_leak_confirmed_<room>_<unit>`) and, when the sensor is
 known, that it has actually stopped reporting a leak - confirming alone is not
-enough while the sensor still reads wet. On release, the unit is driven back
-to Normal immediately (same live-variable pattern), rather than left in DRY
-until whatever scheduled crossover happens to be next.
+enough while the sensor still reads wet. On release, the unit is treated as at
+a section change immediately (cool at the section's setpoint, or rest or
+config_off as the section says), rather than left in DRY until whatever
+scheduled crossover happens to be next.
 
 ### D7. Temperature unit is configurable
 

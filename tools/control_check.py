@@ -4,8 +4,11 @@ Adaptive Climate - control core check (phase 3a).
 A data-driven scenario table for app.control, the cool-or-rest state
 machine, in plain JSON-compatible values: times are seconds from T0,
 readings are named sets (or dicts) against an almanac-shaped section,
-expectations are partial unit records and exact commands. Phase 3b imports
-SCENARIOS and replays the same table against the rendered Jinja.
+expectations are partial unit records and exact commands. Steps are votes,
+a heartbeat (step), a section change, a person's change of a given kind,
+or one climate state change (before and after, as HA's manual-change
+automation sees it). tools/control_logic_check.py imports SCENARIOS and
+replays the same table through the generated automations.
 
 After the table passes, each rule is removed in turn (MUTANTS) and the
 scenarios that guard it must fail - proof the table actually pins every
@@ -80,6 +83,17 @@ def person(kind: str, expect_unit: dict, setpoint=None, power_after: bool = True
            at: int = 0) -> dict:
     return {"do": "person", "at": at, "kind": kind, "setpoint": setpoint,
             "power_after": power_after, "expect": {"unit": expect_unit}}
+
+
+def change(before: tuple, after: tuple, expect_unit: dict, at: int = 0) -> dict:
+    """One climate state change, (mode, setpoint, fan) before and after, as
+    the manual-change automation sees it."""
+    return {"do": "change", "at": at, "before": climate(*before), "after": climate(*after),
+            "expect": {"unit": expect_unit}}
+
+
+def climate(mode: str, temperature: float | None = None, fan: str | None = None) -> dict:
+    return {"mode": mode, "temperature": temperature, "fan": fan}
 
 
 SCENARIOS = [
@@ -294,6 +308,38 @@ SCENARIOS = [
                setpoint=26.0, at=m(1)),
         step("cold", {"state": "manual"}, None, at=m(2))],
       unit={"state": "manual", "offset": 2, "since": -m(15)}),
+    # --- a climate change: our own command showing up late, or a person ---
+    s("a delayed echo of our own off command is ignored", [
+        change(("cool", 22.0, "low"), ("off", 22.0, "low"),
+               {"state": "rest", "since": -m(3), "grace_until": None})],
+      unit={"state": "rest", "since": -m(3)}),
+    s("a delayed echo of our own cool command is ignored", [
+        change(("off", 25.0, "low"), ("cool", 23.0, "low"),
+               {"state": "cool", "offset": 1, "since": -m(2), "grace_until": None,
+                "unblocked": False})],
+      unit={"state": "cool", "offset": 1, "since": -m(2)}),
+    s("a delayed echo of our own boost command is ignored", [
+        change(("cool", 23.0, "low"), ("cool", 21.0, "medium"),
+               {"state": "boost", "offset": 1, "since": -m(2)})],
+      unit={"state": "boost", "offset": 1, "since": -m(2)}),
+    s("a setpoint within reactive_min_delta of our command is ours", [
+        change(("cool", 21.0, "low"), ("cool", 22.4, "low"), {"state": "cool", "base": None})]),
+    s("a setpoint change on a resting unit is a person's: rest, and a wake at the new base", [
+        change(("off", 22.0, "low"), ("off", 24.0, "low"),
+               {"state": "rest", "base": 24.0, "offset": 0, "since": -m(20),
+                "grace_until": None}),
+        step("settled_warm", {"state": "cool", "offset": 1}, cmd("cool", "low", 25.0), at=m(1))],
+      unit={"state": "rest", "offset": -1, "since": -m(20)}),
+    s("a person turning a resting unit on is not an echo", [
+        change(("off", 22.0, "low"), ("cool", 23.0, "low"),
+               {"state": "cool", "base": 23.0, "unblocked": True, "grace_until": m(30)})],
+      unit={"state": "rest"}),
+    s("a mode change away from our command is manual", [
+        change(("cool", 22.0, "low"), ("fan_only", 22.0, "low"), {"state": "manual", "since": 0})]),
+    s("in manual, a change of nothing we track does nothing", [
+        change(("dry", 22.0, None), ("dry", 22.2, None), {"state": "manual", "since": -m(10)})],
+      unit={"state": "manual", "since": -m(10)}),
+
     s("a knob turn counts as a setpoint change; a knob press changes nothing", [
         person("knob_turn", {"state": "cool", "base": 23.0, "grace_until": m(30)}, setpoint=23.0),
         person("knob_press", {"state": "cool", "base": 23.0}, at=m(5))],
@@ -363,6 +409,9 @@ def run(scenario: dict) -> list[str]:
             elif st["do"] == "person":
                 unit = control.on_person_change(st["kind"], unit, st.get("setpoint"),
                                                 st.get("power_after", True), now, ctx)
+            elif st["do"] == "change":
+                unit = control.on_climate_change(unit, control.Climate(**st["before"]),
+                                                 control.Climate(**st["after"]), now, ctx)
             view = _view(unit)
             got = {k: view[k] for k in expect["unit"]}
             if got != expect["unit"]:
@@ -444,6 +493,18 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
         ("a setpoint change in manual keeps manual",
          {"_kept_manual": lambda state: False},
          ["setpoint change in manual stays manual, with no grace"]),
+        ("the is-this-ours check",
+         {"matches_command": lambda command, before, after, min_delta: False},
+         ["a delayed echo of our own off command is ignored",
+          "a delayed echo of our own cool command is ignored",
+          "a delayed echo of our own boost command is ignored",
+          "a setpoint within reactive_min_delta of our command is ours"]),
+        ("an off command's echo keeps the setpoint (just off instead)",
+         {"_off_matches": lambda before, after, min_delta: after.mode == "off"},
+         ["a setpoint change on a resting unit is a person's: rest, and a wake at the new base"]),
+        ("the reactive_min_delta tolerance (exact setpoint instead)",
+         {"_same_setpoint": lambda shown, commanded, min_delta: shown == commanded},
+         ["a setpoint within reactive_min_delta of our command is ours"]),
     ]
 
 

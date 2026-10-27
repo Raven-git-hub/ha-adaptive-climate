@@ -33,7 +33,7 @@ The v1 architecture stays; v2 changes what flows through it. These carry over, w
 - **Two booleans, two meanings:** `ac_active_<room>` (mid-change, ignore), raised by scenes and now also by maintenance around every command; and `ac_hold_<room>`, now only a manual pause switch a person can flip. The system never raises or clears the hold; while it is on, scenes and maintenance send no commands.
 - **Reactions ignore our own changes**, via `context.parent_id`, the guard boolean, and a check that the change isn't what the unit's state helper already implies (see [Where it runs](#where-it-runs)).
 - **The event log is a feature.** Every decision is recorded with its reason.
-- **Unchanged modules:** clock-only scheduler, HA client, doctor, and the offline test harnesses. Deploy reconcile and the leak latch keep their design but change in phase 3b: new helper domains and initial values, and leak automations that write the state helper.
+- **Unchanged modules:** clock-only scheduler, HA client, doctor, and the offline test harnesses. Deploy reconcile and the leak latch keep their design but change in phase 3b: new helper domains and starting values, and leak automations that write the state helper.
 
 Two v1 behaviours do not carry over:
 
@@ -46,7 +46,7 @@ Targets move only when a person acts. A section with no reaction adds confidence
 
 ### What counts as a reaction
 
-A change is a person's when it carries no `context.parent_id`, `ac_active` is off, and it isn't what the unit's state helper already implies (`rest`, `user_off` or `config_off` → off; `cool` or `boost` → cool; `leak` → dry). The container's reaction detector and HA's manual-change automation apply the same test; the state-helper part arrives with the helper in phase 3b.
+A change is a person's when it carries no `context.parent_id`, `ac_active` is off, and the unit isn't now showing the command its state helper implies, which would be our own command arriving after the guard came down. For `rest`, `user_off` and `config_off` that command is off: the change is ours if the unit is off and its setpoint didn't change, so a setpoint changed while off is still a person's. For `cool`, `boost` and `leak` it is ours if the unit shows the command's mode and its setpoint to within `reactive_min_delta` (any setpoint, if the command sets none). The fan is never compared, so a person's fan-only change while the unit sits exactly at our command isn't seen. In `manual` every change is a person's. The container's reaction detector and HA's manual-change automation apply the same test, `app.control.matches_command`.
 
 A unit dropping to `unavailable` or `unknown`, or coming back, is never a reaction: nobody can say who changed it. If it comes back in a different power, mode, setpoint or fan from the one it dropped out in, the runtime logs a `control` event saying what changed.
 
@@ -188,9 +188,9 @@ The **grace period** runs until `input_datetime.ac_grace_until_<room>_<unit>`, w
 - **Offsets and limits:** the offset moves in whole steps and is capped at ±3 on its own. The boost step, `system.control.boost_degrees` (default 2), goes on top, and the final command is clamped to the unit's own range (18 to 30° for the baby room, 16 to 30° for the others).
 - **Minimum times:** counted in heartbeats, to protect the compressor: at least 1 in `cool` or `boost` (a boost that a block sends to `rest` included), at least 2 in `rest`. A minimum of n heartbeats is met when the time since `since` is at least (n − 0.5) × the heartbeat interval, which is 5 and 15 minutes at the default 10-minute interval. A section change and a leak override them.
 - **No seed:** while a unit has neither a base nor a `setpoint_applied`, maintenance leaves it alone and a section change resets its fields without a command. A leak still drives it to dry, with no temperature, and a leak released before there is an almanac leaves it cooling at its current setpoint.
-- **Commands:** sent only on transitions and at section changes, never re-sent every heartbeat. Maintenance raises `ac_active` around every command, as scenes do.
+- **Commands:** sent only on transitions and at section changes, never re-sent every heartbeat. Maintenance and the leak automations raise `ac_active` around every command, as scenes do.
 - **Fan:** low in `cool`, medium in `boost`. A fan call the unit's current mode rejects is skipped, not fatal (as in v1).
-- **Pause:** while `ac_hold_<room>` is on, scenes and maintenance send no commands. Only a person turns it on or off.
+- **Pause:** while `ac_hold_<room>` is on, scenes and maintenance send no commands. Maintenance doesn't run at all; scenes and a leak release still write the helpers. A leak trip ignores the pause. Only a person turns it on or off.
 
 ## Outdoor temperature
 
@@ -266,9 +266,9 @@ The container decides once per section; Home Assistant acts at every heartbeat. 
 
 ### Home Assistant (generated)
 
-- **Scene automation, per room and section:** raises `ac_active`, records the section, and sets each unit's base, offset, `since`, `ac_unblocked` and state as at a section change, then sends the commands. A unit with no seed is left alone. While `ac_hold` is on, it sends no commands.
+- **Scene automation, per room and section:** raises `ac_active`, records the section, and sets each unit's base, offset, `since`, grace, `ac_unblocked` and state as at a section change, then sends the commands. A unit with no seed is left alone. While `ac_hold` is on, it sends no commands.
 - **Maintenance automation, every heartbeat:** reads the almanac, the conditions entity and each unit's helpers. It counts the pooled quorum against the published edges and runs the state machine. On a transition it raises `ac_active`, writes the helpers, sends the commands and lowers `ac_active`.
-- **Manual-change automation, per unit:** catches a person's change (no `context.parent_id`, `ac_active` off) and applies the [person reactions](#person-reactions) straight away, reading whether the unit is on after the change. It ignores a change that matches what the state helper already implies: `rest`, `user_off` or `config_off` → off; `cool` or `boost` → cool; `leak` → dry. That keeps a late echo of our own command from looking like a person.
+- **Manual-change automation, per unit:** catches a person's change (no `context.parent_id`, `ac_active` off) and applies the [person reactions](#person-reactions) straight away, reading whether the unit is on after the change. It ignores our own command arriving late, by the test in [What counts as a reaction](#what-counts-as-a-reaction), and classifies the change's kind as the runtime does.
 - **Leak automations, per unit:** set the state helper to `leak` when the sensor trips. On a confirmed release, they evaluate the unit as at a section change.
 - **Heat sources:** the generator writes the room's heat-source entities into the maintenance template, which checks them directly. A heater switching on blocks cooling without waiting for the container.
 
@@ -276,16 +276,18 @@ The container decides once per section; Home Assistant acts at every heartbeat. 
 
 | Helper | Scope | Purpose |
 | --- | --- | --- |
-| `input_select.ac_state_<room>_<unit>` | Unit, new | `cool`, `boost`, `rest`, `user_off`, `manual`, `config_off`, `leak` |
-| `input_number.ac_base_<room>_<unit>` | Unit, new | The section's base setpoint: `setpoint_applied` at the section change, or what a person chose. Created at 0, which means unset |
-| `input_number.ac_offset_<room>_<unit>` | Unit, new | Section-scoped offset, −3 to +3 in whole steps. Created at 0 |
-| `input_datetime.ac_since_<room>_<unit>` | Unit, new | When the current state began (boost cap, minimum times). Set to now on creation |
-| `input_datetime.ac_grace_until_<room>_<unit>` | Unit, new | When a person's grace period ends: their setpoint change or turn-on + `person_grace_minutes`. Cleared at a section change; a past or unset value means no grace |
+| `input_select.ac_state_<room>_<unit>` | Unit, new | `cool`, `boost`, `rest`, `user_off`, `manual`, `config_off`, `leak`. Deploy sets a new one to `manual`: hands off until the room's next section change |
+| `input_number.ac_base_<room>_<unit>` | Unit, new | The section's base setpoint: `setpoint_applied` at the section change, or what a person chose. 0 to 100 in steps of 0.5; created at 0, its minimum, which means unset |
+| `input_number.ac_offset_<room>_<unit>` | Unit, new | Section-scoped offset, −`offset_cap` to +`offset_cap` in whole steps. Deploy sets a new one to 0 |
+| `input_datetime.ac_since_<room>_<unit>` | Unit, new | When the current state began (boost cap, minimum times). Deploy sets a new one to now |
+| `input_datetime.ac_grace_until_<room>_<unit>` | Unit, new | When a person's grace period ends: their setpoint change or turn-on + `person_grace_minutes`. Cleared at a section change (set to now); a past or unset value means no grace. Created at HA's default, today 00:00 |
 | `input_boolean.ac_unblocked_<room>_<unit>` | Unit, new | A person turned the unit on during a block; the block is ignored for it until the section changes |
 | `sensor.ac_conditions_<room>` | Room, new | Outdoor values, comfort point, block decision, per-sensor edges |
 | `ac_active`, `ac_scene`, `ac_almanac` | Room, kept | As in v1 |
 | `ac_hold_<room>` | Room, changed | A manual pause switch only; the system never sets or clears it |
-| `ac_correction_started_<room>` | Room, removed | Replaced by the per-unit `since` helper |
+| `ac_correction_started_<room>` | Room, removed | Replaced by the per-unit `since` helper; the first v2 deploy prunes it |
+
+No helper has an `initial`: Home Assistant would reset it to that at every restart. Deploy sets the starting values of the helpers it has just created, and only those.
 
 ### Almanac contract additions
 
@@ -295,7 +297,7 @@ The container decides once per section; Home Assistant acts at every heartbeat. 
 
 ### One logic, checked twice
 
-The state machine, including person reactions, leak precedence and minimum times, lives in a pure-Python module, `app/control.py` (phase 3a). The generator renders the same logic as Jinja (phase 3b). `tools/control_check.py` holds the scenario table, as plain values in vote, step, section-change and person-change steps; 3b replays the same table against the rendered templates, extending today's `tools/maintenance_logic_check.py` pattern. The check also removes each rule in turn and requires the scenarios that guard it to fail.
+The state machine, including person reactions, leak precedence and minimum times, lives in a pure-Python module, `app/control.py` (phase 3a). The generator renders the same logic as Jinja (phase 3b). `tools/control_check.py` holds the scenario table, as plain values in vote, step, section-change and person-change steps; The check also removes each rule in turn and requires the scenarios that guard it to fail. `tools/control_logic_check.py` (phase 3b, replacing v1's `maintenance_logic_check`) runs the generated automations as Home Assistant would, replays every scenario through the maintenance, scene, manual-change and leak automations, and compares the helpers and commands with `app/control.py`.
 
 ## UI
 
@@ -410,7 +412,7 @@ Phases 0 to 5 are built and checked offline against the existing harnesses, then
 | 1 · Learning flip | Analyser becomes a replay of reactions from per-unit and per-sensor seeds; rounding toward the latest setpoint-moving reaction; comfort from accepted readings; confidence; the runtime's provisional seeding retired | `analyser_demo` applies a 1° correction the next day; `compare_analyser` diffs v1 and v2 almanacs |
 | 2 · On/off as reactions | Runtime detects a person turning units on or off, or changing mode or fan; reaction kind stored per unit and room; a unit coming back from unavailable changed is logged | `runtime_check` records person on/off and still ignores the system's own changes; on plus a setpoint change in one window is one `on` reaction |
 | 3a · Control core | `app/control.py`: votes, the state machine, section changes and person reactions as pure functions; `app.trust.evaluate_edges` | `control_check` runs the scenario table, and each rule's scenarios fail when it is removed |
-| 3b · Cool-or-rest in HA, deploy and leak | Generator Jinja for maintenance, scenes and the manual-change automation, with the new unit helpers; maintenance raises the guard; the Warming/fan_only path is removed. `input_number` (and `input_boolean`) helper domains, created at 0; every `ac_since_*` set to now on creation; leak automations write the state helper; the runtime's reaction detector also ignores a change that matches what the unit's state helper implies (`rest` → off, and so on), as the manual-change automation does | The rendered Jinja matches `app/control.py` on every `control_check` scenario; `deploy_reconcile_check` creates the new helpers with the right initial values; `leak_response_check` still passes |
+| 3b · Cool-or-rest in HA, deploy and leak | Generator Jinja for maintenance, scenes and the manual-change automation, with the new unit helpers; maintenance raises the guard; the Warming/fan_only path is removed. `input_number` (and `input_boolean`) helper domains, created at 0; every `ac_since_*` set to now on creation; leak automations write the state helper; the runtime's reaction detector also ignores a change that matches what the unit's state helper implies (`rest` → off, and so on), as the manual-change automation does | `control_logic_check` replays every `control_check` scenario through the generated automations with zero differences; `deploy_reconcile_check` creates the new helpers with the right initial values; `leak_response_check` still passes |
 | 4 · Outdoor input | Forecast or probe; outdoor value stored on heartbeats, reactions and section runs | The doctor lists weather entities with an hourly forecast; `store_check` sees the new columns |
 | 5 · Lean and block, in shadow | Conditions entity with per-sensor edges; block decisions and margin learning logged, not applied | Published edges reproduce the lean table; shadow decisions appear in the log |
 | **Gate A** | CSV re-ingest works; then cutover: deploy v2 to HA, block in shadow | SQLite rebuilt from CSV alone gives the same almanac |
@@ -517,3 +519,17 @@ From phase 3a, 27 Oct 2026:
 From phase 3b planning, 27 Oct 2026:
 
 52. **A setpoint change in `manual` keeps `manual`**, as decision 50 does for a unit that is off: base = the new setpoint, offset 0, no grace, `since` kept. A person who chose dry or fan_only and then changed the temperature keeps the mode they chose until the section changes; before this, the unit went to `cool` and the next transition would have overridden their mode. A knob turn is treated the same.
+
+From phase 3b, 27 Oct 2026:
+
+53. **"Is this ours" (the expected-state check):** a change is our own command arriving late when the unit shows what its state helper implies. For `rest`, `user_off` and `config_off`, the unit is off and its setpoint didn't change (an off command sets no setpoint, so decision 50 still works end to end). For `cool`, `boost` and `leak`, the unit shows the command's mode and its setpoint to within `reactive_min_delta`, any setpoint if the command sets none. The fan is never compared, so a person's fan-only change while the unit sits exactly at our command isn't seen. In `manual` every change is a person's. One rule, `app.control.matches_command`, for HA's manual-change automation and the runtime.
+54. **No `initial` on any helper.** Home Assistant resets a helper to its `initial` at every restart, which would wipe a person's base, a `user_off` or an unblock. A new helper starts at HA's default (base at its minimum, 0; grace today 00:00, in the past; unblocked off), and deploy sets the rest for the helpers it has just created only: `since` to now (an epoch timestamp), offset to 0 and state to `manual`. Existing helpers are never reset, so a running boost keeps its clock. A helper whose settings change (the offset range after an `offset_cap` change) is updated in place.
+55. **A new unit starts in `manual`**, hands off until its room's next section change, so deploying sends no command. Control begins at each room's next section change, so deploy shortly before one (docs/DEPLOY.md).
+56. **Times are whole seconds:** HA's `input_datetime` keeps whole seconds, so templates floor now to the second and the scenario table uses whole seconds.
+57. **One classifier for a single change,** `app.control.classify_change`, used by the manual-change automation and by the runtime's relevance test (unchanged semantics), and checked against the runtime's `UnitWindow.kind`. The manual-change automation mirrors `app.control.on_climate_change`.
+58. **The hold:** scenes no longer clear it. While it is on, maintenance doesn't run, and scenes and leak releases write the helpers but send nothing; a leak trip ignores it. Deploy reports any hold that is on, since v1 raised it on every reaction and nothing clears it now.
+59. **The guard:** maintenance computes every unit from one snapshot and raises `ac_active` once around all of a heartbeat's transitions; the leak trip and release raise it around their commands too.
+60. **Leak automations mirror `step`'s leak rules:** a trip moves a unit not already in `leak` into it and sends dry; a release treats a unit in `leak` as at a section change. Maintenance does the same when the latch is raised or cleared by hand, so it carries each unit's forced-off sections as a literal list.
+61. **Retired:** the Warming/fan_only path, the correction clock, the almanac's never-set unit `off` flag, and `fan_only` among the doctor's required modes. `tools/maintenance_logic_check.py` is replaced by `tools/control_logic_check.py`; its scene and correction setpoint-template cases and its skip-condition cases are retired, and the scenario table covers what they protected. The vote fuzz is kept, against `control.evaluate_votes`.
+62. **Phase 5 hooks:** the `blocked`, `cold_edge` and `warm_edge` template variables, false and ±1 until phase 5, each set in one place.
+63. **Runtime:** no hold on reactions, so `suspended_maint` is recorded as 0; each heartbeat records `control_state` and `control_offset` from the helpers (NULL while a room has none).

@@ -98,26 +98,42 @@ learns nothing from it.
 
 Each sensor votes into a **quorum** when its reading leaves its comfort band.
 Corrective action starts once the quorum is met at a heartbeat (1 sensor → 1
-vote; 2 → 2; 3+ → 50% or more), and stops at the first heartbeat below quorum or
-after one hour, whichever comes first.
+vote; 2 → 2; 3+ → 50% or more): too warm boosts the unit, too cold rests it.
+It ends when the sensors still on that side fall below the quorum, or after
+an hour of boost.
 
 ## AC unit control
 
 Air-conditioner units are driven through Home Assistant's standard `climate`
-(thermostat) entity. Each unit is a small state machine; the active state
-depends on where the measured temperature sits relative to the comfort band:
+(thermostat) entity. Each unit is a small state machine kept in Home Assistant
+helpers, so it carries on while the container is down. The system only ever
+cools a unit or turns it off, apart from leak protection:
 
-| State | Trigger | Fan speed | Setpoint | AC mode |
+| State | When | AC mode | Fan | Setpoint |
 |---|---|---|---|---|
-| **Normal** | within the comfort band | LOW | almanac | COOL |
-| **Cooling** | below the comfort band | MEDIUM | almanac − 2°C | COOL |
-| **Warming** | above the comfort band | LOW | almanac | FAN ONLY |
-| **Leak** | leak detected | LOW | almanac | DRY |
+| **cool** | the default while a section is running | COOL | LOW | base + offset |
+| **boost** | the quorum says too warm | COOL | MEDIUM | base + offset − 2°C |
+| **rest** | the quorum says too cold, or cooling is blocked | OFF | — | — |
+| **user_off** | a person turned the unit off | OFF | — | — |
+| **manual** | a person chose another mode or fan | theirs | theirs | theirs |
+| **config_off** | the section's scene forces the unit off | OFF | — | — |
+| **leak** | leak detected (latched) | DRY | LOW | base |
 
-Fan speed, setpoint step and min/max range are read from each unit at runtime,
-so one generated automation adapts per unit — including units that hide their
-fan modes in some HVAC modes (see `docs/HARDWARE.md`). State profiles are fixed
-for now; making them user-customisable is on the roadmap.
+The **base** is the section's learned setpoint, set at each section change, or
+what a person chose since. The **offset** moves in whole steps within a section:
+−1 when a boost ends, +1 when a rest wakes, capped at ±3, and reset at the next
+section change. Commands are sent only on transitions, clamped to the unit's own
+range, and never re-sent every heartbeat. A unit stays in a state for at least
+one heartbeat (two when resting), and a person's setpoint change or turn-on
+holds it in **cool** for 30 minutes. **user_off** and **manual** last until the
+section changes; a person's setpoint change while the unit is off or in manual
+keeps the state and takes effect the next time the unit cools.
+
+Fan speed availability and min/max range are read from each unit at runtime, so
+one generated automation adapts per unit — including units that hide their fan
+modes in some HVAC modes (see `docs/HARDWARE.md`). State profiles are fixed for
+now; making them user-customisable is on the roadmap. `docs/V2_DESIGN.md`
+(Control) has the full rules.
 
 ## Leak detection
 
@@ -129,15 +145,16 @@ sensor; leave it blank and the container still creates the boolean helper
 by hand in Home Assistant instead.
 
 The full cycle: when the sensor (or your own wiring) trips, the leak
-automation raises `input_boolean.ac_leak_<room>_<unit>` **and immediately
-drives the unit into Leak mode** (DRY, fan LOW, the almanac setpoint if one
-is known). While the boolean is on, the maintenance loop leaves that unit
-alone, and **any scheduled crossover that lands mid-leak re-asserts DRY
-instead of reverting to Normal** - leak safety overrides the schedule, not
-the other way round. Release is latched: it fires when the user confirms via
+automation raises `input_boolean.ac_leak_<room>_<unit>` **and immediately puts
+the unit in its leak state** (DRY, fan LOW, its setpoint if one is known),
+whatever else is going on - a person having turned it off or paused the room
+included. While the boolean is on, the unit stays in leak, and **any scheduled
+crossover that lands mid-leak re-asserts DRY instead of reverting to cooling** -
+leak safety overrides the schedule, not the other way round. Release is
+latched: it fires when the user confirms via
 `input_boolean.ac_leak_confirmed_<room>_<unit>`, blocked while the sensor
-still reads wet if the sensor is known, and on release the unit is driven
-back to Normal immediately rather than sitting in DRY until the next
+still reads wet if the sensor is known, and on release the unit is treated as
+at a section change immediately rather than sitting in DRY until the next
 scheduled boundary.
 
 ## Architecture
@@ -163,11 +180,15 @@ foreign automation:
 
 - `input_select.ac_scene_<room>` — the active section
 - `input_boolean.ac_active_<room>` — an AC automation is mid-change; ignore
-- `input_boolean.ac_hold_<room>` — the user intervened; maintenance stands down
-- `input_datetime.ac_correction_started_<room>` — the one-hour correction clock
+- `input_boolean.ac_hold_<room>` — a manual pause: while it is on, no commands
+  are sent (only a person turns it on or off)
+- per unit, its control state: `input_select.ac_state_<room>_<unit>`,
+  `input_number.ac_base_…` and `ac_offset_…`, `input_datetime.ac_since_…` and
+  `ac_grace_until_…`, `input_boolean.ac_unblocked_…`
 - `input_boolean.ac_leak_<room>_<unit>` / `_confirmed_...` — leak latch (per leak unit)
 - `sensor.ac_almanac_<room>` — the learned model, pushed over REST
 - automations: `ac_scene_<room>_<section>` ×6, `ac_maintenance_<room>`,
+  `ac_manual_<room>_<unit>` per unit (a person's change, applied straight away),
   `ac_watchdog_<room>`, and leak automations for leak-enabled units
 
 ## The web UI
@@ -267,8 +288,10 @@ python tools/sweep.py                       # a year of section boundaries
 python tools/store_check.py                 # store writes + reads, into the analyser
 python tools/analyser_demo.py               # the trust-model worked example
 python tools/render_generated.py            # render helpers + automations
-python tools/maintenance_logic_check.py     # quorum Jinja vs the app.trust core
-python tools/deploy_reconcile_check.py      # deploy create / reuse / prune
+python tools/control_check.py               # the control state machine's scenarios
+python tools/control_logic_check.py         # the generated Jinja replayed against them
+python tools/deploy_reconcile_check.py      # deploy create / reuse / update / prune
+python tools/leak_response_check.py         # the leak latch, wet to dry
 python tools/runtime_check.py               # runtime observer + control loop
 ```
 

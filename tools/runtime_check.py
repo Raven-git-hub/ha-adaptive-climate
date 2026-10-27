@@ -9,10 +9,14 @@ Store (no Home Assistant, no network). Verifies:
   * a heartbeat samples every sensor and unit and records it, and the first
     heartbeat in an unseeded section (or one that can seed a unit the
     almanac lacks) replays and pushes the almanac
-  * reactive detection records a genuine user setpoint change, raising hold,
-    replays the almanac at once and again after the comfort window
+  * reactive detection records a genuine user setpoint change, never raising
+    the hold, and replays the almanac at once and again after the comfort
+    window
   * an automation-caused change (context.parent_id set) is ignored
   * a change during the guard window is ignored
+  * a late echo of our own command (what the unit's state helper implies)
+    is ignored, while a setpoint change made while resting is recorded
+  * a heartbeat records the unit's control_state and control_offset
   * several changes in one reactive window record the first setpoint_before
   * a sleep section run crossing midnight closes against its start date
   * on restart, comfort-window replays are re-armed for recent setpoint-moving
@@ -56,6 +60,15 @@ def _build_states():
         states.append({"entity_id": f"input_boolean.ac_active_{r}", "state": "off", "attributes": {}})
         states.append({"entity_id": f"input_boolean.ac_hold_{r}", "state": "off", "attributes": {}})
         states.append({"entity_id": f"input_select.ac_scene_{r}", "state": "day", "attributes": {}})
+        if r == "main_bedroom":     # control helpers on one room; the others have none yet
+            for u in room["units"]:
+                states += [
+                    {"entity_id": f"input_select.ac_state_{r}_{u['id']}", "state": "rest",
+                     "attributes": {}},
+                    {"entity_id": f"input_number.ac_offset_{r}_{u['id']}", "state": "2.0",
+                     "attributes": {}},
+                    {"entity_id": f"input_number.ac_base_{r}_{u['id']}", "state": "0.0",
+                     "attributes": {}}]
         for u in room["units"]:
             states.append({
                 "entity_id": u["entity_id"], "state": "cool",
@@ -211,22 +224,30 @@ async def main() -> int:
     assert len(replays(store, "main_bedroom", "new seed in section")) == 1
     print("heartbeat: a unit off at its section's first heartbeat is seeded by the replay "
           "the first heartbeat with it on triggers - OK")
+    controls = c.execute(
+        "SELECT h.room_id, hu.control_state, hu.control_offset FROM heartbeat_unit hu "
+        "JOIN heartbeat h ON h.id = hu.heartbeat_id ORDER BY h.id, hu.unit_id").fetchall()
+    assert [tuple(x) for x in controls] == [("main_room", None, None),
+                                            ("main_room", None, None),
+                                            ("main_bedroom", "rest", 2),
+                                            ("main_bedroom", "rest", 2)], controls
+    print("heartbeat: control_state and control_offset recorded from the unit's helpers "
+          "(NULL where a room has none yet) - OK")
 
     # --- reactive: genuine user change ---
     rt._cache["input_boolean.ac_active_main_room"] = "off"
     rt._on_state_change(_state_changed("climate.lounge_lounge", 22.0, 24.0))
     assert rt.rooms["main_room"].reactive_units, "user change not buffered"
     await asyncio.sleep(0.05)  # let the scheduled hold-raise task run
-    hold_calls = [c for c in rest.service_calls
-                  if c[:2] == ("input_boolean", "turn_on")
-                  and c[2].get("entity_id") == "input_boolean.ac_hold_main_room"]
-    assert hold_calls, "hold not raised on reaction"
     await asyncio.sleep(1.5)  # let the flush window elapse
+    hold_calls = [c for c in rest.service_calls
+                  if c[2].get("entity_id", "").startswith("input_boolean.ac_hold_")]
+    assert not hold_calls, f"the hold was raised on a reaction: {hold_calls}"
     rx = c.execute("SELECT COUNT(*) FROM reactive WHERE room_id='main_room'").fetchone()[0]
     rxs = c.execute("SELECT COUNT(*) FROM reactive_sensor").fetchone()[0]
     assert rx == 1, rx
     assert rxs == 3, rxs   # all sensors snapshotted at reaction time
-    print(f"reactive: user setpoint change recorded, hold raised, 3 sensors snapshotted - OK")
+    print("reactive: user setpoint change recorded, hold not raised, 3 sensors snapshotted - OK")
     assert len(replays(store, "main_room", "reaction")) == 1
     alm = store.current_almanac("main_room", as_of=rt._today())["sections"][sec]
     assert alm["status"] == "learned", alm
@@ -278,7 +299,7 @@ async def main() -> int:
         for e in events:
             rt._on_state_change(e)
         await eventually(lambda: n_reactions(room_id) == count + 1, "the reaction to flush")
-        assert holds(room_id) == held + 1, "hold not raised"
+        assert holds(room_id) == held, "the hold was raised"
         await asyncio.sleep(0.2)                 # it stays one reaction
         assert n_reactions(room_id) == count + 1
         return last_reaction(c, room_id)
@@ -288,7 +309,7 @@ async def main() -> int:
     on = await window([_state_changed(lounge, 22.0, 22.0, state="off", new_state="cool")])
     assert on == ("on", "on", 0, 1, 22.0, 22.0, 0), on
     print("reactive: a person turning the unit off and back on gives an off then an on "
-          "reaction with power 1->0 and 0->1, each raising the hold - OK")
+          "reaction with power 1->0 and 0->1, neither raising the hold - OK")
 
     count = n_reactions("baby_room")
     rt._on_state_change(_state_changed("climate.baby_room_ac", 22.0, 22.0, parent_id="auto-ctx",
@@ -350,6 +371,35 @@ async def main() -> int:
     assert control[0]["detail"]["after"]["mode"] == "off"
     print("drop-out: cooling -> unavailable -> off is no reaction and one control event; "
           "off -> unknown -> off, unchanged, logs nothing - OK")
+
+    # --- phase 3b: our own command arriving after the guard is down ---
+    bedroom, bed_helper = "climate.home_s_device_2_home_s_device_2", "main_bedroom_main_bedroom_ac"
+    rt._cache["input_boolean.ac_active_main_bedroom"] = "off"
+    count = n_reactions("main_bedroom")
+    # state rest implies off: the unit going off at the same setpoint is our rest
+    rt._on_state_change(_state_changed(bedroom, 22.0, 22.0, state="cool", new_state="off"))
+    assert not rt.rooms["main_bedroom"].reactive_units, "the echo of our rest was buffered"
+    # state cool at base 25, offset 0 implies cool at 25
+    rt._cache[f"input_select.ac_state_{bed_helper}"] = "cool"
+    rt._cache[f"input_number.ac_base_{bed_helper}"] = "25.0"
+    rt._cache[f"input_number.ac_offset_{bed_helper}"] = "0.0"
+    rt._on_state_change(_state_changed(bedroom, 24.0, 25.0, state="off", new_state="cool"))
+    assert not rt.rooms["main_bedroom"].reactive_units, "the echo of our cool was buffered"
+    await asyncio.sleep(1.5)
+    assert n_reactions("main_bedroom") == count
+    print("reactive: a late echo of our own rest (off) and cool (cool at base + offset) is "
+          "not a reaction - OK")
+    # ...but a person's setpoint change while the unit rests is (decision 50)
+    rt._cache[f"input_select.ac_state_{bed_helper}"] = "rest"
+    resting = await window([_state_changed(bedroom, 22.0, 24.0, state="off", new_state="off")],
+                           "main_bedroom")
+    assert resting == ("setpoint", "setpoint", 0, 0, 22.0, 24.0, 1), resting
+    # ...and so is a setpoint a person picks away from our command
+    rt._cache[f"input_select.ac_state_{bed_helper}"] = "cool"
+    away = await window([_state_changed(bedroom, 25.0, 23.0)], "main_bedroom")
+    assert away == ("setpoint", "setpoint", 1, 1, 25.0, 23.0, 1), away
+    print("reactive: a setpoint change while resting, and one away from our command, are "
+          "a person's - OK")
 
     # --- section runs: a sleep run crossing midnight, with a restart inside it ---
     from datetime import datetime as dt

@@ -4,10 +4,12 @@ Adaptive Climate - deployment to Home Assistant.
 Two different reconciliation strategies, because Home Assistant exposes
 two different APIs:
 
-  * HELPERS (input_boolean/input_select/input_datetime) use HA's storage
-    collection WebSocket commands, which include a reliable `{domain}/list`.
-    So helpers are reconciled by LIST-DIFF: list what exists, create what's
-    missing, delete our own (`ac_*`) ones no longer desired.
+  * HELPERS (input_boolean/input_select/input_number/input_datetime) use
+    HA's storage collection WebSocket commands, which include a reliable
+    `{domain}/list`. So helpers are reconciled by LIST-DIFF: list what
+    exists, create what's missing, update ours whose settings changed (a
+    range, the options), delete our own (`ac_*`) ones no longer desired.
+    Only the helpers created in this deploy get starting values.
 
   * AUTOMATIONS use HA's config-editor REST API
     (GET/POST/DELETE /api/config/automation/config/<id>), which has no
@@ -34,17 +36,19 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from app import generator as g
-from app.generator import correction_started_id
 from app.ha import HAError, HARest, HAWebSocket
 
 MANIFEST_FILENAME = "deploy_manifest.json"
-HELPER_DOMAINS = ("input_boolean", "input_select", "input_datetime")
+HELPER_DOMAINS = ("input_boolean", "input_select", "input_number", "input_datetime")
+# A newly created unit is hands off until its room's next section change,
+# so deploying sends no command to any unit.
+NEW_UNIT_STATE = "manual"
 
 
 def slug(text: str) -> str:
@@ -55,6 +59,7 @@ def slug(text: str) -> str:
 class DeployReport:
     helpers_created: list[str] = field(default_factory=list)
     helpers_reused: list[str] = field(default_factory=list)
+    helpers_updated: list[str] = field(default_factory=list)
     helpers_removed: list[str] = field(default_factory=list)
     automations_written: list[str] = field(default_factory=list)
     automations_removed: list[str] = field(default_factory=list)
@@ -71,6 +76,7 @@ class DeployReport:
             "ok": self.ok,
             "helpers_created": self.helpers_created,
             "helpers_reused": self.helpers_reused,
+            "helpers_updated": self.helpers_updated,
             "helpers_removed": self.helpers_removed,
             "automations_written": self.automations_written,
             "automations_removed": self.automations_removed,
@@ -119,6 +125,13 @@ async def check(config: dict, rest: HARest) -> DeployReport:
     for room in config.get("rooms", []):
         if not room.get("enabled", True):
             continue
+        hold = states.get(g.hold_id(room["id"])) or {}
+        if hold.get("state") == "on":
+            # v1 raised the hold on every reaction and its scenes cleared it;
+            # v2 never touches it, so one left on pauses the room for good
+            report.notes.append(
+                f"{g.hold_id(room['id'])} is on: the room is paused (no commands) until a "
+                "person turns it off; nothing clears it automatically any more")
         for u in room.get("units", []):
             if u["entity_id"] not in states:
                 report.missing_entities.append(u["entity_id"])
@@ -150,15 +163,23 @@ async def _reconcile_helpers(rendered_helpers: list[dict], ws: HAWebSocket,
         except HAError as e:
             report.problems.append(f"could not list {domain} helpers: {e}")
             existing = []
-        existing_ids = {e.get("id") or e.get("object_id") for e in existing}
+        existing_by_id = {e.get("id") or e.get("object_id"): e for e in existing}
 
         for h in desired:
             oid = h["object_id"]
             label = f"{domain}.{oid}"
-            if oid in existing_ids:
-                report.helpers_reused.append(label)
-                continue
             payload = {k: v for k, v in h.items() if k not in ("domain", "object_id")}
+            if oid in existing_by_id:
+                current = existing_by_id[oid]
+                if all(current.get(k) == v for k, v in payload.items()):
+                    report.helpers_reused.append(label)
+                    continue
+                try:
+                    await ws.update_helper(domain, oid, payload)
+                    report.helpers_updated.append(label)
+                except HAError as e:
+                    report.problems.append(f"could not update {label}: {e}")
+                continue
             try:
                 await ws.create_helper(domain, payload)
                 report.helpers_created.append(label)
@@ -201,27 +222,42 @@ async def _reconcile_automations(rendered_automations: list[dict], rest: HARest,
     manifest["automations"] = sorted(desired)
 
 
-async def _reset_correction_clocks(config: dict, rest: HARest,
-                                   report: DeployReport) -> None:
-    """Explicitly set every room's correction_started helper to now().
+async def _initialise_new_helpers(config: dict, rest: HARest,
+                                  report: DeployReport) -> None:
+    """Give the unit helpers created in this deploy their starting values.
 
-    HA gives a freshly-created input_datetime a default value ("today,
-    00:00:00") rather than leaving it unset. The maintenance template's
-    elapsed-time check only treats an unknown/unavailable state as "fresh
-    clock"; a real-but-stale midnight value would instead look like an
-    already-long-running correction, incorrectly capping a correction that
-    should be allowed to start. Run every deploy (idempotent, harmless if
-    a correction happens to be mid-flight - it just gets a fresh hour)."""
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    No helper carries an `initial` (HA would reset it to that at every
+    restart), so a new one starts at HA's default: an input_number at its
+    minimum, an input_select at its first option, an input_datetime at
+    today 00:00, a boolean off. That is right for the base (0, unset), the
+    grace period (in the past) and the unblock (off). The rest are set here,
+    and only for helpers that didn't exist before, so a running boost or
+    rest keeps its clock:
+
+      ac_since_*   now, as an epoch timestamp (not the container's clock
+                   read as HA local time)
+      ac_offset_*  0 (the minimum is -offset_cap)
+      ac_state_*   manual: hands off until the room's next section change,
+                   so deploying sends no command to any unit
+    """
+    created = set(report.helpers_created)
+    now = int(time.time())
     for room in config.get("rooms", []):
         if not room.get("enabled", True):
             continue
-        entity_id = correction_started_id(room["id"])
-        try:
-            await rest.call_service("input_datetime", "set_datetime",
-                                    {"entity_id": entity_id, "datetime": now_str})
-        except Exception as e:
-            report.problems.append(f"could not reset {entity_id}: {e}")
+        for unit in room.get("units", []):
+            r, u = room["id"], unit["id"]
+            for entity_id, domain, service, data in (
+                    (g.since_id(r, u), "input_datetime", "set_datetime", {"timestamp": now}),
+                    (g.offset_id(r, u), "input_number", "set_value", {"value": 0}),
+                    (g.state_id(r, u), "input_select", "select_option",
+                     {"option": NEW_UNIT_STATE})):
+                if entity_id not in created:
+                    continue
+                try:
+                    await rest.call_service(domain, service, {"entity_id": entity_id, **data})
+                except Exception as e:
+                    report.problems.append(f"could not set the starting value of {entity_id}: {e}")
 
 
 async def deploy(config: dict, rest: HARest, ws: HAWebSocket,
@@ -231,12 +267,12 @@ async def deploy(config: dict, rest: HARest, ws: HAWebSocket,
         check_report.problems.append("deploy aborted: fix missing entities first")
         return check_report
 
-    report = DeployReport()
+    report = DeployReport(notes=list(check_report.notes))
     rendered = g.render_all(config)
     manifest = load_manifest(data_dir)
 
     await _reconcile_helpers(rendered["helpers"], ws, report)
-    await _reset_correction_clocks(config, rest, report)
+    await _initialise_new_helpers(config, rest, report)
     await _reconcile_automations(rendered["automations"], rest, manifest, report)
 
     manifest["helpers"] = sorted(f"{h['domain']}.{h['object_id']}" for h in rendered["helpers"])

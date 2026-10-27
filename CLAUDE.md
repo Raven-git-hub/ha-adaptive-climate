@@ -44,17 +44,19 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
   never anything else. See `docs/DEPLOY.md`.
 - **The event log is a feature, not debug output.** Every action the
   container takes is recorded and surfaced in the UI, not just logged.
-- **Reactive detection ignores our own automation's changes** (guard boolean
-  or `context.parent_id`), so the maintenance loop doesn't learn from itself.
+- **Reactive detection ignores our own automation's changes** (guard boolean,
+  `context.parent_id`, or the unit showing the command its state helper
+  implies - `app.control.matches_command`), so the maintenance loop doesn't
+  learn from itself.
 
 ### Core modules (`app/`)
 
 | Module | Responsibility |
 |---|---|
 | `app/trust.py` | Pure-function core: sensor trust, comfort band, quorum evaluation |
-| `app/control.py` | Pure-function control core: votes, the cool/boost/rest state machine, section changes, person reactions (rendered as Jinja in phase 3b) |
+| `app/control.py` | Pure-function control core: votes, the cool/boost/rest state machine, section changes, person reactions, the "is this ours" check (rendered as Jinja by the generator) |
 | `app/analyser.py` | Deterministic replay of reactions from a seed: setpoints, applied setpoints, per-sensor comfort/band/trust, confidence |
-| `app/generator.py` | Builds HA helpers and automations (scene, maintenance, leak, watchdog) from config + almanac |
+| `app/generator.py` | Builds HA helpers (incl. six per-unit control helpers) and automations (scene, maintenance, manual change, leak, watchdog) from config, rendering `app/control.py` as Jinja |
 | `app/scheduler.py` | Clock-only section-boundary computation (no sun-based triggers) |
 | `app/ha.py` | Home Assistant REST + WebSocket client |
 | `app/deploy.py` | Reconciles generated helpers/automations into HA; owns the `ac_*` namespace; manifest-based automation pruning |
@@ -96,9 +98,10 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
   stay inside the `ac_*` prefix. Do not add logic that enumerates, edits, or
   deletes entities outside that namespace.
 - **New generator logic needs a template-vs-core cross-check**, the way
-  `tools/maintenance_logic_check.py` renders the real Jinja2 the generator
-  emits and diffs it against `app.trust`'s pure-Python reference. Don't trust
-  a hand-inspected template.
+  `tools/control_logic_check.py` runs the automations the generator emits
+  (real Jinja2, HA's variable/condition/choose semantics) through every
+  `tools/control_check.py` scenario and diffs them against `app/control.py`.
+  Don't trust a hand-inspected template.
 - **"No almanac yet" and "deliberately forced off" are different states** —
   don't conflate them in generated scene logic (see the safety fix described
   in `docs/DEPLOY.md`).
@@ -113,9 +116,9 @@ python tools/config_check.py                # config v1 -> v2 migration, default
 python tools/analyser_demo.py               # reaction replay: worked examples + acceptance checks
 python tools/compare_analyser.py DATA_DIR   # frozen v1 vs v2 almanacs on a COPY of a data dir (migrates it)
 python tools/render_generated.py            # render helpers + automations
-python tools/maintenance_logic_check.py     # quorum + setpoint Jinja vs their Python references
-python tools/control_check.py              # control state machine scenarios; each rule removed must fail
-python tools/deploy_reconcile_check.py      # deploy create / reuse / prune
+python tools/control_check.py               # control state machine scenarios; each rule removed must fail
+python tools/control_logic_check.py         # the generated automations replayed against app/control.py
+python tools/deploy_reconcile_check.py      # deploy create / reuse / update / prune
 python tools/runtime_check.py               # runtime observer + control loop
 python tools/leak_response_check.py         # leak detection / DRY / release automations
 ```

@@ -72,24 +72,20 @@ for display and tie-breaking; the quorum count itself is unweighted.
 - **sensors[].trust** — normalised inverse of band, 0..1. Display and
   tie-breaking only.
 
-## What the HA maintenance template does with it (D4, implemented)
+## What the HA templates do with it (D4; v2 phase 3)
 
-`app/generator.py:build_maintenance_automation` emits, per room, an automation
-on a `time_pattern` trigger (every `heartbeat_interval_minutes`, HA's own clock
-per D4). Per heartbeat, for the active section: read each sensor's
-`comfort`/`band`, count votes (`abs(reading - comfort) >= band`) among sensors
-that are currently available and have a learned comfort (unavailable/unlearned
-sensors count toward neither the tally nor the quorum base), apply the quorum
-rule (1→1, 2→2, 3+→ceil(n/2)), and if met, drive each eligible unit into
-Cooling or Warming by the trust-weighted breach direction, from its
-`setpoint_applied` clamped per `docs/HARDWARE.md`. A unit is corrected only if
-it is already on, has a `setpoint_applied`, is not forced off for the section,
-and (if leak-enabled) its leak boolean is off. The cap uses
-`input_datetime.ac_correction_started_<room>`: reset every heartbeat the quorum
-is not met, left untouched while it is, so elapsed time approximates how long
-correction has been continuously warranted. The `ceil(n/2)` and trust-weighted
-direction logic are specified in `docs/TRUST_MODEL.md`, and the Jinja
-implementing them is cross-checked against `app.trust.evaluate_quorum` (the
-tested reference) in `tools/maintenance_logic_check.py`, which also renders the
-setpoint templates against a plain-Python clamp. Phase 3 replaces this
-automation with the cool-or-rest state machine (docs/V2_DESIGN.md).
+`app/generator.py` renders `app/control.py` as Jinja (docs/V2_DESIGN.md,
+Control). The maintenance automation runs on a `time_pattern` trigger (every
+`heartbeat_interval_minutes`, HA's own clock per D4) and reads the active
+section: each sensor's position is `(reading - comfort) / band` (a missing
+band counts as 5.0; a sensor that is unavailable or has no `comfort` counts
+toward neither the tally nor the quorum base), it votes past either trigger
+edge (±1 until phase 5 leans them), the pooled quorum is 1→1, 2→2,
+3+→ceil(n/2), and the trust-weighted majority of the voters picks too warm or
+too cold. Each unit then takes one step of the state machine from its helpers.
+`setpoint_applied` is what the scene copies into each unit's base at the
+section change, and the fallback while the base is unset; templates never
+round it, only clamp the command to the unit's range (docs/HARDWARE.md). A unit
+with no `setpoint_applied` and no base is left alone. The rules are specified
+in `docs/TRUST_MODEL.md` and `docs/V2_DESIGN.md`, and the generated Jinja is
+replayed against `app/control.py` in `tools/control_logic_check.py`.

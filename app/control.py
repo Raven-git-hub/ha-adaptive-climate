@@ -11,9 +11,12 @@ rule is a small named function, written the way a template can say it.
                       direction (app.trust), and the release counts
   step                one maintenance heartbeat for one unit
   on_section_change   what the scene does to a unit at a crossover
-  on_person_change    what the manual-change automation records after a
-                      person's change (no command: the person already
-                      moved the unit)
+  on_person_change    what a person's change does to the unit's record (no
+                      command: the person already moved the unit)
+  on_climate_change   the manual-change automation: one climate state change,
+                      ignored when it is our own command showing up
+                      (matches_command), else classified and passed to
+                      on_person_change
 
 A unit's state lives in its helpers (phase 3b): ac_state, ac_base,
 ac_offset, ac_since, ac_grace_until and ac_unblocked.
@@ -88,7 +91,16 @@ class Context:
     blocked: bool = False               # the section's cooling block (or a heat source)
     leak_on: bool = False               # the unit's leak latch
     forced_off: bool = False            # the section's scene forces this unit off
+    min_delta: float = 0.5              # system.reactive_min_delta
     config: ControlConfig = ControlConfig()
+
+
+@dataclass(frozen=True)
+class Climate:
+    """What a climate entity shows: its hvac mode, setpoint and fan."""
+    mode: str
+    temperature: float | None = None
+    fan: str | None = None
 
 
 @dataclass(frozen=True)
@@ -181,8 +193,8 @@ def command_for(state: str, base: float | None, offset: int, ctx: Context) -> Co
     if state == "cool":
         return Command("cool", "low", None if base is None else clamp(base + offset, lo, hi))
     if state == "boost":
-        return Command("cool", "medium",
-                       clamp(base + offset - ctx.config.boost_degrees, lo, hi))
+        return Command("cool", "medium", None if base is None
+                       else clamp(base + offset - ctx.config.boost_degrees, lo, hi))
     if state in ("rest", "config_off", "user_off"):
         return Command("off")
     if state == "leak":
@@ -221,6 +233,63 @@ def _kept_off(power_after: bool) -> bool:
 def _kept_manual(state: str) -> bool:
     """So does one made while a person has the unit in manual."""
     return state == "manual"
+
+
+def setpoint_moved(before: float | None, after: float | None, min_delta: float) -> bool:
+    """The runtime's test for a setpoint change: both known, and apart by
+    at least reactive_min_delta."""
+    return before is not None and after is not None and abs(after - before) >= min_delta
+
+
+def implied_command(unit: Unit, ctx: Context) -> Command | None:
+    """The command the unit's state stands for, which a delayed echo of
+    our own command would show. None in manual (or an unknown state):
+    then every change is a person's."""
+    return command_for(unit.state, target_base(unit, ctx), unit.offset, ctx)
+
+
+def _off_matches(before: Climate, after: Climate, min_delta: float) -> bool:
+    """An off command sets no setpoint, so a setpoint change made while
+    off is still a person's (decision 50)."""
+    return after.mode == "off" and not setpoint_moved(before.temperature, after.temperature,
+                                                      min_delta)
+
+
+def matches_command(command: Command | None, before: Climate, after: Climate,
+                    min_delta: float) -> bool:
+    """Is this change our own command showing up? For an off command:
+    the unit is off and its setpoint didn't change. Otherwise: the mode is
+    the command's, and so is the setpoint, to within reactive_min_delta
+    (any setpoint, if the command sets none). The fan is never compared."""
+    if command is None:
+        return False
+    if command.hvac_mode == "off":
+        return _off_matches(before, after, min_delta)
+    if after.mode != command.hvac_mode:
+        return False
+    return command.temperature is None or _same_setpoint(after.temperature, command.temperature,
+                                                         min_delta)
+
+
+def _same_setpoint(shown: float | None, commanded: float, min_delta: float) -> bool:
+    """Closer than a setpoint change: a unit's rounding or unit conversion
+    is not a person."""
+    return shown is not None and abs(shown - commanded) < min_delta
+
+
+def classify_change(before: Climate, after: Climate, min_delta: float) -> str | None:
+    """One change's kind, as the runtime's reaction detector names it:
+    on or off if the power changed (off to any mode is on), else setpoint
+    if the setpoint moved, else manual for a mode or fan change while on.
+    None for anything else (current_temperature, say)."""
+    power_before, power_after = before.mode != "off", after.mode != "off"
+    if power_before != power_after:
+        return "on" if power_after else "off"
+    if setpoint_moved(before.temperature, after.temperature, min_delta):
+        return "setpoint"
+    if power_after and (before.mode != after.mode or before.fan != after.fan):
+        return "manual"
+    return None
 
 
 # ---------------------------------------------------------------------
@@ -319,3 +388,16 @@ def on_person_change(kind: str, unit: Unit, new_setpoint: float | None, power_af
     if kind == "manual":
         return replace(unit, state="manual", since=now)
     return unit
+
+
+def on_climate_change(unit: Unit, before: Climate, after: Climate, now: datetime,
+                      ctx: Context) -> Unit:
+    """The manual-change automation, once it knows the change carries no
+    parent context, the guard is off and the unit is reporting: our own
+    command showing up late changes nothing; anything else is a person's."""
+    if matches_command(implied_command(unit, ctx), before, after, ctx.min_delta):
+        return unit
+    kind = classify_change(before, after, ctx.min_delta)
+    if kind is None:
+        return unit
+    return on_person_change(kind, unit, after.temperature, after.mode != "off", now, ctx)

@@ -5,11 +5,15 @@ boundaries of what it will and won't touch.
 
 ## Two reconciliation strategies, because HA has two different APIs
 
-**Helpers** (`input_boolean`, `input_select`, `input_datetime`) live in HA's
-storage collections, which expose a reliable `{domain}/list` over WebSocket.
-So helpers are reconciled by **list-diff**: list what exists, create what's
-missing, delete our own (`ac_*`) ones no longer desired. Straightforward and
-safe, because we can always see the ground truth.
+**Helpers** (`input_boolean`, `input_select`, `input_number`, `input_datetime`)
+live in HA's storage collections, which expose a reliable `{domain}/list` over
+WebSocket. So helpers are reconciled by **list-diff**: list what exists, create
+what's missing, update ours whose settings changed (`{domain}/update`: the
+offset helper's range after an `offset_cap` change, say, or a select's
+options), delete our own (`ac_*`) ones no longer desired. Straightforward and
+safe, because we can always see the ground truth. The v1 helper
+`input_datetime.ac_correction_started_<room>` is pruned this way on the first
+v2 deploy.
 
 **Automations** use HA's config-editor REST API
 (`GET`/`POST`/`DELETE /api/config/automation/config/<id>`), which has no
@@ -40,6 +44,11 @@ disable or delete it first, per the README.
 
 ## The safety fix: "no almanac yet" is a no-op, not an off command
 
+(v2: the scene now runs `app.control.on_section_change`. With no
+`setpoint_applied` it still resets the unit's section-scoped helpers but keeps
+its state and sends nothing; forced-off stays the only path that commands off
+from config. The rest of this section is the v1 history of that rule.)
+
 `app/generator.py`'s scene automation used to treat two different things the
 same way: a unit deliberately forced off by your scene config, and a unit with
 no learned setpoint yet (true of every room before Phase 10's observer exists,
@@ -58,33 +67,53 @@ off, and it's entirely static — decided from config, not from almanac state.
 was. The maintenance automation already had the correct behaviour (it never
 acts without a learned setpoint); this brought the scene automation in line.
 
-## The correction-clock cold-start fix
+## Starting values: no `initial`, and new units start hands off
 
-A freshly-created `input_datetime` helper in Home Assistant doesn't start
-`unknown` — it defaults to today's midnight. The maintenance template's
-one-hour-cap check only treats `unknown`/`unavailable` as "clock not running
-yet"; a real-but-stale midnight timestamp instead looks like a correction that
-has already been running for hours, which could wrongly cap a correction that
-should be allowed to start fresh on its very first opportunity after deploy.
-Rather than depend on that self-healing (the clock resets the moment any
-heartbeat finds quorum *not* met, which is common but not guaranteed to be
-first), `deploy()` now explicitly resets every room's
-`input_datetime.ac_correction_started_<room>` to the real current time on
-every deploy — cheap, idempotent, and closes the gap outright rather than
-relying on timing.
+Each unit has six control helpers (`ac_state`, `ac_base`, `ac_offset`,
+`ac_since`, `ac_grace_until`, `ac_unblocked`). None is created with an
+`initial`: in Home Assistant, a helper's `initial` overrides its restored value
+at **every** restart, which would wipe a person's chosen base, a `user_off` or
+an unblock each time HA restarts. So a new helper starts at HA's default (an
+`input_number` at its minimum, an `input_select` at its first option, an
+`input_datetime` at today 00:00, a boolean off), and deploy then sets the
+starting values of the helpers **it has just created**, and only those:
+
+| Helper | Starts at | How |
+| --- | --- | --- |
+| `ac_base_<room>_<unit>` | 0 (unset: templates fall back to `setpoint_applied`) | its minimum is 0 |
+| `ac_grace_until_…` | today 00:00, in the past: no grace | HA's default |
+| `ac_unblocked_…` | off | HA's default |
+| `ac_offset_…` | 0 | deploy sets it (its minimum is −`offset_cap`) |
+| `ac_since_…` | now, as an epoch timestamp | deploy sets it |
+| `ac_state_…` | `manual` | deploy sets it |
+
+Helpers that already exist are never reset, so a redeploy leaves a running
+boost or rest, and its clock, alone. (v1 reset its one-hour correction clock on
+every deploy; that helper is gone.)
+
+A new unit starts in **`manual`: hands off until its room's next section
+change**, when the scene sets its base, offset and state properly. Deploying
+therefore sends no command to any unit. The flip side is that **control begins
+at each room's next section change, so deploy shortly before one** (or trigger
+the current section's scene automation in HA to start a room at once).
 
 ## Before you deploy to a live, occupied home
 
 - **Run `/api/deploy/check` (or the Config page's "Check deploy" button)
   first.** It only verifies entity existence — no writes — and is safe to run
   any time.
-- Deploying starts real automations that will call real `climate.*` services
-  on your real thermostats the moment a crossover or maintenance tick fires.
-  Until Phase 10 (the observer) exists, almanacs stay empty, so scene
-  automations will do nothing (the safety fix above) and maintenance will
-  never act (it already required a learned setpoint) — deploying now is inert
-  in terms of driving temperature, but it DOES install real automations and
-  helpers in your instance.
+- Deploying installs real automations that call real `climate.*` services on
+  your real thermostats from the next crossover on. Deploy itself sends no
+  command, and new units are hands off (`manual`) until their room's next
+  section change (above); from then on scenes and maintenance drive them.
+  A room with no almanac yet is still left alone: the scene sends nothing
+  without a `setpoint_applied`, and maintenance never acts without a base.
+- Never deploy a v2 build that has phase 0 but not phase 1 (see CLAUDE.md).
+- **After the first v2 deploy, check the holds.** v1 raised
+  `input_boolean.ac_hold_<room>` on every reaction and its scenes cleared it;
+  in v2 it is only a manual pause that nothing clears automatically, so one
+  left on by v1 pauses that room until a person turns it off. The check and
+  deploy reports name every hold that is on.
 - The manifest-based prune only knows about automations *this container*
   deployed. If you hand-edit or delete one of our `ac_*` automations directly
   in HA, the next deploy will not necessarily notice or restore it correctly —

@@ -371,9 +371,14 @@ class HAWebSocket:
                                   stream_cb=callback)
 
     async def create_helper(self, domain: str, payload: dict) -> dict:
-        """Create an input_boolean / input_select via the storage collection."""
+        """Create an input_* helper via the storage collection."""
         return await self.request(
             {"type": f"{domain}/create", **payload})
+
+    async def update_helper(self, domain: str, helper_id: str, payload: dict) -> dict:
+        """Change a helper's settings (a range, the options) in place."""
+        return await self.request(
+            {"type": f"{domain}/update", f"{domain}_id": helper_id, **payload})
 
     async def delete_helper(self, domain: str, helper_id: str) -> dict:
         return await self.request(

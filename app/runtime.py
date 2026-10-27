@@ -11,8 +11,9 @@ Observation (passive):
     to a unit (NOT automation-caused) - its setpoint, turning it on or off,
     or a mode or fan change while on - opens a consolidation window,
     snapshots every sensor, and records one reactive event of kind on, off,
-    setpoint or manual, raising ac_hold so maintenance stands down until
-    the next crossover (until phase 3b). A unit dropping out to
+    setpoint or manual. HA's manual-change automation applies the same
+    change to the unit's control helpers; the runtime no longer raises
+    ac_hold, which is now only a manual pause. A unit dropping out to
     unavailable/unknown and back is never a reaction; if it comes back
     changed, that is logged as a control event.
 
@@ -34,8 +35,11 @@ Control (active):
     a timer and on homeassistant_start.
 
 Automation-caused changes are told apart from user ones primarily by
-context.parent_id (our service calls carry it), backed by the guard boolean
-and configured external_guards. See docs/DESIGN.md 4, 12.
+context.parent_id (our service calls carry it), backed by the guard boolean,
+configured external_guards, and the same check HA's manual-change
+automation makes: a change that shows what the unit's state helper
+implies (app.control.matches_command) is our own command arriving late.
+See docs/DESIGN.md 4, 12.
 """
 
 from __future__ import annotations
@@ -46,9 +50,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from app import control
 from app.analyser import LearningConfig, analyse_room, is_setpoint_moving
-from app.generator import (almanac_id, guard_id, hold_id, scene_automation_id,
-                           scene_select_id)
+from app.generator import (almanac_id, base_id, guard_id, offset_id, scene_automation_id,
+                           scene_select_id, state_id)
 from app.scheduler import active_section_at
 from app.store import ReactiveUnitSample, UnitSample
 
@@ -66,6 +71,14 @@ NO_STATE = ("unavailable", "unknown", None)     # the unit isn't reporting at al
 
 def _profiles(config: dict) -> dict:
     return {p["id"]: p for p in config.get("schedule_profiles", [])}
+
+
+def _number(state: str | None, default: float | None = 0.0) -> float | None:
+    """An input_number's state string as a float, or default."""
+    try:
+        return float(state)
+    except (TypeError, ValueError):
+        return default
 
 
 def _infer_ac_state(hvac_mode, fan_mode, leak_on: bool) -> str | None:
@@ -278,7 +291,7 @@ class Runtime:
     def _is_user_change(self, event: dict, data: dict, room_id: str) -> bool:
         """A change is a person's only if it was not caused by an automation:
         no context.parent_id, the room guard is off, and no external guard is
-        on. (Phase 3b adds: and not what the unit's state helper implies.)"""
+        on. (_is_our_command then rules out a late echo of our own command.)"""
         new = data.get("new_state") or {}
         ctx = new.get("context") or event.get("context") or {}
         if ctx.get("parent_id"):
@@ -307,13 +320,14 @@ class Runtime:
         new = new_s.get("attributes") or {}
         before, after = old.get("temperature"), new.get("temperature")
         min_delta = self._sys.get("reactive_min_delta", 0.5)
-        setpoint_changed = (before is not None and after is not None
-                            and abs(after - before) >= min_delta)
-        power_before, power_after = old_mode != "off", new_mode != "off"
-        mode_or_fan = power_before and power_after and (
-            old_mode != new_mode or old.get("fan_mode") != new.get("fan_mode"))
-        if not (setpoint_changed or power_before != power_after or mode_or_fan):
+        was = control.Climate(old_mode, before, old.get("fan_mode"))
+        now_shows = control.Climate(new_mode, after, new.get("fan_mode"))
+        if control.classify_change(was, now_shows, min_delta) is None:
             return      # another attribute (current_temperature, ...) changed
+        if self._is_our_command(room_id, unit_id, was, now_shows, new, min_delta):
+            return      # our own command, showing up after the guard came down
+        setpoint_changed = control.setpoint_moved(before, after, min_delta)
+        power_before, power_after = old_mode != "off", new_mode != "off"
 
         rs = self.rooms[room_id]
         # One record per window: the first value of everything before the
@@ -330,10 +344,31 @@ class Runtime:
         window = self._sys.get("reactive_window_seconds", 120)
         rs.reactive_deadline = datetime.now(self.tz) + timedelta(seconds=window)
         if rs.reactive_task is None or rs.reactive_task.done():
-            # raise hold so maintenance stands down until the next crossover
-            asyncio.create_task(self._safe_service(
-                "input_boolean", "turn_on", {"entity_id": hold_id(room_id)}))
             rs.reactive_task = asyncio.create_task(self._flush_reactive_after(rs))
+
+    def _is_our_command(self, room_id: str, unit_id: str, was: control.Climate,
+                        now_shows: control.Climate, attrs: dict, min_delta: float) -> bool:
+        """The manual-change automation's test (app.control.matches_command):
+        does the unit now show the command its state helper implies? Reads
+        the helpers from the state cache and setpoint_applied from the
+        almanac for the room's section."""
+        state = self._cache.get(state_id(room_id, unit_id))
+        if state not in control.STATES:
+            return False            # no state helper yet: every change is a person's
+        rs = self.rooms[room_id]
+        section = (self.store.current_almanac(room_id, as_of=self._today())["sections"]
+                   .get(rs.section or "") or {})
+        applied = ((section.get("units") or {}).get(unit_id) or {}).get("setpoint_applied")
+        unit = control.Unit(state=state, offset=int(_number(self._cache.get(
+            offset_id(room_id, unit_id)))), base=_number(self._cache.get(
+                base_id(room_id, unit_id))) or None)
+        ctx = control.Context(
+            setpoint_applied=applied,
+            unit_min=attrs.get("min_temp") or control.DEFAULT_MIN_TEMP,
+            unit_max=attrs.get("max_temp") or control.DEFAULT_MAX_TEMP,
+            config=control.ControlConfig.from_config(self.config))
+        return control.matches_command(control.implied_command(unit, ctx), was, now_shows,
+                                       min_delta)
 
     def _track_dropout(self, entity_id: str, room_id: str, unit_id: str,
                        old_s: dict, new_s: dict) -> None:
@@ -390,7 +425,7 @@ class Runtime:
         units = {uid: w.sample() for uid, w in windows.items()}
         kind = room_kind(u.kind for u in units.values())
         self.store.record_reactive(room_id, ts, ts_utc, local_date, rs.section or "day",
-                                   window, units, sensors, suspended_maint=True, kind=kind)
+                                   window, units, sensors, kind=kind)
 
         def told(uid: str, w: UnitWindow) -> str:
             if w.kind in ("on", "off"):
@@ -446,14 +481,16 @@ class Runtime:
                 return None
         return None
 
-    def _unit_sample(self, entity_id: str, leak_on: bool, attrs: dict) -> UnitSample:
+    def _unit_sample(self, entity_id: str, leak_on: bool, attrs: dict,
+                     control_state: str | None, control_offset: int | None) -> UnitSample:
         state = self._cache.get(entity_id)
         is_on = state not in OFFISH
         hvac = state if state not in ("unavailable", "unknown", None) else None
         return UnitSample(
             is_on=is_on, hvac_mode=hvac, fan_mode=attrs.get("fan_mode"),
             setpoint=attrs.get("temperature"), current_temp=attrs.get("current_temperature"),
-            ac_state=_infer_ac_state(hvac, attrs.get("fan_mode"), leak_on))
+            ac_state=_infer_ac_state(hvac, attrs.get("fan_mode"), leak_on),
+            control_state=control_state, control_offset=control_offset)
 
     async def _do_heartbeat(self, rs: RoomState) -> None:
         room_id = rs.room["id"]
@@ -475,7 +512,13 @@ class Runtime:
         for u in rs.room["units"]:
             attrs = (states.get(u["entity_id"], {}) or {}).get("attributes", {}) or {}
             leak_on = self._cache.get(f"input_boolean.ac_leak_{room_id}_{u['id']}") == "on"
-            units[u["id"]] = self._unit_sample(u["entity_id"], leak_on, attrs)
+            # the unit's control helpers, as maintenance last left them
+            state = self._cache.get(state_id(room_id, u["id"]))
+            offset = _number(self._cache.get(offset_id(room_id, u["id"])), None)
+            units[u["id"]] = self._unit_sample(
+                u["entity_id"], leak_on, attrs,
+                state if state in control.STATES else None,
+                None if offset is None else int(offset))
 
         ts, ts_utc, local_date, _ = self._now()
         section = rs.section or "day"

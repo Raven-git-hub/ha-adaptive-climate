@@ -13,9 +13,9 @@ the devices actually do, not what we assumed. Re-check with
 | Main Bedroom | main_bedroom_ac | `climate.home_s_device_2_home_s_device_2` | cool, fan_only, dry, off | 16–30 | 1 |
 | Baby Room | baby_room_ac | `climate.baby_room_ac` | cool, fan_only, dry, off | 18–30 | 1 |
 
-All three expose `cool` / `fan_only` / `dry` / `off`, so the four-state machine
-(Normal=cool, Cooling=cool, Warming=fan_only, Leak=dry) is drivable on every
-unit.
+All three expose `cool` / `fan_only` / `dry` / `off`. v2 drives only `cool`
+(cool and boost), `dry` (leak) and `off` (rest and the off states); v1's
+Warming state used `fan_only`, which now appears only when a person picks it.
 
 ## Fan modes are reported per current hvac_mode (important)
 
@@ -33,10 +33,10 @@ Two consequences for the generator (Phase 5):
    will record a false "no fan" for any unit resting in dry/fan_only.
 
 2. **Guard `set_fan_mode` anyway.** When the state machine drives a unit *into*
-   DRY (Leak) or fan_only (Warming), fan control may be unavailable at that
-   moment. A `set_fan_mode` call must tolerate failure/absence rather than abort
-   the crossover. Map Normal -> `low`, Cooling -> `medium` on all three units;
-   fall back to skipping fan if the current mode rejects it.
+   DRY (leak), fan control may be unavailable at that moment. A `set_fan_mode`
+   call must tolerate failure/absence rather than abort the crossover. Map
+   cool -> `low`, boost -> `medium` on all three units; fall back to skipping
+   fan if the current mode rejects it.
 
 ## Setpoints: store precise, apply snapped
 
