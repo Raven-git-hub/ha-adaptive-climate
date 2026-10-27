@@ -65,7 +65,10 @@ Expect:
   error with the container idle. In that case, stop here and roll back (step 9).
 - `runtime started (3 room(s) live)`.
 
-In the UI at `http://<host>:8098`:
+In the UI at `http://<host>:8098` (hard-refresh it once, Ctrl+Shift+R or
+Cmd+Shift+R: a browser may still hold v1's `app.js`, served before the UI sent
+`Cache-Control: no-cache`, and v1's script shows "undefined" in the Almanac
+tab's Status column):
 
 - **Log** tab, category *storage*: "database migrated from storage version 0 to 2;
   backup at ...".

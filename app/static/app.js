@@ -94,7 +94,8 @@ function renderRoom(room, sections) {
         <span class="muted">±${fmt(v.band)}</span>
         <span class="trust"><span style="width:${Math.round(t * 100)}%"></span></span></td>`;
     }).join("");
-    return `<tr><td>${sec}</td><td><span class="state ${d.status}">${d.status}</span></td>${uCells}${sCells}</tr>`;
+    const status = d.status ?? "\u2014";      // provisional | learned (API: sections[s].status)
+    return `<tr><td>${sec}</td><td><span class="state ${status}">${status}</span></td>${uCells}${sCells}</tr>`;
   }).join("");
 
   return `<section class="room"><h2>${room.name}</h2>

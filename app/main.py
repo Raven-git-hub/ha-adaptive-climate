@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -397,6 +397,18 @@ async def api_now() -> dict:
             "sensors": sensors_out,
         })
     return {"rooms": rooms_out}
+
+
+@app.middleware("http")
+async def revalidate_ui(request: Request, call_next):
+    """The UI is served without a cache lifetime, so a browser may keep an
+    old app.js for days after an upgrade: v1's read the almanac's `state`,
+    v2's API sends `status`, and the Almanac tab showed "undefined". With
+    no-cache the browser revalidates every load (a 304 when unchanged)."""
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 @app.get("/")

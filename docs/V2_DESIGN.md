@@ -552,3 +552,4 @@ Rounding, 27 Oct 2026 (supersedes 9, and the rounding-direction parts of 21, 33,
 From the first live run, 27 Oct 2026:
 
 68. **Startup replays every room before any crossover.** The almanac is empty after a migration, and the first heartbeat's replay came 10 minutes after startup: the 22:00 Sleep crossover, three minutes after a 21:57 start, found no `setpoint_applied` and left every unit in `manual`. `start()` now replays every room and pushes its almanac before the catch-up crossover and before the scheduler starts.
+69. **The UI is served with `Cache-Control: no-cache`.** The Almanac tab's Status column showed "undefined": the browser was running a cached v1 `app.js`, which reads the almanac's `state`, against v2's API, which sends `status` (v2's `app.js` reads `status`). Served without a cache lifetime, the old script could stay in use for days; now every load revalidates (a 304 when unchanged). A browser still holding v1's script needs one hard refresh.
