@@ -99,6 +99,8 @@ the current section's scene automation in HA to start a room at once).
 
 ## Before you deploy to a live, occupied home
 
+- **For the v1 → v2 cutover, follow `docs/V2_CUTOVER.md`**, including
+  `tools/doctor.py --v2-preflight` and the rollback steps.
 - **Run `/api/deploy/check` (or the Config page's "Check deploy" button)
   first.** It only verifies entity existence — no writes — and is safe to run
   any time.

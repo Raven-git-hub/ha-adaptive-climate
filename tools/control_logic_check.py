@@ -351,6 +351,37 @@ def _trigger(before: control.Climate, after: control.Climate, parent_id=None) ->
     return {"from_state": state(before), "to_state": state(after)}
 
 
+def manual_triggers(entity_id: str) -> list[dict]:
+    """The manual-change automation's triggers: mode changes only (to: null
+    skips attribute-only changes), and the setpoint and fan attributes - so
+    a current_temperature update fires nothing."""
+    return [{"platform": "state", "entity_id": entity_id, "to": None},
+            {"platform": "state", "entity_id": entity_id, "attribute": "temperature"},
+            {"platform": "state", "entity_id": entity_id, "attribute": "fan_mode"}]
+
+
+def fired(automation: dict, change: dict) -> list[dict]:
+    """Home Assistant's state-trigger matching, for the forms we generate:
+    an attribute trigger fires when that attribute's value changed; `to:
+    null` when the state changed, never on an attribute-only change; a bare
+    one on any change. One trigger variable per trigger that fires: HA runs
+    the automation once for each."""
+    old, new = change["from_state"], change["to_state"]
+    out = []
+    for t in automation["trigger"]:
+        assert t["platform"] == "state", t
+        if "attribute" in t:
+            hit = old["attributes"].get(t["attribute"]) != new["attributes"].get(t["attribute"])
+        elif "to" in t and t["to"] is None:
+            hit = old["state"] != new["state"]
+        else:
+            hit = old != new
+        if hit:
+            out.append({**change, "platform": "state", "entity_id": t["entity_id"],
+                        "attribute": t.get("attribute")})
+    return out
+
+
 def _runtime_kind(before: control.Climate, after: control.Climate, min_delta: float) -> str:
     """What the runtime's reaction detector makes of the same single change."""
     w = UnitWindow(before.mode != "off", after.mode != "off", before.mode, after.mode,
@@ -365,9 +396,10 @@ def _runtime_kind(before: control.Climate, after: control.Climate, min_delta: fl
 
 class Replay:
     def __init__(self) -> None:
-        self.steps = self.runs = self.echoes = self.kinds = self.ours = 0
+        self.steps = self.runs = self.echoes = self.kinds = self.ours = self.twice = 0
         self.skipped: list[str] = []
         self.last_vars: dict | None = None
+        self.first_rendered: dict | None = None
 
     def scenario(self, sc: dict) -> list[str]:
         unit = table._unit(sc["unit"])
@@ -464,27 +496,37 @@ class Replay:
             ha.set(ENTITY, after.mode, **{**ha.entities[ENTITY]["attributes"],
                                           "temperature": after.temperature,
                                           "fan_mode": after.fan})
-            diff = self.compare(ha, manual, _trigger(before, after), {}, unit, new, None, now,
-                                echo=False)
-            if diff is None:
+            if manual["trigger"] != manual_triggers(ENTITY):
+                return new, f"manual change triggers {manual['trigger']}"
+            triggers = fired(manual, _trigger(before, after))
+            self.twice += len(triggers) > 1
+            diff = self.compare(ha, manual, triggers, {}, unit, new, None, now, echo=False)
+            if diff is None and self.first_rendered is not None:
                 want_ours = control.matches_command(control.implied_command(unit, ctx),
                                                     before, after, ctx.min_delta)
-                got = ha.rendered[g._unit_var(room["units"][0])]
+                got = self.first_rendered[g._unit_var(room["units"][0])]
                 if got["kind"] != kind or got["ours"] != want_ours:
                     diff = f"kind/ours {got['kind']}/{got['ours']}, control {kind}/{want_ours}"
                 self.ours += want_ours
+            elif diff is None and not triggers and new != unit:
+                diff = "no trigger fired, but control changed the unit"
             return new, diff and f"manual change: {diff}"
 
         raise AssertionError(do)
 
     def compare(self, ha: HA, automation: dict, trigger, overrides: dict, old: control.Unit,
                 new: control.Unit, command, now: datetime, echo: bool = True) -> str | None:
-        """Run one automation; its helpers and command must be control's, and
-        nothing is written or sent without a change."""
+        """Run one automation - once per trigger, if given a list of the
+        triggers that fired - and its helpers and command must be control's,
+        with nothing written or sent without a change."""
         before = ha.climate()
         ha.calls = []
-        self.last_vars = ha.run(automation, trigger, overrides)
-        self.runs += 1
+        self.first_rendered = None
+        for i, t in enumerate(trigger if isinstance(trigger, list) else [trigger]):
+            self.last_vars = ha.run(automation, t, overrides)
+            if i == 0:
+                self.first_rendered = ha.rendered
+            self.runs += 1
         self.steps += 1
         got, want = _view(ha, now), _control_view(new, now)
         if got != want:
@@ -519,11 +561,12 @@ class Replay:
         snapshot = _view(ha, now)
         ha.calls = []
         manual = g.build_manual_change_automation(config, room, room["units"][0])
-        ran = ha.run(manual, _trigger(before, after))
         self.echoes += 1
-        if ran is not None or _view(ha, now) != snapshot or not ha.rendered[
-                g._unit_var(room["units"][0])]["ours"]:
-            return f"the manual-change automation took the echo {before} -> {after} for a person"
+        for t in fired(manual, _trigger(before, after)):
+            if ha.run(manual, t) is not None or _view(ha, now) != snapshot or not ha.rendered[
+                    g._unit_var(room["units"][0])]["ours"]:
+                return (f"the manual-change automation took the echo {before} -> {after} "
+                        "for a person")
         return None
 
 
@@ -638,21 +681,30 @@ def _extra_cases() -> int:
            "blocked comes from one place and is false until phase 5")
 
     manual = g.build_manual_change_automation(config, room, room["units"][0])
+    expect(manual["trigger"] == manual_triggers(ENTITY),
+           "manual change triggers on mode changes (to: null) and on the temperature and "
+           "fan_mode attributes, nothing else")
+    reading = _trigger(control.Climate("cool", 22.0, "low"), control.Climate("cool", 22.0, "low"))
+    reading["from_state"]["attributes"]["current_temperature"] = 24.1
+    reading["to_state"]["attributes"]["current_temperature"] = 24.3
+    expect(fired(manual, reading) == [], "a current_temperature update fires no trigger")
     person = (control.Climate("cool", 22.0, "low"), control.Climate("off", 22.0, "low"))
     for what, trig, guard in (
             ("a change carrying a parent context", _trigger(*person, parent_id="x"), "off"),
             ("a change while the guard is up", _trigger(*person), "on"),
             ("a unit coming back from unavailable",
              _trigger(control.Climate("unavailable"), person[1]), "off"),
-            ("a unit dropping out", _trigger(person[0], control.Climate("unknown")), "off"),
-            ("a current_temperature change", _trigger(person[0], person[0]), "off")):
+            ("a unit dropping out", _trigger(person[0], control.Climate("unknown")), "off")):
         ha, config, room = world(cool)
         ha.set(g.guard_id(ROOM), guard)
-        expect(ha.run(manual, trig) is None, f"manual change ignores {what}")
+        triggers = fired(manual, trig)
+        expect(bool(triggers) and all(ha.run(manual, t) is None for t in triggers),
+               f"manual change ignores {what}")
     ha, config, room = world(cool)
-    expect(ha.run(manual, _trigger(*person)) is not None
+    triggers = fired(manual, _trigger(*person))
+    expect(len(triggers) == 1 and ha.run(manual, triggers[0]) is not None
            and ha.states(g.state_id(ROOM, UNIT)) == "user_off",
-           "manual change takes a person's off")
+           "manual change takes a person's off (one trigger: the mode)")
     return fails
 
 
@@ -665,7 +717,8 @@ def main() -> int:
     passed = sum(1 for why in failures.values() if not why)
     print(f"{passed}/{len(table.SCENARIOS)} scenarios: the generated automations match "
           f"app.control ({replay.steps} template runs, {replay.echoes} echoes ignored, "
-          f"{replay.kinds} changes' kind and is-this-ours checked, {replay.ours} of them ours; "
+          f"{replay.kinds} changes' kind and is-this-ours checked, {replay.ours} of them ours, "
+          f"{replay.twice} firing two triggers; "
           f"{len(replay.skipped)} knob steps not replayed: {sorted(set(replay.skipped))})")
     fuzz = _fuzz_votes(40)
     print("other cases:")

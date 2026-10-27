@@ -100,6 +100,15 @@ class HARest:
                            data: dict | None = None) -> Any:
         return await self._post(f"/api/services/{domain}/{service}", data or {})
 
+    async def render_template(self, template: str) -> str:
+        """POST /api/template: Home Assistant renders a template with its own
+        Jinja and returns the text (used by the doctor's v2 preflight)."""
+        r = await (await self._c()).post(f"{self.url}/api/template", json={"template": template})
+        if r.status_code == 401:
+            raise HAAuthError("token rejected by Home Assistant")
+        r.raise_for_status()
+        return r.text
+
     # --- automation config editor API (used by deploy.py) -----------
     # These are the same endpoints Home Assistant's own frontend
     # automation editor uses (GET/POST/DELETE /api/config/automation/

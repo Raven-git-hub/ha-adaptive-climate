@@ -12,6 +12,7 @@ sections).
     export AC_CONFIG=examples/config.example.json
 
     PYTHONPATH=. python tools/doctor.py
+    PYTHONPATH=. python tools/doctor.py --v2-preflight    # before the v2 cutover
 
 Checks, in order:
   1. REST /api/ reachable, token accepted
@@ -23,19 +24,34 @@ Checks, in order:
      the state machine needs; sensors exist; fan mode reported per unit
      while the unit is in `cool` (see docs/HARDWARE.md)
 
+  7. (--v2-preflight) the Home Assistant behaviour v2's generated helpers
+     and templates rely on, tried for real on throwaway ac_preflight_*
+     helpers created and deleted through the same helper API deploy uses:
+       - input_datetime.set_datetime with a timestamp round-trips through
+         the timestamp attribute
+       - an input_number shaped like ac_base_* accepts 0 and a mid-range value
+       - HA's own Jinja (the template API) renders state_attr(..., 'timestamp'),
+         the trigger-style s.attributes.get(...) snapshot the manual-change
+         automation uses, and now().timestamp()
+     The helpers are deleted afterwards, and leftovers from an earlier run
+     first, whatever fails in between.
+
 Exits non-zero on the first hard failure. Reports (does not fail on) mode
 gaps and sensors that are currently unavailable.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app import generator as g                                 # noqa: E402
 from app.ha import HARest, HAWebSocket, HAAuthError, HAError  # noqa: E402
 
 REQUIRED_HVAC = ("cool", "dry", "off")   # cool and boost, leak, rest and the off states
@@ -47,8 +63,146 @@ OK, FAIL, WARN = f"{GREEN}\u2713{RESET}", f"{RED}\u2717{RESET}", f"{YELLOW}!{RES
 def line(marker, msg):  print(f"  {marker} {msg}")
 
 
+# ---------------------------------------------------------------------
+# v2 preflight
+# ---------------------------------------------------------------------
+
+PREFLIGHT_PREFIX = "ac_preflight_"
+PREFLIGHT_DOMAINS = ("input_datetime", "input_number")
+ITEM_DATETIME = "input_datetime: set_datetime with a timestamp round-trips"
+ITEM_NUMBER = "input_number (0-100, step 0.5, as ac_base_*): accepts 0 and 23.5"
+ITEM_TEMPLATE = "template API: timestamp attribute, .attributes.get, now()"
+ITEM_CLEANUP = "throwaway helpers deleted, nothing left behind"
+
+
+async def _state_attr(rest, entity_id: str, attribute: str | None = None, tries: int = 10):
+    """An entity's state (or one attribute), waiting briefly for a helper
+    that was only just created or changed."""
+    last = None
+    for _ in range(tries):
+        try:
+            s = await rest.state(entity_id)
+            last = s.get("state") if attribute is None else (s.get("attributes") or {}).get(attribute)
+            if last not in (None, "unknown"):
+                return last
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+    return last
+
+
+async def _clear_preflight(ws) -> tuple[list[str], list[str]]:
+    """Try to delete every ac_preflight_* helper, carrying on past one that
+    fails. Returns (removed, still there)."""
+    removed, failed = [], []
+    for domain in PREFLIGHT_DOMAINS:
+        for item in await ws.list_helpers(domain):
+            oid = item.get("id") or item.get("object_id") or ""
+            if not oid.startswith(PREFLIGHT_PREFIX):
+                continue
+            try:
+                await ws.delete_helper(domain, oid)
+                removed.append(f"{domain}.{oid}")
+            except Exception:
+                failed.append(f"{domain}.{oid}")
+    return removed, failed
+
+
+async def v2_preflight(rest, ws) -> list[tuple[str, bool, str]]:
+    """Try, on throwaway helpers, the Home Assistant behaviour v2 relies on.
+    Returns (item, passed, detail) for each item; the helpers are always
+    deleted, and the last item says whether that worked."""
+    results: list[tuple[str, bool, str]] = []
+    dt_name, num_name = f"{PREFLIGHT_PREFIX}since", f"{PREFLIGHT_PREFIX}base"
+    lo, hi, step = g.BASE_RANGE     # the ac_base_* helper's shape (ITEM_NUMBER names it)
+    stamp = int(time.time()) - 3 * 86400 + 37        # whole seconds, well clear of the default
+    try:
+        leftovers, stuck = await _clear_preflight(ws)
+        if stuck:
+            raise HAError(f"could not remove leftovers from an earlier run: {', '.join(stuck)}")
+        if leftovers:
+            results.append(("leftovers from an earlier run removed", True, ", ".join(leftovers)))
+
+        dt = await ws.create_helper("input_datetime",
+                                    {"name": dt_name, "has_date": True, "has_time": True})
+        num = await ws.create_helper("input_number", {"name": num_name, "min": lo, "max": hi,
+                                                      "step": step, "mode": "box"})
+        dt_id = f"input_datetime.{(dt or {}).get('id') or dt_name}"
+        num_id = f"input_number.{(num or {}).get('id') or num_name}"
+
+        # 1. set_datetime(timestamp) -> the timestamp attribute
+        try:
+            await rest.call_service("input_datetime", "set_datetime",
+                                    {"entity_id": dt_id, "timestamp": stamp})
+            got = await _state_attr(rest, dt_id, "timestamp")
+            ok = got is not None and float(got) == float(stamp)
+            results.append((ITEM_DATETIME, ok, f"sent {stamp}, timestamp attribute {got}"))
+        except Exception as e:
+            results.append((ITEM_DATETIME, False, f"{type(e).__name__}: {e}"))
+
+        # 2. an ac_base_*-shaped input_number takes 0 and a setpoint
+        try:
+            seen = []
+            for value in (0, 23.5):
+                await rest.call_service("input_number", "set_value",
+                                        {"entity_id": num_id, "value": value})
+                for _ in range(10):
+                    state = await _state_attr(rest, num_id)
+                    if state is not None and float(state) == value:
+                        break
+                    await asyncio.sleep(0.3)
+                seen.append(state)
+            ok = [float(v) if v not in (None, "unknown") else None for v in seen] == [0.0, 23.5]
+            results.append((ITEM_NUMBER, ok, f"read back {seen}"))
+        except Exception as e:
+            results.append((ITEM_NUMBER, False, f"{type(e).__name__}: {e}"))
+
+        # 3. HA's own Jinja, through the template API
+        try:
+            checks = []
+            text = await rest.render_template(f"{{{{ state_attr('{dt_id}', 'timestamp') | int }}}}")
+            checks.append(("state_attr timestamp", text.strip() == str(stamp), text.strip()))
+            # the manual-change automation's snapshot of trigger.from_state /
+            # to_state, over a state object read the same way
+            snap_src = g._climate_snapshot(f"states.{dt_id}")
+            snap = ast.literal_eval((await rest.render_template(snap_src)).strip())
+            want = {"mode": None, "temperature": None, "fan": None}
+            got_dt = await _state_attr(rest, dt_id)
+            want["mode"] = got_dt
+            checks.append(("s.attributes.get snapshot", snap == want, repr(snap)))
+            attr = await rest.render_template(
+                f"{{%- set s = states.{dt_id} -%}}{{{{ s.attributes.get('timestamp') | int }}}}")
+            checks.append((".attributes.get('timestamp')", attr.strip() == str(stamp), attr.strip()))
+            now_text = (await rest.render_template(g.NOW_TS)).strip()
+            skew = abs(int(now_text) - int(time.time()))
+            checks.append((f"now().timestamp() | int (clock skew {skew}s)", skew < 300, now_text))
+            ok = all(c[1] for c in checks)
+            results.append((ITEM_TEMPLATE, ok,
+                            "; ".join(f"{n}: {'ok' if p else 'got ' + v}" for n, p, v in checks)))
+        except Exception as e:
+            results.append((ITEM_TEMPLATE, False, f"{type(e).__name__}: {e}"))
+    except Exception as e:
+        results.append(("create the throwaway helpers", False, f"{type(e).__name__}: {e}"))
+        done = {item for item, _, _ in results}
+        results += [(item, False, "not run: the helpers could not be created")
+                    for item in (ITEM_DATETIME, ITEM_NUMBER, ITEM_TEMPLATE) if item not in done]
+    finally:
+        try:
+            for _ in range(3):                         # sweep until a pass finds nothing
+                removed, stuck = await _clear_preflight(ws)
+                if not removed and not stuck:
+                    break
+            results.append((ITEM_CLEANUP, not removed and not stuck,
+                            ", ".join(removed + stuck) or f"{PREFLIGHT_PREFIX}* gone"))
+        except Exception as e:
+            results.append((ITEM_CLEANUP, False,
+                            f"{type(e).__name__}: {e}; delete {PREFLIGHT_PREFIX}* helpers "
+                            "by hand (Settings > Devices & services > Helpers)"))
+    return results
+
+
 async def _run(url: str, token: str, verify_ssl: bool,
-               config_path: str | None) -> int:
+               config_path: str | None, preflight: bool = False) -> int:
     print(f"\nAdaptive Climate doctor -> {url}")
     print("=" * 62)
 
@@ -190,6 +344,13 @@ async def _run(url: str, token: str, verify_ssl: bool,
                         unit = e.get("attributes", {}).get("unit_of_measurement")
                         line(OK, f"    sensor {s['entity_id']} = {e['state']} {unit or ''}")
 
+    # --- 7. v2 preflight (opt-in) ----------------------------------
+    if preflight:
+        print("\nv2 preflight (throwaway ac_preflight_* helpers)")
+        for item, passed, detail in await v2_preflight(rest, ws):
+            line(OK if passed else FAIL, f"{item}: {detail}")
+            hard_failures += not passed
+
     await ws.close()
     await rest.close()
 
@@ -210,10 +371,11 @@ def main() -> int:
     token = os.environ.get("AC_HA_TOKEN")
     verify_ssl = os.environ.get("AC_HA_VERIFY_SSL", "true").lower() != "false"
     config = os.environ.get("AC_CONFIG")
+    preflight = "--v2-preflight" in sys.argv[1:]
     if not url or not token:
         print("Set AC_HA_URL and AC_HA_TOKEN first."); return 2
     try:
-        return asyncio.run(_run(url, token, verify_ssl, config))
+        return asyncio.run(_run(url, token, verify_ssl, config, preflight))
     except KeyboardInterrupt:
         return 130
 

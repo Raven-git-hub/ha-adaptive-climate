@@ -69,6 +69,7 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
 ### Key docs
 
 - `docs/V2_DESIGN.md` — v2 design and build plan; on branch `v2` it overrides the docs below where they conflict
+- `docs/V2_CUTOVER.md` — the v1 → v2 cutover runbook, with checks and rollback
 - `docs/DESIGN.md` — inherited principles + climate-specific departures (read after V2_DESIGN.md)
 - `docs/TRUST_MODEL.md` — the sensor trust model and quorum, with a worked example
 - `docs/ALMANAC_FORMAT.md` — the almanac JSON contract shared across modules
@@ -110,6 +111,7 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
 
 ```bash
 python tools/doctor.py                     # check a real Home Assistant (6-step diagnostic; needs live HA)
+python tools/doctor.py --v2-preflight      # ...plus v2's helper/template behaviour, on throwaway ac_preflight_* helpers
 python tools/sweep.py                       # a year of section-boundary computation
 python tools/store_check.py                 # store writes + reads, into the analyser; migrations
 python tools/config_check.py                # config v1 -> v2 migration, defaults, validation

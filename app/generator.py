@@ -740,8 +740,16 @@ def build_manual_change_automation(config: dict, room: dict, unit: dict) -> dict
         "alias": f"AC {room.get('name', r)} — manual change ({unit.get('name', u)})",
         "mode": "queued",
         "max": 10,
-        # no to/from: attribute changes (the setpoint, the fan) fire it too
-        "trigger": [{"platform": "state", "entity_id": unit["entity_id"]}],
+        # Mode changes (to: null fires on state changes only), and the two
+        # attributes a person changes: current_temperature updates don't fire
+        # it. A change that moves the mode and an attribute fires twice; the
+        # second run sees the first's helper writes, so it either finds the
+        # change is now "ours" or writes the same record again.
+        "trigger": [
+            {"platform": "state", "entity_id": unit["entity_id"], "to": None},
+            {"platform": "state", "entity_id": unit["entity_id"], "attribute": "temperature"},
+            {"platform": "state", "entity_id": unit["entity_id"], "attribute": "fan_mode"},
+        ],
         "variables": {
             **_live_section_variables(room), "now_ts": NOW_TS,
             "before": _climate_snapshot("trigger.from_state"),
