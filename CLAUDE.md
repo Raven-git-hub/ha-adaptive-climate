@@ -52,6 +52,7 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
 | Module | Responsibility |
 |---|---|
 | `app/trust.py` | Pure-function core: sensor trust, comfort band, quorum evaluation |
+| `app/control.py` | Pure-function control core: votes, the cool/boost/rest state machine, section changes, person reactions (rendered as Jinja in phase 3b) |
 | `app/analyser.py` | Deterministic replay of reactions from a seed: setpoints, applied setpoints, per-sensor comfort/band/trust, confidence |
 | `app/generator.py` | Builds HA helpers and automations (scene, maintenance, leak, watchdog) from config + almanac |
 | `app/scheduler.py` | Clock-only section-boundary computation (no sun-based triggers) |
@@ -113,6 +114,7 @@ python tools/analyser_demo.py               # reaction replay: worked examples +
 python tools/compare_analyser.py DATA_DIR   # frozen v1 vs v2 almanacs on a COPY of a data dir (migrates it)
 python tools/render_generated.py            # render helpers + automations
 python tools/maintenance_logic_check.py     # quorum + setpoint Jinja vs their Python references
+python tools/control_check.py              # control state machine scenarios; each rule removed must fail
 python tools/deploy_reconcile_check.py      # deploy create / reuse / prune
 python tools/runtime_check.py               # runtime observer + control loop
 python tools/leak_response_check.py         # leak detection / DRY / release automations
@@ -121,7 +123,7 @@ python tools/leak_response_check.py         # leak detection / DRY / release aut
 Run `PYTHONPATH=.` before these if invoking from outside the repo root (most
 scripts also self-insert the repo root via `sys.path`). These harnesses are
 the test suite in the absence of a live HA instance — run the relevant ones
-after touching `app/generator.py`, `app/trust.py`, `app/deploy.py`,
+after touching `app/generator.py`, `app/trust.py`, `app/control.py`, `app/deploy.py`,
 `app/scheduler.py`, `app/store.py`, or `app/runtime.py`.
 
 ## Local dev / Docker

@@ -126,9 +126,32 @@ def evaluate_quorum(
     only used to break a mixed-direction tie.
     """
     usable = [r for r in readings if r.usable]
-    required = quorum_required(len(usable))
+    voters = [(r.sensor_id, r.deviation or 0.0) for r in usable if r.votes()]
+    return _pooled(voters, len(usable), trusts)
 
-    voters = [r for r in usable if r.votes()]
+
+def evaluate_edges(
+    positions: dict[str, float | None],
+    trusts: dict[str, float] | None = None,
+    cold_edge: float = -1.0,
+    warm_edge: float = 1.0,
+) -> QuorumResult:
+    """The same pooled quorum and trust-weighted direction, over positions
+    in band widths ((reading - comfort) / band, None if unusable) against
+    a cold and a warm trigger edge. With the default edges a sensor votes
+    exactly when |reading - comfort| >= band; phase 5 passes leaned edges.
+    Used by app.control."""
+    usable = {sid: p for sid, p in positions.items() if p is not None}
+    voters = [(sid, p) for sid, p in usable.items() if p <= cold_edge or p >= warm_edge]
+    return _pooled(voters, len(usable), trusts)
+
+
+def _pooled(voters: list[tuple[str, float]], n_usable: int,
+            trusts: dict[str, float] | None) -> QuorumResult:
+    """voters: (sensor_id, signed drift), positive = too warm. One pooled
+    count against the quorum; the summed trust of each side picks the
+    direction, an exact tie meaning none."""
+    required = quorum_required(n_usable)
     tally = len(voters)
     met = required > 0 and tally >= required
 
@@ -137,9 +160,8 @@ def evaluate_quorum(
 
     trusts = trusts or {}
     warm_weight = cold_weight = 0.0
-    for r in voters:
-        d = r.deviation or 0.0
-        w = trusts.get(r.sensor_id, 0.0) + 1e-6   # tiny floor so untrusted still counts
+    for sid, d in voters:
+        w = trusts.get(sid, 0.0) + 1e-6   # tiny floor so untrusted still counts
         if d > 0:
             warm_weight += w        # too warm -> need to cool
         elif d < 0:
@@ -150,8 +172,7 @@ def evaluate_quorum(
     else:
         direction = "cool" if warm_weight > cold_weight else "warm"
 
-    return QuorumResult(met, tally, required, direction,
-                        tuple(r.sensor_id for r in voters))
+    return QuorumResult(met, tally, required, direction, tuple(sid for sid, _ in voters))
 
 
 # ---------------------------------------------------------------------

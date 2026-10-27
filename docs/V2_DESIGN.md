@@ -164,27 +164,30 @@ System transitions:
 - `cool` → `rest` when the quorum is met and the direction is too cold, or when cooling is blocked and the unit isn't unblocked.
 - `rest` → `cool` when back at comfort; offset +1. A rest doesn't wake while blocked.
 - Any state → `leak` when the leak sensor is wet. Leak beats everything, including a person turning the unit off. When the leak is fixed and confirmed, the unit is evaluated as at a section change.
-- **Section change:** offsets reset to 0, base = `setpoint_applied`, and `ac_unblocked` is cleared. Each unit starts in `config_off` if the section's scene forces it off, otherwise in `rest` if cooling is blocked, otherwise in `cool`. `user_off` and `manual` end here; a unit in `leak` stays there. A section change overrides minimum times.
+- **Section change:** offsets reset to 0, base = `setpoint_applied`, `since` = now, and `ac_unblocked` and `ac_grace_until` are cleared. Each unit starts in `config_off` if the section's scene forces it off, otherwise in `rest` if cooling is blocked, otherwise in `cool`. `user_off` and `manual` end here; a unit in `leak` stays there, and dry is sent again. A section change overrides minimum times.
 
 ### Person reactions
 
 The manual-change automation applies these per unit, straight away, so they hold even while the container is down. The container records the same change as a reaction for learning.
 
-- **Setpoint change:** base = the chosen value, offset 0, state `cool`, `since` = now. The grace period applies.
+- **Setpoint change, unit on:** base = the chosen value, offset 0, state `cool`, `since` = now. The grace period starts.
+- **Setpoint change, unit off:** the state stays as it is (`rest` stays `rest`, `user_off` stays `user_off`, and so on), base = the chosen value and offset 0. No grace period starts and `since` is kept, so a rest still keeps its minimum time. The new base applies the next time the unit cools.
 - **Turned off:** state `user_off`.
-- **Turned on:** state `cool`, base = the unit's current setpoint, offset 0, `since` = now. The grace period applies. `input_boolean.ac_unblocked_<room>_<unit>` turns on, so the cooling block is ignored for that unit for the rest of the section.
+- **Turned on:** state `cool`, base = the unit's current setpoint, offset 0, `since` = now. The grace period starts. `input_boolean.ac_unblocked_<room>_<unit>` turns on, so the cooling block is ignored for that unit for the rest of the section.
 - **Mode or fan change while on:** state `manual`. Logged, not learned.
-- **While a leak is latched,** none of these change the state: it stays `leak`.
+- **While a leak is latched,** none of these change anything: it stays `leak`.
+- **The knob (phase 8):** a turn counts as a setpoint change; a press changes nothing here.
 
-The **grace period**, `system.control.person_grace_minutes` (default 30) counted from `since`, blocks any transition into `boost` or `rest` until it ends.
+The **grace period** runs until `input_datetime.ac_grace_until_<room>_<unit>`, which a person's setpoint change or turn-on sets to now + `system.control.person_grace_minutes` (default 30). Until then the unit is held in `cool`: no transition into `boost` or `rest`, a cooling block included. A leak still wins, and a section change clears it.
 
 ### Rules
 
-- **Quorum, exactly as in v1:** one pooled count. A sensor votes when it is past either of its leaned trigger edges, and votes on both sides count toward the same tally. 1 usable sensor needs 1 vote, 2 need 2, 3 or more need at least half. When the quorum is met, the trust-weighted majority of the voters' sides picks the direction; an exact tie means no action.
-- **Release:** a boost or rest ends when the pooled count of sensors still on the triggering side of their comfort readings falls below the quorum.
+- **Quorum, exactly as in v1:** one pooled count. A sensor votes when it is past either of its leaned trigger edges, and votes on both sides count toward the same tally. 1 usable sensor needs 1 vote, 2 need 2, 3 or more need at least half. When the quorum is met, the trust-weighted majority of the voters' sides picks the direction, `too_warm` or `too_cold`; an exact tie is `none`, which means no action.
+- **Release:** a boost or rest ends when the pooled count of sensors still on the triggering side of their comfort readings falls below the quorum, counted as at least 1. With no usable sensor, a rest wakes into `cool` rather than wait for ever.
 - **Boost cap:** `system.control.boost_max_minutes` (default 60). The unit then returns to `cool` at −1; if the room is still too warm next heartbeat, another boost can start, so it steps down gradually.
 - **Offsets and limits:** the offset moves in whole steps and is capped at ±3 on its own. The boost step, `system.control.boost_degrees` (default 2), goes on top, and the final command is clamped to the unit's own range (18 to 30° for the baby room, 16 to 30° for the others).
-- **Minimum times:** counted in heartbeats, to protect the compressor: at least 1 in `cool` or `boost`, at least 2 in `rest`. A minimum of n heartbeats is met when the time since `since` is at least (n − 0.5) × the heartbeat interval, which is 5 and 15 minutes at the default 10-minute interval. A section change overrides them.
+- **Minimum times:** counted in heartbeats, to protect the compressor: at least 1 in `cool` or `boost` (a boost that a block sends to `rest` included), at least 2 in `rest`. A minimum of n heartbeats is met when the time since `since` is at least (n − 0.5) × the heartbeat interval, which is 5 and 15 minutes at the default 10-minute interval. A section change and a leak override them.
+- **No seed:** while a unit has neither a base nor a `setpoint_applied`, maintenance leaves it alone and a section change resets its fields without a command. A leak still drives it to dry, with no temperature, and a leak released before there is an almanac leaves it cooling at its current setpoint.
 - **Commands:** sent only on transitions and at section changes, never re-sent every heartbeat. Maintenance raises `ac_active` around every command, as scenes do.
 - **Fan:** low in `cool`, medium in `boost`. A fan call the unit's current mode rejects is skipped, not fatal (as in v1).
 - **Pause:** while `ac_hold_<room>` is on, scenes and maintenance send no commands. Only a person turns it on or off.
@@ -265,7 +268,7 @@ The container decides once per section; Home Assistant acts at every heartbeat. 
 
 - **Scene automation, per room and section:** raises `ac_active`, records the section, and sets each unit's base, offset, `since`, `ac_unblocked` and state as at a section change, then sends the commands. A unit with no seed is left alone. While `ac_hold` is on, it sends no commands.
 - **Maintenance automation, every heartbeat:** reads the almanac, the conditions entity and each unit's helpers. It counts the pooled quorum against the published edges and runs the state machine. On a transition it raises `ac_active`, writes the helpers, sends the commands and lowers `ac_active`.
-- **Manual-change automation, per unit:** catches a person's change (no `context.parent_id`, `ac_active` off) and applies the [person reactions](#person-reactions) straight away. It ignores a change that matches what the state helper already implies: `rest`, `user_off` or `config_off` → off; `cool` or `boost` → cool; `leak` → dry. That keeps a late echo of our own command from looking like a person.
+- **Manual-change automation, per unit:** catches a person's change (no `context.parent_id`, `ac_active` off) and applies the [person reactions](#person-reactions) straight away, reading whether the unit is on after the change. It ignores a change that matches what the state helper already implies: `rest`, `user_off` or `config_off` → off; `cool` or `boost` → cool; `leak` → dry. That keeps a late echo of our own command from looking like a person.
 - **Leak automations, per unit:** set the state helper to `leak` when the sensor trips. On a confirmed release, they evaluate the unit as at a section change.
 - **Heat sources:** the generator writes the room's heat-source entities into the maintenance template, which checks them directly. A heater switching on blocks cooling without waiting for the container.
 
@@ -276,7 +279,8 @@ The container decides once per section; Home Assistant acts at every heartbeat. 
 | `input_select.ac_state_<room>_<unit>` | Unit, new | `cool`, `boost`, `rest`, `user_off`, `manual`, `config_off`, `leak` |
 | `input_number.ac_base_<room>_<unit>` | Unit, new | The section's base setpoint: `setpoint_applied` at the section change, or what a person chose. Created at 0, which means unset |
 | `input_number.ac_offset_<room>_<unit>` | Unit, new | Section-scoped offset, −3 to +3 in whole steps. Created at 0 |
-| `input_datetime.ac_since_<room>_<unit>` | Unit, new | When the current state began (boost cap, minimum times, person grace). Set to now on creation |
+| `input_datetime.ac_since_<room>_<unit>` | Unit, new | When the current state began (boost cap, minimum times). Set to now on creation |
+| `input_datetime.ac_grace_until_<room>_<unit>` | Unit, new | When a person's grace period ends: their setpoint change or turn-on + `person_grace_minutes`. Cleared at a section change; a past or unset value means no grace |
 | `input_boolean.ac_unblocked_<room>_<unit>` | Unit, new | A person turned the unit on during a block; the block is ignored for it until the section changes |
 | `sensor.ac_conditions_<room>` | Room, new | Outdoor values, comfort point, block decision, per-sensor edges |
 | `ac_active`, `ac_scene`, `ac_almanac` | Room, kept | As in v1 |
@@ -291,7 +295,7 @@ The container decides once per section; Home Assistant acts at every heartbeat. 
 
 ### One logic, checked twice
 
-The state machine, including person reactions, leak precedence and minimum times, lives in a new pure-Python module, `app/control.py`. The generator renders the same logic as Jinja, and a check harness runs both on the same inputs and diffs them, extending today's `tools/maintenance_logic_check.py` pattern.
+The state machine, including person reactions, leak precedence and minimum times, lives in a pure-Python module, `app/control.py` (phase 3a). The generator renders the same logic as Jinja (phase 3b). `tools/control_check.py` holds the scenario table, as plain values in vote, step, section-change and person-change steps; 3b replays the same table against the rendered templates, extending today's `tools/maintenance_logic_check.py` pattern. The check also removes each rule in turn and requires the scenarios that guard it to fail.
 
 ## UI
 
@@ -405,8 +409,8 @@ Phases 0 to 5 are built and checked offline against the existing harnesses, then
 | 0 · Foundations | Storage migrations (`user_version`, backup first, checked transaction, rollback; `almanac` and `event` rebuilt); `section_run` written to CSV; every v2 config key with defaults, and the v1 config migration; `setpoint_before` keeps the first value in a window | `store_check` migrates a v1 database keeping every row, finds it identical to a fresh one, and sees a forced failure leave it untouched; `config_check` migrates the v1 example to exactly the v2 example; a three-step setpoint change records its first `setpoint_before` |
 | 1 · Learning flip | Analyser becomes a replay of reactions from per-unit and per-sensor seeds; rounding toward the latest setpoint-moving reaction; comfort from accepted readings; confidence; the runtime's provisional seeding retired | `analyser_demo` applies a 1° correction the next day; `compare_analyser` diffs v1 and v2 almanacs |
 | 2 · On/off as reactions | Runtime detects a person turning units on or off, or changing mode or fan; reaction kind stored per unit and room; a unit coming back from unavailable changed is logged | `runtime_check` records person on/off and still ignores the system's own changes; on plus a setpoint change in one window is one `on` reaction |
-| 3a · Cool-or-rest control | `app/control.py`, generator Jinja, the new unit helpers and the manual-change automation; maintenance raises the guard; the Warming/fan_only path is removed | Jinja matches `app/control.py` for every state, edge and person reaction |
-| 3b · Deploy and leak | `input_number` (and `input_boolean`) helper domains, created at 0; every `ac_since_*` set to now on creation; leak automations write the state helper; the runtime's reaction detector also ignores a change that matches what the unit's state helper implies (`rest` → off, and so on), as the manual-change automation does | `deploy_reconcile_check` creates the new helpers with the right initial values; `leak_response_check` still passes |
+| 3a · Control core | `app/control.py`: votes, the state machine, section changes and person reactions as pure functions; `app.trust.evaluate_edges` | `control_check` runs the scenario table, and each rule's scenarios fail when it is removed |
+| 3b · Cool-or-rest in HA, deploy and leak | Generator Jinja for maintenance, scenes and the manual-change automation, with the new unit helpers; maintenance raises the guard; the Warming/fan_only path is removed. `input_number` (and `input_boolean`) helper domains, created at 0; every `ac_since_*` set to now on creation; leak automations write the state helper; the runtime's reaction detector also ignores a change that matches what the unit's state helper implies (`rest` → off, and so on), as the manual-change automation does | The rendered Jinja matches `app/control.py` on every `control_check` scenario; `deploy_reconcile_check` creates the new helpers with the right initial values; `leak_response_check` still passes |
 | 4 · Outdoor input | Forecast or probe; outdoor value stored on heartbeats, reactions and section runs | The doctor lists weather entities with an hourly forecast; `store_check` sees the new columns |
 | 5 · Lean and block, in shadow | Conditions entity with per-sensor edges; block decisions and margin learning logged, not applied | Published edges reproduce the lean table; shadow decisions appear in the log |
 | **Gate A** | CSV re-ingest works; then cutover: deploy v2 to HA, block in shadow | SQLite rebuilt from CSV alone gives the same almanac |
@@ -494,3 +498,18 @@ From phase 2, 27 Oct 2026:
 37. **Kind decides an `on`'s band direction**: an `on` that also changes the setpoint learns its band as cooler wanted, even if the new setpoint is higher. Its rounding direction still follows how S moved.
 38. **Unavailable/unknown transitions are not reactions.** A unit that comes back in a different power, mode, setpoint or fan from the one it dropped out in is logged as a `control` warning event (it may have been reset by a power cut, or changed on its remote while HA couldn't see it), still not a reaction. Nothing is logged if it was already out when the runtime started.
 39. **Margin-learning inputs are stored now**: room and unit kind, `power_before/after`, the reaction time and section. Control state and `since` (phase 3), the outdoor value (phase 4) and the block decision (phase 5) fill columns that already exist.
+
+From phase 3a, 27 Oct 2026:
+
+40. **Phase 3 is built in two parts.** 3a is `app/control.py` alone, with no generator, runtime or HA change; 3b renders it as Jinja and does the deploy and leak work. The build plan rows are split to match.
+41. **Vote direction is named for the side the room is on:** `too_warm`, `too_cold` or `none`. `app.trust` names what the room needs (`cool` for too warm, `warm` for too cold), so `app/control.py` maps one to the other in a single table, and the 3b Jinja and the scenario table use the control names.
+42. **A vote is a position in band widths**, (reading − comfort) / band, against a cold edge of −1 and a warm edge of +1, which phase 5 leans. At those edges it is v1's |reading − comfort| ≥ band except for float rounding exactly on the boundary; the 3b Jinja does the same division, so the two match. `app.trust.evaluate_edges` shares the pooled count and trust-weighted direction with `evaluate_quorum`, whose behaviour is unchanged.
+43. **Votes are read from an almanac-shaped section entry**, as HA reads it. A sensor with no comfort reading can't vote, and a missing band counts as 5.0, the low-trust width, as in the v1 template.
+44. **A leak comes before the no-seed rule.** A leak drives the unit to dry even with no base, leaving its temperature as it is, as v1's leak automation does: safety doesn't wait for an almanac.
+45. **A leak release is a full section change:** resets, state and command. A section change with the leak latched sends dry again, as v1's crossover safety fix does. A leak released before there is an almanac goes to `cool` at the unit's current setpoint rather than stay in dry.
+46. **A section change with no `setpoint_applied`** still resets the offset, base, `since`, grace and unblock, but keeps the state and sends nothing.
+47. **The minimum time also gates boost → rest on a block.** Where the phase brief and this document differed, the document won: minimum times apply to `boost`. A section change and a leak still override them.
+48. **Release counts against at least one.** With no usable sensor the quorum is 0, so a rest would never wake; the baby room resting all night on a dead sensor is the risk. With the floor it wakes into `cool`, which is the plain setpoint.
+49. **Grace has its own helper**, `input_datetime.ac_grace_until_<room>_<unit>` (created in 3b), set to the person's change + `person_grace_minutes` and cleared at a section change, instead of being counted from `since`, which minimum times and the boost cap also use. It only ever holds a unit in `cool`, because only a setpoint change or turn-on with the unit on starts it, and both leave the unit in `cool`. It holds against a cooling block as well as votes; a leak still wins.
+50. **A setpoint change on a unit that is off keeps its state**, replacing "state `cool`" in Person reactions: `rest` stays `rest`, `user_off` stays `user_off`, and so on. Base = the new setpoint and offset 0, with no grace and `since` kept, so the new base applies the next time the unit cools. The manual-change automation therefore passes the unit's power after the change. In `user_off` or `config_off` the stored base rarely matters, since a turn-on sets the base to the unit's current setpoint and a section change resets it.
+51. **The knob:** a turn counts as a setpoint change and a press changes nothing in control, ready for phase 8.
