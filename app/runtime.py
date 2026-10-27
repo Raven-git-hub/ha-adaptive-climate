@@ -19,6 +19,7 @@ Observation (passive):
 
 Learning (docs/V2_DESIGN.md, Rebuilding) - replay_room() re-runs the
 reaction replay for a room and pushes the result:
+  * at startup, for every room, before any crossover (catch-up included);
   * right after each recorded reaction;
   * 65 minutes after each setpoint-moving reaction, once its comfort window
     has closed (re-armed at startup for reactions in the last 65 minutes);
@@ -218,6 +219,14 @@ class Runtime:
         self.ws.on_reconnect(self._resubscribe)
         self.ws.on_status(self._on_ws_status)
         await self.ws.subscribe_states(self._on_state_change)
+
+        # Replay every room and push its almanac before any crossover can
+        # fire, catch-up included: after a migration the almanac is empty,
+        # and a crossover that finds no setpoint_applied leaves every unit
+        # as it is (in manual). Waiting for the first heartbeat's replay
+        # left a crossover three minutes after startup with nothing.
+        for room_id in self.rooms:
+            await self.replay_room(room_id, "startup")
 
         # initial catch-up crossover for every room
         _, _, _, now = self._now()

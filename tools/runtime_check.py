@@ -17,6 +17,9 @@ Store (no Home Assistant, no network). Verifies:
   * a late echo of our own command (what the unit's state helper implies)
     is ignored, while a setpoint change made while resting is recorded
   * a heartbeat records the unit's control_state and control_offset
+  * startup replays every room and pushes its almanac before any
+    crossover: started 3 minutes before 22:00 with an empty almanac but
+    history in the store, the Sleep crossover finds setpoint_applied
   * several changes in one reactive window record the first setpoint_before
   * a sleep section run crossing midnight closes against its start date
   * on restart, comfort-window replays are re-armed for recent setpoint-moving
@@ -30,7 +33,7 @@ import asyncio
 import json
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -38,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app.runtime as runtime_mod                               # noqa: E402
 from app.runtime import Runtime                                  # noqa: E402
-from app.store import Store                                      # noqa: E402
+from app.store import Store, UnitSample                          # noqa: E402
 from app.generator import SECTIONS                               # noqa: E402
 
 SCHEMA = Path(__file__).resolve().parent.parent / "schema" / "storage.schema.sql"
@@ -87,6 +90,7 @@ class StubRest:
         self._states = states
         self.service_calls = []
         self.set_states = []
+        self.log = []               # service calls and state pushes, in order
     async def config(self):
         return {"time_zone": "Asia/Hong_Kong", "version": "2026.7.4",
                 "unit_system": {"temperature": "\u00b0C"}}
@@ -94,8 +98,10 @@ class StubRest:
         return self._states
     async def call_service(self, domain, service, data=None):
         self.service_calls.append((domain, service, data or {}))
+        self.log.append(("service", domain, service, data or {}))
     async def set_state(self, entity_id, state, attributes=None):
         self.set_states.append((entity_id, state, attributes or {}))
+        self.log.append(("set_state", entity_id, attributes or {}))
     async def close(self):
         pass
 
@@ -179,8 +185,10 @@ async def main() -> int:
     # --- no provisional seeding at crossover any more ---
     for r in rt.rooms:
         assert store.current_almanac(r, as_of=rt._today())["sections"] == {}, r
-    assert not store.recent_events(category="analysis")
-    print("startup: no provisional almanac seeded at crossover; nothing replayed yet - OK")
+        assert len(replays(store, r, "startup")) == 1, r
+    assert len(store.recent_events(category="analysis")) == 3
+    print("startup: each room replayed once (no history yet: an empty almanac); no "
+          "provisional almanac seeded at crossover - OK")
 
     # --- heartbeat sampling ---
     rs = rt.rooms["main_room"]
@@ -205,7 +213,8 @@ async def main() -> int:
     assert pushed[2]["sections"][sec]["units"]["main_room_ac"]["setpoint_applied"] == 22.0
     await asyncio.sleep(1.05)                    # heartbeats are unique per second
     await rt._do_heartbeat(rs)                   # nothing new to seed: no replay
-    assert len(store.recent_events(room_id="main_room", category="analysis")) == 1
+    assert len([e for e in store.recent_events(room_id="main_room", category="analysis")
+                if (e.get("detail") or {}).get("reason") != "startup"]) == 1
     print(f"heartbeat: the first one in '{sec}' replayed and pushed a provisional almanac "
           f"(applied 22); the next one, with nothing new to seed, did not - OK")
 
@@ -475,8 +484,70 @@ async def main() -> int:
           "one or the manual one), and it ran - OK")
     await rt2.stop()
     store.close()
+    await check_startup_race()
     print("\nALL RUNTIME CHECKS PASSED")
     return 0
+
+
+async def check_startup_race() -> None:
+    """Migration leaves the almanac empty; the history is in the store.
+    Started at 21:57, three minutes before the 22:00 Sleep boundary, the
+    Sleep crossover must find setpoint_applied in what HA holds: startup
+    replays and pushes every room before any crossover can fire."""
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+    tmp = Path(tempfile.mkdtemp())
+    store = Store(tmp, SCHEMA)
+    for room in CONFIG["rooms"]:                  # last night's Sleep, every unit on at 23
+        for minute in (10, 20, 30):
+            t = datetime(2026, 8, 2, 22, minute, tzinfo=hk)
+            store.record_heartbeat(
+                room["id"], t.isoformat(timespec="seconds"),
+                t.astimezone(utc).isoformat(timespec="seconds"), t.date().isoformat(), "sleep",
+                sensors={s["id"]: 24.0 for s in room["sensors"]},
+                units={u["id"]: UnitSample(True, "cool", "low", 23.0, 24.0, "normal")
+                       for u in room["units"]})
+    for room in CONFIG["rooms"]:
+        assert store.current_almanac(room["id"], as_of=date(2026, 8, 3))["sections"] == {}
+    states = _build_states()
+    for s in states:
+        if s["entity_id"].startswith("input_select.ac_scene_"):
+            s["state"] = "night"                  # HA is in Night: no catch-up re-fire
+    rest, ws = StubRest(states), StubWS()
+    rt = Runtime(CONFIG, store, rest, ws, tmp)
+    clock = {"t": datetime(2026, 8, 3, 21, 57, 0, tzinfo=hk)}
+    rt._now = lambda: (clock["t"].isoformat(timespec="seconds"),
+                       clock["t"].astimezone(utc).isoformat(timespec="seconds"),
+                       clock["t"].date().isoformat(), clock["t"])
+
+    def fired(room_id: str) -> int | None:
+        entity = f"automation.ac_{room_id}_sleep"
+        return next((i for i, e in enumerate(rest.log)
+                     if e[:3] == ("service", "automation", "trigger")
+                     and e[3].get("entity_id") == entity), None)
+
+    saved = runtime_mod.SCHEDULER_TICK_SECONDS
+    runtime_mod.SCHEDULER_TICK_SECONDS = 0.05
+    try:
+        await rt.start()
+        assert not any(e[:3] == ("service", "automation", "trigger") for e in rest.log)
+        clock["t"] = datetime(2026, 8, 3, 22, 0, 15, tzinfo=hk)     # the scheduler's next tick
+        await eventually(lambda: all(fired(r["id"]) is not None for r in CONFIG["rooms"]),
+                         "the 22:00 Sleep crossovers")
+    finally:
+        runtime_mod.SCHEDULER_TICK_SECONDS = saved
+        await rt.stop()
+    for room in CONFIG["rooms"]:
+        r = room["id"]
+        pushed = [e[2] for e in rest.log[:fired(r)]
+                  if e[0] == "set_state" and e[1] == f"sensor.ac_almanac_{r}"]
+        units = ((pushed[-1]["sections"] if pushed else {}).get("sleep") or {}).get("units", {})
+        assert all((units.get(u["id"]) or {}).get("setpoint_applied") == 23.0
+                   for u in room["units"]), \
+            f"{r}: the Sleep crossover fired with HA holding sleep units {units}"
+    store.close()
+    print("startup race: started 21:57 with an empty almanac and history in the store, each "
+          "room's 22:00 Sleep crossover fired after its almanac reached HA with "
+          "setpoint_applied 23 - OK")
 
 
 if __name__ == "__main__":

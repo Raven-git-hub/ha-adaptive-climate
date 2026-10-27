@@ -69,9 +69,9 @@ In the UI at `http://<host>:8098`:
 
 - **Log** tab, category *storage*: "database migrated from storage version 0 to 2;
   backup at ...".
-- Within 10 minutes, category *analysis*: "replayed almanac for Main Room (first
-  heartbeat in section): N section(s)", one per room. Phase 0 emptied the almanac;
-  this refills it from history.
+- Straight away, category *analysis*: "replayed almanac for Main Room (startup):
+  N section(s)", one per room, before any crossover. Phase 0 emptied the almanac;
+  this refills it from history and pushes it to HA.
 - **Almanac** tab: for each room, the **Sunset** section should list every unit with
   a `setpoint_applied`. A unit missing there has no seed for Sunset yet: at 16:00
   the scene will leave it alone (it stays `manual`), and it starts at the next

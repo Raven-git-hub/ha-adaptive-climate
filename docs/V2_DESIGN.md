@@ -129,10 +129,11 @@ The almanac is a deterministic replay of every reaction, in time order, from a s
 - **Per sensor:** its earliest non-null reading in that section.
 - **No seed:** the unit has no setpoint to apply, so it is left alone. The scene and maintenance send it no commands.
 
-The runtime's provisional seeding at crossover is retired. Instead, when the first heartbeat lands in a section with no almanac, the runtime runs the replay for that room.
+The runtime's provisional seeding at crossover is retired. Instead, the runtime replays every room at startup, before any crossover can fire, and again when the first heartbeat lands in a section with no almanac.
 
 **The replay runs:**
 
+- at startup, for every room, and pushed to HA before any crossover (catch-up included), so a crossover just after a start or a migration finds `setpoint_applied`;
 - after every reaction, so the UI updates immediately;
 - 65 minutes after each setpoint-moving reaction, to apply its comfort window (on startup the runtime re-arms this for the setpoint-moving reactions of the last 65 minutes, so a restart doesn't hold the comfort update until 00:15);
 - on the first heartbeat in a section with no almanac, or on any heartbeat that can seed a unit or sensor the almanac doesn't have yet (a unit that was off at the section's first heartbeat);
@@ -263,6 +264,7 @@ The container decides once per section; Home Assistant acts at every heartbeat. 
 
 - **At each section change:** computes the room comfort point, Δ, the block decision and each sensor's trigger edges in degrees, then publishes them to a new `sensor.ac_conditions_<room>`. It is re-pushed on a timer and on `homeassistant_start`, like the almanac.
 - **On every reaction:** records it with its per-unit kind and the outdoor value, replays the almanac and pushes it. After a setpoint-moving reaction, it schedules another replay 65 minutes later for the comfort window.
+- **At startup:** replays every room and pushes its almanac before any crossover.
 - **On the first heartbeat in a section with no almanac:** replays that room.
 - **Nightly:** full replay as a consistency check.
 - **Its own commands** (phase 8, for the knob): the container's REST calls carry no `context.parent_id`, so it raises `ac_active` around any command it sends itself.
@@ -546,3 +548,7 @@ Before cutover, 27 Oct 2026:
 Rounding, 27 Oct 2026 (supersedes 9, and the rounding-direction parts of 21, 33, 34 and 37):
 
 67. **`setpoint_applied` is tracked through the replay.** It is normally the whole step nearest S, an exact half going toward the latest reaction's direction (half up for a seed alone). After a setpoint-moving reaction whose chosen value differs from the `setpoint_applied` in force at that moment, the new value moves at least one step from that value toward the chosen one, and never past it; a chosen value equal to it keeps it. Nothing else moves it, so quiet days never change it. Rounding toward the latest reaction's direction over-applied: Main Room sleep had S 24.17 and applied 25; with 23 in force when the person chose 25 it now applies 24 (with 24 in force it would still apply 25). An `on` that sets 21 → 23 after a correction down to 21 now applies 22 (S 22.25), where the direction rule applied 23. Decision 22 stands: steps are whole degrees, and `nearest_step` and `next_applied` take the step as a parameter. With whole-degree setpoints the chosen value is always on a step; a fractional one is never passed, even if that means no step is taken.
+
+From the first live run, 27 Oct 2026:
+
+68. **Startup replays every room before any crossover.** The almanac is empty after a migration, and the first heartbeat's replay came 10 minutes after startup: the 22:00 Sleep crossover, three minutes after a 21:57 start, found no `setpoint_applied` and left every unit in `manual`. `start()` now replays every room and pushes its almanac before the catch-up crossover and before the scheduler starts.
