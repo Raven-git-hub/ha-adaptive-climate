@@ -14,6 +14,8 @@ Then the storage migrations:
   * a migration forced to fail, by raising half-way or by leaving a row
     that fails foreign_key_check, rolls back and leaves the database
     exactly as it was
+  * migration 2 closes the section runs v1 left open, from v1 or from a
+    phase 0 database, and a sleep run crossing midnight closes properly
   * a database newer than the code is refused
 
     PYTHONPATH=. python tools/store_check.py
@@ -73,7 +75,7 @@ def check_fresh_store() -> None:
     store.record_section_run("main_room", rd, "day",
                              planned_start=f"{rd}T08:00:00+08:00",
                              actual_start=f"{rd}T08:00:03+08:00")
-    store.close_section_run("main_room", rd, "day", f"{rd}T14:00:00+08:00")
+    assert store.close_section_run("main_room", f"{rd}T14:00:00+08:00") == (rd, "day")
     store.log_event(f"{rd}T14:40:00+08:00", f"{rd}T06:40:00+00:00", "info",
                     "reactive", "user bumped main_room_ac 22->23", room_id="main_room")
     store.save_config_version({"version": 2, "rooms": []})
@@ -105,6 +107,28 @@ def check_fresh_store() -> None:
     assert sr_rows[0]["actual_start"] == f"{rd}T08:00:03+08:00" and sr_rows[0]["ended_at"] == ""
     assert sr_rows[1]["ended_at"] == f"{rd}T14:00:00+08:00" and sr_rows[1]["actual_start"] == ""
     print("CSV columns: v2 columns appended after v1's; section runs archived (start + close) - OK")
+
+    # --- a sleep run that crosses midnight closes against the day it began ---
+    d0, d1 = rd, AS_OF.isoformat()
+    store.record_section_run("main_bedroom", d0, "sleep",
+                             planned_start=f"{d0}T22:00:00+08:00",
+                             actual_start=f"{d0}T22:00:02+08:00")
+    # a catch-up restart at 01:00 inside the same run leaves it open
+    assert store.close_section_run("main_bedroom", f"{d1}T01:00:00+08:00",
+                                   keep=(d0, "sleep")) is None
+    # sunrise next morning closes it, though the close date is a day later
+    assert store.close_section_run("main_bedroom", f"{d1}T05:30:01+08:00",
+                                   keep=(d1, "sunrise")) == (d0, "sleep")
+    runs = [tuple(r) for r in c.execute(
+        "SELECT local_date, section, ended_at FROM section_run WHERE room_id='main_bedroom'")]
+    assert runs == [(d0, "sleep", f"{d1}T05:30:01+08:00")], runs
+    bed_csv = tmp / "csv" / "main_bedroom"
+    sleep_rows = list(csvmod.DictReader((bed_csv / f"{d0}_section_run.csv").open()))
+    assert [r["ended_at"] for r in sleep_rows] == ["", f"{d1}T05:30:01+08:00"], sleep_rows
+    assert not (bed_csv / f"{d1}_section_run.csv").exists(), "close row filed under the close date"
+    assert store.close_section_run("main_bedroom", f"{d1}T08:00:00+08:00") is None
+    print("section runs: a sleep run crossing midnight closes against its start date, "
+          "in SQLite and in its own CSV day file; a same-run restart keeps it open - OK")
 
     # --- SQLite row counts ---
     assert c.execute("SELECT COUNT(*) FROM heartbeat WHERE room_id='main_room'").fetchone()[0] == 8
@@ -204,10 +228,26 @@ def build_v1_db(data_dir: Path) -> Path:
     c.executescript(V1_SCHEMA.read_text())
     c.executescript("""
         INSERT INTO config_version VALUES (1, '2026-07-01T00:00:00', '{"version":1}', 'sha-1');
+        -- v1 closed runs by the close date: every sleep run stayed open, and a
+        -- restart across a boundary orphaned the run it interrupted. Ids are
+        -- deliberately not in time order.
         INSERT INTO section_run(id,room_id,local_date,section,planned_start,actual_start,
                                 ended_at,outcome)
           VALUES (1,'main_room','2026-07-31','day','2026-07-31T08:00:00+08:00',
-                  '2026-07-31T08:00:03+08:00','2026-07-31T14:00:00+08:00','ran');
+                  '2026-07-31T08:00:03+08:00','2026-07-31T14:00:00+08:00','ran'),
+                 (2,'main_room','2026-07-30','sleep','2026-07-30T22:00:00+08:00',
+                  '2026-07-30T22:00:02+08:00',NULL,'ran'),
+                 (3,'main_room','2026-07-31','sunrise','2026-07-31T05:30:00+08:00',
+                  '2026-07-31T05:30:01+08:00','2026-07-31T08:00:02+08:00','ran'),
+                 (4,'main_room','2026-07-31','afternoon','2026-07-31T14:00:00+08:00',
+                  '2026-07-31T14:00:01+08:00',NULL,'ran'),
+                 (5,'main_room','2026-07-31','sunset','2026-07-31T16:00:00+08:00',
+                  '2026-07-31T17:10:00+08:00',NULL,'caught_up'),
+                 (6,'baby_room','2026-07-30','sleep','2026-07-30T22:00:00+08:00',
+                  '2026-07-30T22:00:01+08:00',NULL,'ran'),
+                 (7,'baby_room','2026-07-31','sunrise','2026-07-31T05:30:00+08:00',
+                  '2026-07-31T05:30:02+08:00',NULL,'ran'),
+                 (8,'main_room','2026-07-29','night',NULL,NULL,NULL,'missed');
         INSERT INTO heartbeat(id,room_id,ts,ts_utc,local_date,section,sensor_n,any_unit_on,
                               deferred_ms)
           VALUES (7,'main_room','2026-07-31T14:10:00+08:00','2026-07-31T06:10:00+00:00',
@@ -264,9 +304,28 @@ def _shape(db: Path) -> tuple[int, list[tuple]]:
         c.close()
 
 
-def _backups(db: Path) -> list[Path]:
-    return sorted(p for p in db.parent.glob(f"{db.name}.v1-backup-*")
+def _backups(db: Path, label: str = "v1") -> list[Path]:
+    return sorted(p for p in db.parent.glob(f"{db.name}.{label}-backup-*")
                   if not p.name.endswith(("-wal", "-shm")))
+
+
+# What migration 2 should do to build_v1_db's section runs: close each open
+# run at the next run's start in its room, leave each room's latest open,
+# and leave a run with no start time alone.
+EXPECTED_RUNS = [
+    (1, "2026-07-31T14:00:00+08:00"),   # already closed
+    (2, "2026-07-31T05:30:01+08:00"),   # sleep across midnight -> next sunrise
+    (3, "2026-07-31T08:00:02+08:00"),   # already closed
+    (4, "2026-07-31T17:10:00+08:00"),   # orphaned by a restart -> the caught-up run
+    (5, None),                           # main_room's current run
+    (6, "2026-07-31T05:30:02+08:00"),   # other room, its own next run
+    (7, None),                           # baby_room's current run
+    (8, None),                           # no start time: nothing to order it by
+]
+
+
+def _runs(c) -> list[tuple]:
+    return [tuple(r) for r in c.execute("SELECT id, ended_at FROM section_run ORDER BY id")]
 
 
 def check_migration() -> None:
@@ -277,14 +336,14 @@ def check_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store_mod.MIGRATIONS) == 1
+    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store_mod.MIGRATIONS) == 2
     assert _backups(db) == [store.backup_path], (_backups(db), store.backup_path)
     assert _dump(store.backup_path) == v1_dump, "backup is not a copy of the v1 database"
-    print(f"migration: v1 database backed up to {store.backup_path.name}, now at version 1 - OK")
+    print(f"migration: v1 database backed up to {store.backup_path.name}, now at version 2 - OK")
 
     def n(table: str) -> int:
         return c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    expected = {"config_version": 1, "section_run": 1, "heartbeat": 2, "heartbeat_sensor": 4,
+    expected = {"config_version": 1, "section_run": 8, "heartbeat": 2, "heartbeat_sensor": 4,
                 "heartbeat_unit": 2, "reactive": 1, "reactive_unit": 1, "reactive_sensor": 2,
                 "ingest_file": 1, "event": 3 + 1,   # + the migration's own storage event
                 "almanac": 0, "almanac_unit": 0, "almanac_sensor": 0}
@@ -300,13 +359,15 @@ def check_migration() -> None:
                    "ru.kind, ru.power_before FROM reactive r "
                    "JOIN reactive_unit ru ON ru.reactive_id = r.id WHERE r.id = 3").fetchone()
     assert tuple(rx) == (120, 22.0, 23.0, None, None, None), tuple(rx)
-    sr = c.execute("SELECT ended_at, outcome, outdoor_mean, blocked FROM section_run").fetchone()
+    sr = c.execute("SELECT ended_at, outcome, outdoor_mean, blocked FROM section_run "
+                   "WHERE id = 1").fetchone()
     assert tuple(sr) == ("2026-07-31T14:00:00+08:00", "ran", None, None), tuple(sr)
+    assert _runs(c) == EXPECTED_RUNS, _runs(c)
     cats = [e["category"] for e in store.recent_events(limit=10)]
     assert sorted(cats) == ["connection", "crossover", "reactive", "storage"], cats
     storage = store.recent_events(category="storage")[0]
     assert str(store.backup_path) in storage["message"], storage
-    assert storage["detail"] == {"from": 0, "to": 1, "backup": str(store.backup_path)}
+    assert storage["detail"] == {"from": 0, "to": 2, "backup": str(store.backup_path)}
     assert store.current_almanac("main_room", as_of=date(2026, 8, 1)) == \
         {"room_id": "main_room", "sections": {}}
     assert c.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -314,6 +375,12 @@ def check_migration() -> None:
     assert c.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     print("migration: every row kept (ids, joins, values), new columns null, almanac "
           "emptied, backup path logged as a storage event, checks clean - OK")
+    print("migration 2: open sleep and orphaned runs closed at the next run's start, "
+          "per room; each room's current run left open - OK")
+    # with history repaired, the live close finds the right run: main_room's
+    # current one, not the start-less run with the higher id
+    assert store.close_section_run("main_room", "2026-07-31T20:30:00+08:00") == \
+        ("2026-07-31", "sunset")
     store.close()
 
     fresh = Path(tempfile.mkdtemp())
@@ -363,10 +430,40 @@ def check_failed_migration() -> None:
         print(f"failed migration ({label}): rolled back, database identical to before (full dump + user_version) - OK")
 
         recovered = Store(tmp, SCHEMA)   # still a v1 database the real migration accepts
-        assert recovered._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert recovered._conn.execute("PRAGMA user_version").fetchone()[0] == len(real)
         assert recovered._conn.execute("SELECT COUNT(*) FROM heartbeat").fetchone()[0] == 2
         recovered.close()
     print("failed migration: the untouched database then migrates normally - OK")
+
+
+def check_phase0_database() -> None:
+    """A database left at storage version 1 (v2 phase 0, before the section
+    run fix) gets migration 2 alone, behind its own backup."""
+    real = store_mod.MIGRATIONS
+    tmp = Path(tempfile.mkdtemp())
+    db = build_v1_db(tmp)
+    store_mod.MIGRATIONS = real[:1]
+    try:
+        Store(tmp, SCHEMA).close()
+    finally:
+        store_mod.MIGRATIONS = real
+    phase0 = _dump(db)
+    assert phase0[0] == 1
+    c = sqlite3.connect(db)
+    still_open = c.execute("SELECT COUNT(*) FROM section_run WHERE ended_at IS NULL").fetchone()[0]
+    c.close()
+    assert still_open == 6, still_open
+
+    store = Store(tmp, SCHEMA)
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert _backups(db, "phase0") == [store.backup_path], store.backup_path
+    assert _dump(store.backup_path) == phase0
+    assert _runs(store._conn) == EXPECTED_RUNS, _runs(store._conn)
+    details = [e["detail"] for e in store.recent_events(category="storage")]
+    assert {"from": 1, "to": 2, "backup": str(store.backup_path)} in details, details
+    store.close()
+    print(f"phase 0 database: backed up to {store.backup_path.name}, migration 2 alone "
+          f"closes its open runs - OK")
 
 
 def check_newer_database_refused() -> None:
@@ -388,6 +485,7 @@ def main() -> int:
     check_fresh_store()
     check_migration()
     check_failed_migration()
+    check_phase0_database()
     check_newer_database_refused()
     print("\nALL STORE CHECKS PASSED")
     return 0

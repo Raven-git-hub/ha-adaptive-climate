@@ -200,9 +200,38 @@ def _migration_1(conn: sqlite3.Connection, schema: _Schema) -> None:
     conn.execute(schema.create("current_almanac"))
 
 
-# (label for the pre-migration backup file, migration). Append only.
+def _migration_2(conn: sqlite3.Connection, schema: _Schema) -> None:
+    """Close the section runs that were left open.
+
+    Before this fix a run was closed by the date of its close, so a run that
+    crossed midnight (sleep) never closed, and a restart across a boundary
+    orphaned the run it interrupted. Per room, in start order, every open
+    run except the latest is closed at the next run's start; only the
+    genuinely current run stays open. Data only: the schema is unchanged."""
+    by_room: dict[str, list[tuple[datetime, int, str, str | None]]] = {}
+    for run_id, room_id, planned, actual, ended in conn.execute(
+            "SELECT id, room_id, planned_start, actual_start, ended_at FROM section_run"):
+        start = actual or planned
+        if not start:
+            continue    # nothing to order it by; leave it as it is
+        when = datetime.fromisoformat(start)
+        if when.tzinfo is None:
+            continue    # every writer stamps an offset; don't guess one
+        by_room.setdefault(room_id, []).append((when, run_id, start, ended))
+    for runs in by_room.values():
+        runs.sort(key=lambda r: (r[0], r[1]))
+        for (_, run_id, _, ended), (_, _, next_start, _) in zip(runs, runs[1:]):
+            if ended is None:
+                conn.execute("UPDATE section_run SET ended_at=? WHERE id=?",
+                             (next_start, run_id))
+
+
+# (label for the pre-migration backup file, migration). Migration n takes
+# storage version n-1 to n; the label names the shape it upgrades from.
+# Append only.
 MIGRATIONS: list[tuple[str, Callable[[sqlite3.Connection, _Schema], None]]] = [
     ("v1", _migration_1),
+    ("phase0", _migration_2),
 ]
 
 # The v1 analyser's almanac states, until phase 1's replay emits status.
@@ -458,18 +487,34 @@ class Store:
                  comfort_point, lean, _int_or_none(blocked), block_mode))
             self._conn.commit()
 
-    def close_section_run(self, room_id: str, local_date: str, section: str,
-                          ended_at: str) -> None:
+    def close_section_run(self, room_id: str, ended_at: str,
+                          keep: tuple[str, str] | None = None) -> tuple[str, str] | None:
         """Stamp the end of a section when the next one fires, so Analysis
-        target bands stop at the real boundary (a Light cutover lesson)."""
-        self._append_csv(room_id, local_date, "section_run", SECTION_RUN_CSV,
-                         [section, None, None, ended_at] + [None] * 8)
+        target bands stop at the real boundary (a Light cutover lesson).
+
+        Closes the room's most recent open run, found by being open rather
+        than by date, so a run that crossed midnight (sleep) closes against
+        the date it started on. keep=(local_date, section) leaves that run
+        open: a catch-up restart inside the same run. Returns the closed
+        run's (local_date, section), or None if nothing was closed."""
         with self._lock:
-            self._conn.execute(
-                "UPDATE section_run SET ended_at=? WHERE room_id=? AND local_date=? "
-                "AND section=? AND ended_at IS NULL",
-                (ended_at, room_id, local_date, section))
+            run = self._conn.execute(
+                "SELECT id, local_date, section FROM section_run "
+                "WHERE room_id=? AND ended_at IS NULL "
+                "ORDER BY COALESCE(actual_start, planned_start) IS NULL, "
+                "COALESCE(actual_start, planned_start) DESC, id DESC LIMIT 1",
+                (room_id,)).fetchone()
+        if run is None or (keep is not None and (run["local_date"], run["section"]) == tuple(keep)):
+            return None
+        # The close row goes in the run's own day file, so re-ingest merges it
+        # into the run it ends.
+        self._append_csv(room_id, run["local_date"], "section_run", SECTION_RUN_CSV,
+                         [run["section"], None, None, ended_at] + [None] * 8)
+        with self._lock:
+            self._conn.execute("UPDATE section_run SET ended_at=? WHERE id=?",
+                               (ended_at, run["id"]))
             self._conn.commit()
+        return run["local_date"], run["section"]
 
     def log_event(self, ts: str, ts_utc: str, severity: str, category: str,
                   message: str, room_id: str | None = None,

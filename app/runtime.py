@@ -358,9 +358,14 @@ class Runtime:
     async def _crossover(self, rs: RoomState, section: str, started, catch_up: bool) -> None:
         room_id = rs.room["id"]
         ts, ts_utc, local_date, now = self._now()
+        # A run is dated by when it started, so a catch-up after midnight
+        # into a sleep that began yesterday is still yesterday's sleep run.
+        run_date = started.date().isoformat() if started else local_date
 
-        if rs.section and rs.section != section:
-            self.store.close_section_run(room_id, local_date, rs.section, ts)
+        # Close whatever run the room still has open - found by being open,
+        # not by date, so a sleep run that crossed midnight closes too. A
+        # catch-up restart inside the same run leaves that run open.
+        self.store.close_section_run(room_id, ts, keep=(run_date, section))
 
         seeded = await self._seed_provisional_if_needed(rs, section)
 
@@ -382,7 +387,7 @@ class Runtime:
                                          {"entity_id": scene_select_id(room_id), "option": section})
 
         self.store.record_section_run(
-            room_id, local_date, section,
+            room_id, run_date, section,
             planned_start=started.isoformat(timespec="seconds") if started else None,
             actual_start=ts,
             outcome="caught_up" if catch_up else "ran")

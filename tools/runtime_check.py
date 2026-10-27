@@ -184,6 +184,33 @@ async def main() -> int:
     assert tuple(rows[-1]) == (22.0, 25.0), tuple(rows[-1])
     print("reactive: 22->23->24->25 in one window recorded once as before 22, after 25 - OK")
 
+    # --- section runs: a sleep run crossing midnight, with a restart inside it ---
+    from datetime import datetime as dt
+    from zoneinfo import ZoneInfo
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+    real_now = rt._now
+
+    def at(*args):
+        t = dt(*args, tzinfo=hk)
+        return lambda: (t.isoformat(timespec="seconds"),
+                        t.astimezone(utc).isoformat(timespec="seconds"), t.date().isoformat(), t)
+    bed = rt.rooms["main_bedroom"]
+    sleep_start = dt(2026, 8, 3, 22, 0, tzinfo=hk)
+    rt._now = at(2026, 8, 3, 22, 0, 2)
+    await rt._crossover(bed, "sleep", sleep_start, catch_up=False)
+    rt._now = at(2026, 8, 4, 1, 0, 0)       # container restarts at 01:00, still in sleep
+    await rt._crossover(bed, "sleep", sleep_start, catch_up=True)
+    rt._now = at(2026, 8, 4, 5, 30, 1)
+    await rt._crossover(bed, "sunrise", dt(2026, 8, 4, 5, 30, tzinfo=hk), catch_up=False)
+    rt._now = real_now
+    runs = [tuple(r) for r in c.execute(
+        "SELECT local_date, section, ended_at FROM section_run "
+        "WHERE room_id='main_bedroom' AND local_date LIKE '2026-08-%' ORDER BY id")]
+    assert runs == [("2026-08-03", "sleep", "2026-08-04T05:30:01+08:00"),
+                    ("2026-08-04", "sunrise", None)], runs
+    print("section runs: sleep from 22:00 survives a 01:00 restart as one run and is closed "
+          "by the 05:30 sunrise against its start date - OK")
+
     await rt.stop()
 
     # --- restart with almanac already seeded + select already on-section:

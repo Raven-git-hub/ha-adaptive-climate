@@ -1,5 +1,5 @@
 -- =====================================================================
--- Adaptive Climate - SQLite storage schema (v2, storage user_version 1)
+-- Adaptive Climate - SQLite storage schema (v2, storage user_version 2)
 --
 -- CSV on disk is the archival source of truth; this database is the
 -- query layer for the analyser and the UI. It is always rebuildable
@@ -11,7 +11,8 @@
 -- app/store.py, which recreate changed tables from the CREATE text in
 -- this file. So: never edit a CREATE here without adding a migration,
 -- and fresh and migrated databases stay byte-identical in sqlite_master
--- (tools/store_check.py checks this). user_version 0 = v1 (v1.0-poc).
+-- (tools/store_check.py checks this). user_version 0 = v1 (v1.0-poc),
+-- 1 = v2 phase 0, 2 = phase 1 (open section runs closed; data only).
 --
 -- Design notes:
 --   * Sensor readings and unit states are stored LONG, not wide. Rooms
