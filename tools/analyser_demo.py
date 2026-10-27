@@ -7,8 +7,11 @@ docs/V2_DESIGN.md and docs/TRUST_MODEL.md:
 
   * 8 days at 21 plus one reaction 21 -> 22 applies 22 (v1 applied 21)
   * 300 quiet heartbeats leave the seed unchanged
-  * rounding goes toward the last reaction, both ways, keeps its direction
-    while S doesn't move, and rounds half up before there is one
+  * setpoint_applied is tracked through the replay: a correction moves it
+    at least one step toward the chosen value and never past it, otherwise
+    to the step nearest S; Main Room sleep's S 24.17 applies 24, not 25;
+    a chosen value equal to the applied one keeps it; quiet days never
+    change it
   * a reaction is setpoint-moving when a setpoint changed, whatever its kind:
     an `on` with a new setpoint sets the direction and opens a window
   * the replay is deterministic, whatever order the rows were written in
@@ -37,7 +40,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.analyser import (LearningConfig, analyse_room,           # noqa: E402
-                          confidence_from_quiet, round_toward)
+                          confidence_from_quiet, nearest_step, next_applied)
 from app.store import ReactiveUnitSample, Store, UnitSample       # noqa: E402
 from tools.compare_analyser import compare                        # noqa: E402
 
@@ -151,13 +154,17 @@ def check_quiet_heartbeats() -> None:
 
 
 def check_rounding() -> None:
-    print("rounding")
-    cases = [(21.5, 0, 22.0), (22.5, 0, 23.0), (21.2, 1, 22.0), (21.8, -1, 21.0),
-             (22.0 + 1e-12, -1, 22.0), (21.0, 1, 21.0), (21.5, -1, 21.0)]
+    print("rounding: setpoint_applied, tracked through the replay")
+    cases = [(21.5, 0, 22.0), (22.5, 0, 23.0), (22.5, 1, 23.0), (22.5, -1, 22.0),
+             (21.2, 1, 21.0), (21.8, -1, 22.0), (22.0 + 1e-12, -1, 22.0)]
     for value, direction, want in cases:
-        assert round_toward(value, direction) == want, (value, direction)
-    ok("round_toward: half up with no direction (22.5 -> 23, not 22), up, down, "
-       "float noise stays on its step")
+        assert nearest_step(value, direction) == want, (value, direction)
+    ok("nearest_step: the nearest whole degree, an exact half toward the reaction's direction "
+       "(up with none: 22.5 -> 23, not 22), float noise stays on its step")
+    assert next_applied(24.0, 23.4, 24.0, 1) == 24.0      # nearest would be 23
+    assert next_applied(22.0, 22.9, 22.6, 1) == 22.0      # a step would pass 22.6
+    ok("next_applied: a chosen value equal to the applied one keeps it; a step that would "
+       "pass the chosen value isn't taken")
 
     sc = Scenario()
     sc.beat(t(1, 8), setpoint=22.0)
@@ -174,15 +181,62 @@ def check_rounding() -> None:
     sc.react(t(1, 12), 21.0, 21.0)              # up and back down in one window
     day = sc.replay(t(1, 23))["day"]
     assert day.unit_setpoints == {"ac": 21.5} and day.unit_setpoints_applied == {"ac": 21.0}
-    ok("a reaction that leaves S where it is keeps the downward direction: still 21")
+    ok("a reaction that leaves the setpoint where it was moves nothing: still 21")
 
     sc = Scenario()
     sc.beat(t(1, 8), setpoint=23.0)
     sc.react(t(1, 10), 21.0, 22.0)              # boosting at 21; the person sets 22
     day = sc.replay(t(1, 23))["day"]
     assert day.unit_setpoints == {"ac": 22.5} and day.unit_setpoints_applied == {"ac": 22.0}
-    ok("seed 23, boosted at 21, person sets 22: the gesture is warmer but S moved down "
-       "to 22.5, so 22 applies")
+    ok("seed 23, boosted at 21, person sets 22: the gesture is warmer but 22 is below the "
+       "applied 23, so it moves down a step to 22")
+
+    check_overapplied()
+
+    # A correction from an applied value that sits on a .5 tie still moves.
+    sc = Scenario()
+    sc.beat(t(1, 8), setpoint=22.0)
+    sc.react(t(1, 10), 22.0, 23.0)              # S 22.5: a tie, applied 23
+    sc.react(t(1, 12), 23.0, 24.0)              # S 23.25: nearest is 23, still 23 applied
+    day = sc.replay(t(1, 23))["day"]
+    assert day.unit_setpoints == {"ac": 23.25} and day.unit_setpoints_applied == {"ac": 24.0}
+    down = Scenario()
+    down.beat(t(1, 8), setpoint=22.0)
+    down.react(t(1, 10), 22.0, 23.0)
+    down.react(t(1, 12), 23.0, 22.0)            # S 22.25, back down a step
+    assert down.replay(t(1, 23))["day"].unit_setpoints_applied == {"ac": 22.0}
+    ok("from 23, applied off the tie S 22.5: a correction to 24 moves one step although "
+       "S 23.25 is nearer 23, and one to 22 moves one step down")
+
+    # Quiet days never change it: the 24 above, though S 23.25 is nearer 23.
+    confidences = []
+    for day_n in range(2, 7):
+        sc.beats(t(day_n, 8), t(day_n, 13, 50), setpoint=24.0)
+        sc.run(t(day_n, 8), t(day_n, 14))
+    for day_n in range(1, 7):
+        day = sc.replay(t(day_n, 23))["day"]
+        assert day.unit_setpoints == {"ac": 23.25}, (day_n, day.unit_setpoints)
+        assert day.unit_setpoints_applied == {"ac": 24.0}, (day_n, day.unit_setpoints_applied)
+        confidences.append(round(day.confidence, 3))
+    assert confidences == sorted(confidences) and confidences[0] < confidences[-1], confidences
+    ok(f"five quiet days at 24: still S 23.25 and applied 24 at every nightly replay, while "
+       f"confidence rises {confidences[0]} -> {confidences[-1]}")
+
+
+def check_overapplied() -> None:
+    """Main Room sleep: S 24.17, which the direction rule applied as 25."""
+    sc = Scenario()
+    sc.beat(t(1, 22, 10), section="sleep", setpoint=24.0)
+    chosen = (23.0, 24.0, 23.0, 24.0, 23.0, 25.0)       # the last one up
+    before = 24.0
+    for day_n, after in enumerate(chosen, start=1):
+        sc.react(t(day_n, 23), before, after, section="sleep")
+        before = after
+    sleep = sc.replay(t(7, 8))["sleep"]
+    assert abs(sleep.unit_setpoints["ac"] - 24.171875) < 1e-9, sleep.unit_setpoints
+    assert sleep.unit_setpoints_applied == {"ac": 24.0}, sleep.unit_setpoints_applied
+    ok("Main Room sleep: seed 24, then 23, 24, 23, 24, 23 and finally 25: S 24.17 applies 24 "
+       "(nearest, and a step up from the 23 in force), not 25")
 
 
 def check_on_with_setpoint() -> None:
@@ -197,10 +251,10 @@ def check_on_with_setpoint() -> None:
         sc.beat(when, setpoint=23.0, readings={"wall": 23.0, "door": 24.0})
     day = sc.replay(t(1, 23))["day"]
     assert day.unit_setpoints == {"ac": 22.25}, day.unit_setpoints
-    assert day.unit_setpoints_applied == {"ac": 23.0}    # up; the old rule floored to 22
+    assert day.unit_setpoints_applied == {"ac": 22.0}    # a step up from 21, nearest 22.25
     assert day.sensor_comfort == {"wall": 24.0, "door": 24.5}, day.sensor_comfort
-    ok("an `on` that also sets 21 -> 23 moves S to 22.25, turns the direction up "
-       "(applies 23) and opens a comfort window")
+    ok("an `on` that also sets 21 -> 23 moves S to 22.25 and the applied setpoint a step up "
+       "from 21 to 22, and opens a comfort window")
 
     sc = Scenario()
     sc.beat(t(1, 8), setpoint=22.0)
@@ -213,9 +267,9 @@ def check_on_with_setpoint() -> None:
     assert day.sensor_comfort == {"wall": 25.0, "door": 25.0}, day.sensor_comfort
     sc.react(t(1, 10), 22.0, 21.0)              # an earlier cooler correction...
     day = sc.replay(t(1, 23))["day"]
-    assert day.unit_setpoints_applied == {"ac": 21.0}     # ...whose direction the on keeps
+    assert day.unit_setpoints_applied == {"ac": 21.0}     # ...which the on leaves alone
     ok("an `on` with no setpoint change moves nothing: still provisional, no comfort "
-       "window, and an earlier direction stands")
+       "window, and an earlier correction's applied value stands")
 
 
 def check_deterministic() -> None:

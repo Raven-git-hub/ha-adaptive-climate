@@ -57,10 +57,16 @@ for display and tie-breaking; the quorum count itself is unweighted.
   section with it on and a setpoint. A missing unit means "leave it alone".
 - **units[].setpoint** — the learned setpoint, stored precise.
 - **units[].setpoint_applied** — the whole-degree value the templates drive,
-  already rounded toward the latest setpoint-moving reaction (half up before
-  there is one), so templates never round; they only clamp it to the unit's
-  `[min_temp, max_temp]` (docs/HARDWARE.md) and add their correction offset.
-  Absent or `null` means no seed - leave the unit as it is.
+  so templates never round; they only clamp it to the unit's
+  `[min_temp, max_temp]` (docs/HARDWARE.md) and add the unit's section offset.
+  The replay tracks it reaction by reaction (docs/TRUST_MODEL.md): normally
+  the step nearest `setpoint`, an exact half toward the latest reaction's
+  direction (half up before any); a reaction whose chosen value differs from
+  the value in force moves it at least one step toward that choice and never
+  past it, and one that chose the value in force keeps it. Nothing else moves
+  it, so it can differ from the step nearest `setpoint` (S 23.25 can apply 24
+  after a correction to 24). Absent or `null` means no seed - leave the unit
+  as it is.
 - **units[].off** — an explicit forced-off for this section. Scene "off" comes
   from config and is baked into the automation directly; this flag mirrors it so
   the two agree once an almanac exists. The replay always writes `false`.

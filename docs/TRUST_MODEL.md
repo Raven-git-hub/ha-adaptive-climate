@@ -48,13 +48,22 @@ from a **seed**:
   ```
 
   `chosen` is the raw value the person set, whatever offset or boost was active.
-- **Applied setpoint.** The unit takes whole degrees, so the stored `S` is
-  rounded to `setpoint_applied` **toward the direction of the latest
-  setpoint-moving reaction**: up after a warmer correction, down after a cooler
-  one. A correction from 22 to 23 stores 22.5 and applies 23, so it shows the
-  next day; plain rounding (Python's and Jinja's, which round halves to even)
-  would send 22.5 back to 22. The direction is how `S` moved, not the gesture;
-  it stands while `S` doesn't move; before any reaction it rounds half up.
+- **Applied setpoint.** The unit takes whole degrees, so `setpoint_applied` is
+  a whole degree tracked through the replay, reaction by reaction:
+  - normally the whole step **nearest `S`**, an exact half going toward the
+    latest reaction's direction (half up before any reaction);
+  - after a setpoint-moving reaction whose chosen value differs from the
+    `setpoint_applied` in force at that moment, the new value moves **at least
+    one step** from that value toward the chosen one, and **never past it**;
+  - a chosen value equal to the applied value keeps it;
+  - nothing else moves it, so quiet days never change it.
+
+  A correction from 22 to 23 stores 22.5 and applies 23, so it shows the next
+  day; plain rounding (Python's and Jinja's, which round halves to even) would
+  send 22.5 back to 22. Earlier v2 rounded toward the latest reaction's
+  direction instead, which over-applied: an `S` of 24.17 after a correction up
+  to 25 applied 25. With 23 in force when that correction was made, it now
+  applies 24, the nearest step and still a step up.
 - **Comfort readings** move only on evidence that you accepted the room: the
   mean reading 30 to 60 minutes after a setpoint-moving reaction, if nobody
   reacted in that window, no unit was boosting, resting or in leak mode, and it
@@ -145,8 +154,10 @@ had at least one heartbeat and no reaction. Any reaction resets it to 0.
 2. Sensor A drifts down to **24°C**. You react: *"too cold now"*, and set
    21 → **22°C**.
 3. Two lessons land at once:
-   - **The setpoint was wrong.** `S = 21 + 0.5 × (22 − 21) = 21.5`, rounded up
-     (you asked for warmer) to an applied **22°C**. The section is now learned.
+   - **The setpoint was wrong.** `S = 21 + 0.5 × (22 − 21) = 21.5`. You chose
+     22 while 21 was applied, so the applied setpoint moves a step toward it,
+     to **22°C** (21.5 is a tie, and the tie goes your way too). The section
+     is now learned.
    - **Sensor A is trustworthy.** You wanted it warmer and A was `1.0°C` below
      its comfort, so its band tightens to **±1.0°C** and its trust rises to
      **0.89**. A second sensor sitting at its comfort learns nothing.

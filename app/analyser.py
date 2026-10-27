@@ -16,9 +16,14 @@ Per room and section:
   setpoint    every reaction whose setpoint_after differs from its
               setpoint_before moves S toward the raw chosen value:
               S += reaction_rate * (chosen - S).
-  applied     S rounded to a whole degree toward the latest setpoint-moving
-              reaction's direction, sign(chosen - S_before); the direction
-              stands while S doesn't move; half up before there is one.
+  applied     tracked through the replay, on whole degrees. A seed applies
+              its nearest step (half up). A setpoint-moving reaction whose
+              chosen value differs from the applied value in force moves it
+              to the step nearest the new S (an exact half toward the
+              reaction's direction, sign(chosen - S_before)), but at least
+              one step toward the chosen value and never past it; one whose
+              chosen value equals the applied value keeps it. Nothing else
+              moves it, so quiet days never do.
   comfort     30-60 min after each setpoint-moving reaction, the window's
               mean reading moves comfort toward it at reaction_rate, unless
               the window holds another reaction, a heartbeat with a unit in
@@ -130,27 +135,42 @@ def changed_setpoint(units: dict) -> bool:
 def is_setpoint_moving(kind: str | None, units: dict | None = None) -> bool:
     """A setpoint change or knob turn, or a reaction of any kind in which a
     unit's setpoint changed - an `on` that comes with a new setpoint, say
-    (docs/V2_DESIGN.md). It moves S, sets the rounding direction, makes the
+    (docs/V2_DESIGN.md). It moves S and the applied setpoint, makes the
     section learned and opens a comfort window."""
     return kind in SETPOINT_MOVING_KINDS or changed_setpoint(units or {})
 
 
-def round_toward(value: float, direction: int, step: float = 1.0) -> float:
-    """`value` on a multiple of `step`: up when direction > 0, down when
-    < 0, half up when 0. A value already on a step (within float noise)
-    stays put. Not Python's round(), whose ties go to even and would send
-    a learned 22.5 back to 22."""
+def nearest_step(value: float, direction: int, step: float = 1.0) -> float:
+    """`value` on its nearest multiple of `step`; an exact half goes up when
+    direction >= 0 and down when < 0. Not Python's round(), whose ties go
+    to even and would send a learned 22.5 back to 22."""
     q = value / step
-    nearest = math.floor(q + 0.5)
-    if abs(q - nearest) < _EPS:
-        n = nearest
-    elif direction > 0:
-        n = math.ceil(q)
-    elif direction < 0:
-        n = math.floor(q)
+    low = math.floor(q + _EPS)
+    if abs(q - low - 0.5) < _EPS:
+        n = low if direction < 0 else low + 1
     else:
-        n = nearest
+        n = math.floor(q + 0.5)
     return float(n * step)
+
+
+def next_applied(applied: float, s: float, chosen: float, direction: int,
+                 step: float = 1.0) -> float:
+    """setpoint_applied after a setpoint-moving reaction (docs/TRUST_MODEL.md).
+    applied: the value in force when the person reacted; s: the new S;
+    chosen: what they set; direction: the reaction's, for an exact half.
+
+    A chosen value equal to the applied value keeps it. Otherwise the new
+    value is the step nearest S, but at least one step from the applied
+    value toward the chosen one and never past it: a correction always
+    shows, and never overshoots what the person asked for."""
+    if abs(chosen - applied) < _EPS:
+        return applied
+    near = nearest_step(s, direction, step)
+    if chosen > applied:
+        cap = math.floor(chosen / step + _EPS) * step       # the last step not past it
+        return float(min(max(near, applied + step), cap))
+    cap = math.ceil(chosen / step - _EPS) * step
+    return float(max(min(near, applied - step), cap))
 
 
 def confidence_from_quiet(quiet: int) -> float:
@@ -288,6 +308,7 @@ def _replay_section(conn, room_id: str, section: str, unit_seeds: dict, sensor_s
     rate = cfg.reaction_rate
     setpoint = dict(unit_seeds)                      # unit -> S
     direction = {u: 0 for u in setpoint}             # +1 / -1 / 0: none yet
+    applied = {u: nearest_step(s, 0) for u, s in setpoint.items()}   # setpoint_applied
     comfort = dict(sensor_seeds)                     # sensor -> comfort reading
     samples: dict[str, list[tuple[float, float]]] = {s: [] for s in comfort}
     here = [r for r in room_reactions if r.section == section]
@@ -318,9 +339,9 @@ def _replay_section(conn, room_id: str, section: str, unit_seeds: dict, sensor_s
                     samples[sid].append((abs(dev), weight))
 
         # A unit whose setpoint changed makes this a setpoint-moving reaction
-        # whatever its kind (an `on` with a new setpoint included): S moves
-        # and the rounding direction follows how it moved. On/off alone, or
-        # manual, leaves both alone.
+        # whatever its kind (an `on` with a new setpoint included): S moves,
+        # and so does the applied setpoint, from the value in force toward
+        # what the person chose. On/off alone, or manual, leaves both alone.
         for uid, (before, after) in r.units.items():
             if uid not in setpoint or not changed_setpoint({uid: (before, after)}):
                 continue
@@ -328,6 +349,7 @@ def _replay_section(conn, room_id: str, section: str, unit_seeds: dict, sensor_s
             setpoint[uid] = s_before + rate * (after - s_before)
             if abs(after - s_before) >= _EPS:
                 direction[uid] = 1 if after > s_before else -1
+            applied[uid] = next_applied(applied[uid], setpoint[uid], after, direction[uid])
 
     band: dict[str, float] = {}
     trust: dict[str, float] = {}
@@ -347,7 +369,7 @@ def _replay_section(conn, room_id: str, section: str, unit_seeds: dict, sensor_s
         valid_from=as_of.date(),
         confidence=_confidence(conn, room_id, section, room_reactions, last_reaction, as_of),
         unit_setpoints=setpoint,
-        unit_setpoints_applied={u: round_toward(s, direction[u]) for u, s in setpoint.items()},
+        unit_setpoints_applied=dict(applied),
         unit_off={u: False for u in setpoint},
         sensor_comfort=comfort, sensor_band=band, sensor_trust=trust,
     )

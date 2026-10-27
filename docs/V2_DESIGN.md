@@ -65,7 +65,7 @@ Every reaction kind, the knob included, is grouped by the existing 120-second ex
 
 The reaction kind is stored per unit: `setpoint`, `on`, `off`, `manual`, `knob_turn` or `knob_press` (a knob long press records as `off`). A unit's kind in a window is `on` or `off` if its power changed between the first and last state (off → any mode is on), else `setpoint` if its setpoint was changed at all in the window, else `manual` (a mode or fan change while on). Its `setpoint_before/after` and `power_before/after` keep the first and last values. The room-level kind is derived from the units' kinds when the reaction is recorded, and stored with it: `off` if any unit went off, else `on`, else `setpoint`, else `manual`. A unit turned on and given a new setpoint in the same window is one reaction of kind `on`; setpoint learning still applies to it, because its `setpoint_after` changed.
 
-A **setpoint-moving reaction** is a setpoint change or a knob turn, or a reaction of any kind in which a unit's setpoint changed (an `on` that comes with a new setpoint, say). It moves S, sets the rounding direction, makes the section learned and opens a comfort window.
+A **setpoint-moving reaction** is a setpoint change or a knob turn, or a reaction of any kind in which a unit's setpoint changed (an `on` that comes with a new setpoint, say). It moves S and the applied setpoint, makes the section learned and opens a comfort window.
 
 ### Setpoint
 
@@ -77,11 +77,14 @@ S_new = S_before + rate × (S_chosen − S_before)
 
 S_chosen is the person's raw value, whatever offset or boost was active at the time. Offsets never feed learning.
 
-The stored value stays fractional. The applied value, `setpoint_applied`, rounds to a whole degree **toward the direction of the latest setpoint-moving reaction**, which is the sign of S_chosen − S_before. A correction from 22 to 23 stores 22.5 and applies 23, so a 1° correction always shows the next day. Plain rounding would send 22.5 back to 22, repeating the v1 bug.
+The stored value stays fractional. The applied value, `setpoint_applied`, is on whole degrees and is tracked through the replay, reaction by reaction:
 
-- **The direction is how S moved, not the gesture.** If S is 23 and the unit is boosting at 21 when a person sets 22, the gesture is warmer but S moves down to 22.5, so 22 is applied.
-- **If S didn't move,** the previous direction stands. On/off and manual reactions change it only when they changed a setpoint too.
-- **A seed alone** has no direction yet and rounds half up.
+- **Normally it is the whole step nearest S.** An exact half goes toward the latest reaction's direction, the sign of S_chosen − S_before. A seed alone has no direction yet and rounds half up.
+- **A correction always shows.** After a setpoint-moving reaction whose chosen value differs from the `setpoint_applied` in force at that moment, the new value moves at least one step from that previous value toward the chosen value, and never past it. A correction from 22 to 23 stores 22.5 and applies 23, so a 1° correction shows the next day. Plain rounding would send 22.5 back to 22, repeating the v1 bug.
+- **A chosen value equal to the applied value keeps it.**
+- **Nothing else moves it.** Quiet days, and reactions that change no setpoint (on/off or manual alone, or 22 → 23 → 22 in one window), leave it where it is.
+
+This replaced rounding toward the direction of the latest reaction, which over-applied: Main Room sleep had S 24.17 and applied 25. In the worked example in `tools/analyser_demo.py` (23 in force when the person chose 25), 24.17 now applies 24: the nearest step, and still one step up. Had 24 been in force, the correction would still have to show, and 25 would apply. If S is 23 and the unit is boosting at 21 when a person sets 22, the gesture is warmer, but 22 is below the applied 23, so 22 is applied.
 
 ### Per-sensor comfort readings
 
@@ -291,7 +294,7 @@ No helper has an `initial`: Home Assistant would reset it to that at every resta
 
 ### Almanac contract additions
 
-- Per unit: `setpoint` (precise) plus `setpoint_applied` (already rounded toward the latest setpoint-moving reaction), so templates never round.
+- Per unit: `setpoint` (precise) plus `setpoint_applied` (already on a whole degree, tracked through the replay as in [Setpoint](#setpoint)), so templates never round.
 - Per section: `status` (`provisional` or `learned`) and `confidence`.
 - Per room: the learned `margin`.
 
@@ -409,7 +412,7 @@ Phases 0 to 5 are built and checked offline against the existing harnesses, then
 | Phase | Scope | Check |
 | --- | --- | --- |
 | 0 · Foundations | Storage migrations (`user_version`, backup first, checked transaction, rollback; `almanac` and `event` rebuilt); `section_run` written to CSV; every v2 config key with defaults, and the v1 config migration; `setpoint_before` keeps the first value in a window | `store_check` migrates a v1 database keeping every row, finds it identical to a fresh one, and sees a forced failure leave it untouched; `config_check` migrates the v1 example to exactly the v2 example; a three-step setpoint change records its first `setpoint_before` |
-| 1 · Learning flip | Analyser becomes a replay of reactions from per-unit and per-sensor seeds; rounding toward the latest setpoint-moving reaction; comfort from accepted readings; confidence; the runtime's provisional seeding retired | `analyser_demo` applies a 1° correction the next day; `compare_analyser` diffs v1 and v2 almanacs |
+| 1 · Learning flip | Analyser becomes a replay of reactions from per-unit and per-sensor seeds; `setpoint_applied` tracked through the replay (see [Setpoint](#setpoint)); comfort from accepted readings; confidence; the runtime's provisional seeding retired | `analyser_demo` applies a 1° correction the next day; `compare_analyser` diffs v1 and v2 almanacs |
 | 2 · On/off as reactions | Runtime detects a person turning units on or off, or changing mode or fan; reaction kind stored per unit and room; a unit coming back from unavailable changed is logged | `runtime_check` records person on/off and still ignores the system's own changes; on plus a setpoint change in one window is one `on` reaction |
 | 3a · Control core | `app/control.py`: votes, the state machine, section changes and person reactions as pure functions; `app.trust.evaluate_edges` | `control_check` runs the scenario table, and each rule's scenarios fail when it is removed |
 | 3b · Cool-or-rest in HA, deploy and leak | Generator Jinja for maintenance, scenes and the manual-change automation, with the new unit helpers; maintenance raises the guard; the Warming/fan_only path is removed. `input_number` (and `input_boolean`) helper domains, created at 0; every `ac_since_*` set to now on creation; leak automations write the state helper; the runtime's reaction detector also ignores a change that matches what the unit's state helper implies (`rest` → off, and so on), as the manual-change automation does | `control_logic_check` replays every `control_check` scenario through the generated automations with zero differences; `deploy_reconcile_check` creates the new helpers with the right initial values; `leak_response_check` still passes |
@@ -539,3 +542,7 @@ Before cutover, 27 Oct 2026:
 64. **The manual-change automation has three triggers:** a state trigger with `to: null` (mode changes only) and attribute triggers on `temperature` and `fan_mode`, so `current_temperature` updates no longer fire it. A change that moves the mode and an attribute fires it twice; the second run sees the first's helper writes and either finds the change is now ours or writes the same record again. `control_logic_check` asserts the triggers, matches them as Home Assistant does, and runs the automation once per trigger that fires.
 65. **`tools/doctor.py --v2-preflight`** tries, on a real Home Assistant, the behaviour the generated templates rely on: an `input_datetime` timestamp round trip, an `ac_base_*`-shaped `input_number` taking 0 and 23.5, and HA's own Jinja (via the template API) rendering the timestamp attribute, the `s.attributes.get` snapshot and `now()`. It uses throwaway `ac_preflight_*` helpers, created and deleted through deploy's helper API, removed even when a step fails.
 66. **Cutover and rollback** follow `docs/V2_CUTOVER.md`. Rolling back, v1's own deploy removes the v2 `input_select`, `input_boolean` and `input_datetime` helpers, but not the `input_number` ones (a domain v1 never lists) nor the `ac_manual_*` automations (the restored v1 manifest predates them); the runbook deletes those by hand. Checked by running v1.0-poc's deploy code against a stub holding a v2 deployment.
+
+Rounding, 27 Oct 2026 (supersedes 9, and the rounding-direction parts of 21, 33, 34 and 37):
+
+67. **`setpoint_applied` is tracked through the replay.** It is normally the whole step nearest S, an exact half going toward the latest reaction's direction (half up for a seed alone). After a setpoint-moving reaction whose chosen value differs from the `setpoint_applied` in force at that moment, the new value moves at least one step from that value toward the chosen one, and never past it; a chosen value equal to it keeps it. Nothing else moves it, so quiet days never change it. Rounding toward the latest reaction's direction over-applied: Main Room sleep had S 24.17 and applied 25; with 23 in force when the person chose 25 it now applies 24 (with 24 in force it would still apply 25). An `on` that sets 21 → 23 after a correction down to 21 now applies 22 (S 22.25), where the direction rule applied 23. Decision 22 stands: steps are whole degrees, and `nearest_step` and `next_applied` take the step as a parameter. With whole-degree setpoints the chosen value is always on a step; a fractional one is never passed, even if that means no step is taken.
