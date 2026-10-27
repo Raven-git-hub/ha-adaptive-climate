@@ -209,9 +209,9 @@ SCENARIOS = [
 
     # --- leak ----------------------------------------------------------------
     s("leak overrides the minimum time and grace", [
-        step("settled_warm", {"state": "leak", "since": 0}, cmd("dry", "low", 22.0))],
+        step("settled_warm", {"state": "leak", "since": 0}, OFF)],
       unit={"since": -m(1), "grace_until": m(20)}, ctx={"leak_on": True}),
-    s("leak overrides a person's off", [step("cold", {"state": "leak"}, cmd("dry", "low", 22.0))],
+    s("leak overrides a person's off", [step("cold", {"state": "leak"}, OFF)],
       unit={"state": "user_off"}, ctx={"leak_on": True}),
     s("leak holds, and sends nothing again", [step("hot", {"state": "leak"}, None)],
       unit={"state": "leak", "since": -m(10)}, ctx={"leak_on": True}),
@@ -223,10 +223,14 @@ SCENARIOS = [
       unit={"state": "leak", "since": -m(10)}, ctx={"blocked": True}),
     s("leak release in a forced-off section", [step("hot", {"state": "config_off"}, OFF)],
       unit={"state": "leak", "since": -m(10)}, ctx={"forced_off": True}),
-    s("leak release with no almanac still leaves dry", [
-        step("hot", {"state": "cool"}, cmd("cool", "low", None))],
+    s("leak turns the unit off, not dry", [
+        step("hot", {"state": "leak"}, OFF), step("hot", {"state": "leak"}, None, at=m(10))],
+      unit={"state": "boost", "offset": -1, "since": -m(30)}, ctx={"leak_on": True}),
+    s("leak release with no almanac rests, off, sending nothing", [
+        step("hot", {"state": "rest", "since": 0}, None),
+        step("cold", {"state": "rest"}, None, at=m(20))],
       unit={"state": "leak", "since": -m(10)}, ctx={"setpoint_applied": None}),
-    s("leak with no almanac still goes dry", [step("hot", {"state": "leak"}, cmd("dry", "low"))],
+    s("leak with no almanac still goes off", [step("hot", {"state": "leak"}, OFF)],
       unit={"since": -m(10)}, ctx={"setpoint_applied": None, "leak_on": True}),
 
     # --- nothing to drive / hands off -------------------------------------------
@@ -257,8 +261,8 @@ SCENARIOS = [
       ctx={"blocked": True}),
     s("section change in a forced-off section", [
         section({"state": "config_off"}, OFF, forced_off=True)]),
-    s("section change with the leak latched re-sends dry", [
-        section({"state": "leak"}, cmd("dry", "low", 22.0))],
+    s("section change with the leak latched re-sends off", [
+        section({"state": "leak"}, OFF)],
       unit={"state": "leak"}, ctx={"leak_on": True}),
     s("section change ends user_off", [section({"state": "cool"}, cmd("cool", "low", 22.0))],
       unit={"state": "user_off"}),
@@ -322,6 +326,9 @@ SCENARIOS = [
         change(("cool", 23.0, "low"), ("cool", 21.0, "medium"),
                {"state": "boost", "offset": 1, "since": -m(2)})],
       unit={"state": "boost", "offset": 1, "since": -m(2)}),
+    s("a delayed echo of our own leak off is ignored", [
+        change(("cool", 22.0, "low"), ("off", 22.0, "low"), {"state": "leak", "since": -m(1)})],
+      unit={"state": "leak", "since": -m(1)}, ctx={"leak_on": True}),
     s("a setpoint within reactive_min_delta of our command is ours", [
         change(("cool", 21.0, "low"), ("cool", 22.4, "low"), {"state": "cool", "base": None})]),
     s("a setpoint change on a resting unit is a person's: rest, and a wake at the new base", [

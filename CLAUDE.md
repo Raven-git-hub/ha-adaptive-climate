@@ -122,7 +122,7 @@ python tools/control_check.py               # control state machine scenarios; e
 python tools/control_logic_check.py         # the generated automations replayed against app/control.py
 python tools/deploy_reconcile_check.py      # deploy create / reuse / update / prune
 python tools/runtime_check.py               # runtime observer + control loop
-python tools/leak_response_check.py         # leak detection / DRY / release automations
+python tools/leak_response_check.py         # leak detection / OFF / release automations
 ```
 
 Run `PYTHONPATH=.` before these if invoking from outside the repo root (most

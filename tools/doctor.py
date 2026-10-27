@@ -54,7 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app import generator as g                                 # noqa: E402
 from app.ha import HARest, HAWebSocket, HAAuthError, HAError  # noqa: E402
 
-REQUIRED_HVAC = ("cool", "dry", "off")   # cool and boost, leak, rest and the off states
+REQUIRED_HVAC = ("cool", "off")          # cool and boost; rest, the off states and leak
 REQUIRED_FAN = ("low", "medium")         # cool / boost
 
 GREEN, RED, YELLOW, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[0m"
@@ -311,7 +311,7 @@ async def _run(url: str, token: str, verify_ssl: bool,
                         line(FAIL, f"    {u['entity_id']} missing hvac_modes: {missing_hvac}")
                         hard_failures += 1
                     else:
-                        line(OK, f"    {u['entity_id']} has cool/dry/off")
+                        line(OK, f"    {u['entity_id']} has cool/off")
 
                     if fan_modes is None:
                         line(WARN, f"    {u['entity_id']} reports fan_modes=None "

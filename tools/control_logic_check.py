@@ -655,8 +655,8 @@ def _extra_cases() -> int:
     ha, config, room = world(cool, leak_on=True)
     ha.set(g.hold_id(ROOM), "on")
     ha.run(g.build_leak_automation(config, room, room["units"][0]))
-    expect((_sent(ha.calls) or {}).get("hvac_mode") == "dry",
-           "hold on: a leak trip still drives dry")
+    expect(_sent(ha.calls) == {"hvac_mode": "off", "fan_mode": None, "temperature": None},
+           "hold on: a leak trip still turns the unit off (no setpoint, no fan)")
 
     ha, config, room = world(cool)
     ha.entities[ENTITY]["attributes"]["fan_modes"] = None

@@ -8,14 +8,16 @@ tools/control_logic_check.py, on the example config with leak detection
 wired on the baby room:
 
   1. wet: the leak automation raises the latch, puts the state helper in
-     leak and drives dry (fan low, the unit's setpoint), under the guard
-  2. a crossover landing mid-leak re-asserts dry instead of cooling, and
+     leak and turns the unit off (no setpoint, no fan; dry would still run
+     the compressor), under the guard, almanac or not
+  2. a crossover landing mid-leak re-asserts off instead of cooling, and
      maintenance holds leak without re-sending anything
   3. a person's change while latched leaves the unit in leak, and the
-     unit's delayed echo of dry is not taken for a person at all
+     unit's delayed echo of off is not taken for a person at all
   4. release is blocked while the sensor still reads wet, even if confirmed
-  5. release once dry and confirmed: latch and confirmation off, and the
-     unit treated as at a section change (cool, fan low, the setpoint)
+  5. release once the sensor is dry and the fix confirmed: latch and
+     confirmation off, and the unit treated as at a section change (cool,
+     fan low, the setpoint)
   6. units without leak detection never read a latch, and their rooms'
      automations are identical to a config with no leak detection at all
 
@@ -85,36 +87,37 @@ def main() -> int:
     assert ha.states(g.leak_id(ROOM, UNIT)) == "on"
     assert ha.states(g.state_id(ROOM, UNIT)) == "leak"
     assert ha.state_attr(g.since_id(ROOM, UNIT), "timestamp") == table.T0.timestamp()
-    assert _sent(ha.calls) == {"hvac_mode": "dry", "fan_mode": "low", "temperature": 24.0}, \
-        _sent(ha.calls)
+    off = {"hvac_mode": "off", "fan_mode": None, "temperature": None}
+    assert _sent(ha.calls) == off, _sent(ha.calls)
+    assert [c[0] for c in ha.calls if c[0].startswith("climate.")] == ["climate.set_hvac_mode"]
     assert all(guarded for s, _, _, guarded in ha.calls if s.startswith("climate."))
     assert ha.states(g.guard_id(ROOM)) == "off"
-    print("wet: latch on, state helper leak, dry / fan low / the unit's setpoint, "
-          "sent under the guard - OK")
-    dry = ha.climate()
+    print("wet: latch on, state helper leak, the unit turned off (set_hvac_mode off only: no "
+          "setpoint, no fan), sent under the guard - OK")
+    went_off = ha.climate()
 
-    # with no almanac yet, a leak still goes dry, leaving the setpoint alone
+    # with no almanac yet, a leak still turns the unit off
     bare = _world(cfg, room, "cool", setpoint_applied=None)
     bare.run(leak, {"to_state": {"state": "on"}})
-    assert _sent(bare.calls) == {"hvac_mode": "dry", "fan_mode": "low", "temperature": None}
-    print("wet with no almanac yet: dry and fan low, no setpoint - OK")
+    assert _sent(bare.calls) == off
+    print("wet with no almanac yet: still off - OK")
 
-    # 2. a crossover mid-leak re-asserts dry; maintenance holds
+    # 2. a crossover mid-leak re-asserts off; maintenance holds
     ha.calls = []
     ha.run(scene)
     assert ha.states(g.state_id(ROOM, UNIT)) == "leak"
-    assert _sent(ha.calls)["hvac_mode"] == "dry", _sent(ha.calls)
-    print("crossover mid-leak: stays leak and re-sends dry, not cool - OK")
+    assert _sent(ha.calls) == off, _sent(ha.calls)
+    print("crossover mid-leak: stays leak and re-sends off, not cool - OK")
     ha.calls = []
     ha.now = table._time(table.m(30))
     ha.run(maintenance)
     assert ha.states(g.state_id(ROOM, UNIT)) == "leak" and ha.calls == []
     print("maintenance mid-leak: holds leak and sends nothing - OK")
 
-    # 3. people while latched, and the unit's echo of dry
+    # 3. people while latched, and the unit's echo of off
     before = ha.climate()
-    for after in (control.Climate("off", before.temperature, before.fan),
-                  control.Climate("cool", 22.0, "low"),
+    for after in (control.Climate("cool", 22.0, "low"),
+                  control.Climate("off", 20.0, "low"),
                   control.Climate("dry", 20.0, None)):
         trig = {"from_state": {"state": before.mode, "attributes": {
                     "temperature": before.temperature, "fan_mode": before.fan},
@@ -124,14 +127,15 @@ def main() -> int:
                     "context": {"parent_id": None}}}
         ha.run(manual, trig)
         assert ha.states(g.state_id(ROOM, UNIT)) == "leak", after
-    echo = {"from_state": {"state": "cool", "attributes": {"temperature": 25.0},
+    echo = {"from_state": {"state": "cool", "attributes": {"temperature": went_off.temperature,
+                                                           "fan_mode": went_off.fan},
                            "context": {"parent_id": None}},
-            "to_state": {"state": dry.mode, "attributes": {"temperature": dry.temperature,
-                                                           "fan_mode": dry.fan},
-                         "context": {"parent_id": None}}}
+            "to_state": {"state": went_off.mode, "attributes": {
+                "temperature": went_off.temperature, "fan_mode": went_off.fan},
+                "context": {"parent_id": None}}}
     assert ha.run(manual, echo) is None
-    print("people while latched: off, cool and a new setpoint all leave the unit in leak; "
-          "the unit's delayed echo of dry isn't a person - OK")
+    print("people while latched: on, a new setpoint and dry all leave the unit in leak; "
+          "the unit's delayed echo of off isn't a person - OK")
 
     # 4. confirmed while still wet: release is blocked
     ha.set(g.leak_confirm_id(ROOM, UNIT), "on")
@@ -140,7 +144,7 @@ def main() -> int:
     assert ha.states(g.leak_id(ROOM, UNIT)) == "on"
     print("release while the sensor still reads wet: blocked, even though confirmed - OK")
 
-    # 5. dry and confirmed: released, as at a section change
+    # 5. sensor dry and fix confirmed: released, as at a section change
     ha.set(SENSOR, "off")
     ha.calls = []
     ha.run(release, {"to_state": {"state": "on"}})
@@ -149,8 +153,8 @@ def main() -> int:
     assert ha.states(g.state_id(ROOM, UNIT)) == "cool"
     assert float(ha.states(g.offset_id(ROOM, UNIT))) == 0
     assert _sent(ha.calls) == {"hvac_mode": "cool", "fan_mode": "low", "temperature": 24.0}
-    print("release once dry and confirmed: latch and confirmation off, state cool at offset 0, "
-          "cool / fan low / 24 - OK")
+    print("release once the sensor is dry and the fix confirmed: latch and confirmation off, "
+          "state cool at offset 0, cool / fan low / 24 - OK")
 
     # 6. no regression for units without leak detection
     plain = next(r for r in cfg["rooms"] if r["id"] == "main_room")

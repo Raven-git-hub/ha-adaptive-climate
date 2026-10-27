@@ -25,7 +25,7 @@ table through these templates against app/control.py.
 Per-unit hardware differences (fan availability, min/max range - see
 docs/HARDWARE.md) are handled inside the generated templates by reading the
 unit's own attributes at runtime, so one generated automation adapts to
-each unit and to the dry-mode-hides-fan quirk.
+each unit and to units that hide their fan modes in some hvac modes.
 """
 
 from __future__ import annotations
@@ -291,12 +291,10 @@ def _command(state: str, base: str, offset: str, boost: float) -> str:
         "else {'hvac_mode': 'cool', 'fan_mode': 'medium', "
         "'temperature': (none if <<B>> is none else <<BOOST>>) } if <<S>> == 'boost' "
         "else {'hvac_mode': 'off', 'fan_mode': none, 'temperature': none} "
-        "if <<S>> in ['rest', 'config_off', 'user_off'] "
-        "else {'hvac_mode': 'dry', 'fan_mode': 'low', "
-        "'temperature': (none if <<B>> is none else <<DRY>>) } if <<S>> == 'leak' "
+        "if <<S>> in ['rest', 'config_off', 'user_off', 'leak'] "
         "else none)",
         S=state, B=base, COOL=_clamp(f"{base} + {offset}"),
-        BOOST=_clamp(f"{base} + {offset} - {boost!r}"), DRY=_clamp(base))
+        BOOST=_clamp(f"{base} + {offset} - {boost!r}"))
 
 
 def _go(state: str, cfg: control.ControlConfig, offset: str | None = None) -> str:
@@ -330,12 +328,10 @@ def _section_change(cfg: control.ControlConfig, forced_off: str) -> str:
         "{%- set r.go = true -%}"
         "{%- if leak -%}{%- set r.state = 'leak' -%}"
         "{%- elif <<FORCED>> -%}{%- set r.state = 'config_off' -%}"
-        "{%- elif sa is none -%}{%- if st == 'leak' -%}{%- set r.state = 'cool' -%}{%- endif -%}"
+        "{%- elif sa is none -%}{%- if st == 'leak' -%}{%- set r.state = 'rest' -%}{%- endif -%}"
         "{%- else -%}{%- set r.state = 'rest' if blocked else 'cool' -%}"
         "{%- endif -%}"
         "{%- if leak or <<FORCED>> or sa is not none -%}{%- set r.cmd = <<CMD>> -%}"
-        "{%- elif st == 'leak' -%}"
-        "{%- set r.cmd = {'hvac_mode': 'cool', 'fan_mode': 'low', 'temperature': none} -%}"
         "{%- endif -%}",
         FORCED=forced_off, CMD=_command("r.state", "sa", "0", cfg.boost_degrees))
 
@@ -515,15 +511,14 @@ def build_scene_automation(config: dict, room: dict, section: dict) -> dict:
 
 # ---------------------------------------------------------------------
 # Leak automations - the latch (docs/DESIGN.md D6): a trip puts the unit
-# into leak and dry at once; a confirmed release treats it as at a section
-# change. The trip ignores ac_hold (safety); the release, like a scene,
+# into leak and turns it off at once (dry would still run the compressor);
+# a confirmed release treats it as at a section change. The trip ignores ac_hold (safety); the release, like a scene,
 # writes the helpers but sends nothing while ac_hold is on.
 # ---------------------------------------------------------------------
 
 def build_leak_automation(config: dict, room: dict, unit: dict) -> dict:
-    """Raises the leak boolean AND drives the unit into leak (dry, fan low
-    if offered, its base or the almanac setpoint if known) under the guard -
-    the boolean alone drives nothing. When the unit's
+    """Raises the leak boolean AND puts the unit into leak, turned off,
+    under the guard - the boolean alone drives nothing. When the unit's
     leak_detection.sensor_entity_id is set, the trigger is wired directly to
     that binary_sensor going 'on'. Left unset, the trigger is empty for the
     user to wire a sensor into by hand in Home Assistant."""
@@ -557,7 +552,7 @@ def build_leak_automation(config: dict, room: dict, unit: dict) -> dict:
 def build_leak_release_automation(config: dict, room: dict, unit: dict) -> dict:
     """Latch release: fires when the user confirms the fix, and treats a
     unit in leak as at a section change straight away rather than leaving
-    it in dry until the next scheduled crossover. When the sensor is known,
+    it off until the next scheduled crossover. When the sensor is known,
     a condition also requires it to no longer read 'on' - confirmation
     alone is not enough while the sensor still reports wet."""
     r, u = room["id"], unit["id"]

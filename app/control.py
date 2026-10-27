@@ -76,7 +76,7 @@ class Unit:
 
 @dataclass(frozen=True)
 class Command:
-    hvac_mode: str                      # cool | dry | off
+    hvac_mode: str                      # cool | off
     fan_mode: str | None = None
     temperature: float | None = None    # None: leave the unit's setpoint as it is
 
@@ -195,10 +195,8 @@ def command_for(state: str, base: float | None, offset: int, ctx: Context) -> Co
     if state == "boost":
         return Command("cool", "medium", None if base is None
                        else clamp(base + offset - ctx.config.boost_degrees, lo, hi))
-    if state in ("rest", "config_off", "user_off"):
-        return Command("off")
-    if state == "leak":
-        return Command("dry", "low", None if base is None else clamp(base, lo, hi))
+    if state in ("rest", "config_off", "user_off", "leak"):
+        return Command("off")            # leak too: dry still runs the compressor
     return None                          # manual: the person's settings stand
 
 
@@ -343,7 +341,7 @@ def step(unit: Unit, votes: Votes, now: datetime, ctx: Context) -> tuple[Unit, C
 def on_section_change(unit: Unit, ctx: Context, forced_off: bool,
                       now: datetime) -> tuple[Unit, Command | None]:
     """The scene at a crossover (and a confirmed leak release). Resets the
-    section-scoped fields, then: leak if the latch is on (dry is re-sent),
+    section-scoped fields, then: leak if the latch is on (off is re-sent),
     else config_off if the scene forces the unit off, else rest if cooling
     is blocked, else cool. user_off and manual end here. Minimum times
     don't apply."""
@@ -356,8 +354,9 @@ def on_section_change(unit: Unit, ctx: Context, forced_off: bool,
     elif ctx.setpoint_applied is None:
         if unit.state != "leak":
             return reset, None               # no almanac yet: leave the unit alone
-        # a released leak needs a way out of dry even before there is an almanac
-        return replace(reset, state="cool"), Command("cool", "low", None)
+        # A released leak can't stay in leak. Its unit is already off: rest
+        # leaves it off, and wakes it once there is a setpoint to cool to.
+        return replace(reset, state="rest"), None
     else:
         state = "rest" if ctx.blocked else "cool"
     new = replace(reset, state=state)

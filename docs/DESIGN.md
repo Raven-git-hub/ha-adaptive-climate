@@ -97,8 +97,9 @@ Control): `cool` (cool, fan low, base + offset), `boost` (cool, fan medium,
 base + offset − the boost step), `rest` (off, waiting), `user_off` and `manual`
 (a person turned it off or chose another mode or fan; hands off until the
 section changes), `config_off` (the section's scene forces it off) and `leak`
-(dry, latched). The system only ever cools a unit or turns it off, apart from
-leak protection: v1's Warming state (fan_only) is gone.
+(off, latched). The system only ever cools a unit or turns it off: v1's
+Warming state (fan_only) is gone, and leak protection turns the unit off
+rather than to dry, which would still run the compressor.
 
 The **base** is the section's setpoint (`setpoint_applied` at the section
 change, or what a person chose since); the **offset** builds up in whole steps
@@ -156,13 +157,13 @@ trigger for the user to wire their own sensor into by hand.
 
 **The boolean is not a passive record - it drives the AC.** The leak automation
 raises `input_boolean.ac_leak_<room>_<unit>` and, in the same action list,
-immediately puts the unit's state helper in `leak` and drives it to DRY (fan
-LOW if supported, its base or the almanac setpoint if known), under the guard
-and regardless of the hold. Maintenance checks the latch before anything else
+immediately puts the unit's state helper in `leak` and turns it OFF (no
+setpoint, no fan: dry would still run the compressor, and a leaking unit keeps
+leaking), under the guard and regardless of the hold. Maintenance checks the latch before anything else
 too, so a latch raised by hand still wins, and holds a unit in `leak` without
 re-sending. Critically, **every scene (crossover) automation for a leak-enabled
 unit checks the leak boolean before anything else** - ahead of even an explicit
-forced-off scene - and re-asserts DRY if it's on, instead of driving the unit
+forced-off scene - and re-asserts OFF if it's on, instead of driving the unit
 back to cooling. Without this, a
 scheduled boundary landing while a leak was still active would have silently
 reverted the unit to Cool, which was a real defect caught after the picker
@@ -173,8 +174,9 @@ Leak mode is a **latch**: release requires the user's confirmation
 known, that it has actually stopped reporting a leak - confirming alone is not
 enough while the sensor still reads wet. On release, the unit is treated as at
 a section change immediately (cool at the section's setpoint, or rest or
-config_off as the section says), rather than left in DRY until whatever
-scheduled crossover happens to be next.
+config_off as the section says), rather than left off until whatever
+scheduled crossover happens to be next. Released before there is an almanac,
+the unit rests: still off, until there is a setpoint to cool to.
 
 ### D7. Temperature unit is configurable
 

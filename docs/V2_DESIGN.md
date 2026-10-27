@@ -46,7 +46,7 @@ Targets move only when a person acts. A section with no reaction adds confidence
 
 ### What counts as a reaction
 
-A change is a person's when it carries no `context.parent_id`, `ac_active` is off, and the unit isn't now showing the command its state helper implies, which would be our own command arriving after the guard came down. For `rest`, `user_off` and `config_off` that command is off: the change is ours if the unit is off and its setpoint didn't change, so a setpoint changed while off is still a person's. For `cool`, `boost` and `leak` it is ours if the unit shows the command's mode and its setpoint to within `reactive_min_delta` (any setpoint, if the command sets none). The fan is never compared, so a person's fan-only change while the unit sits exactly at our command isn't seen. In `manual` every change is a person's. The container's reaction detector and HA's manual-change automation apply the same test, `app.control.matches_command`.
+A change is a person's when it carries no `context.parent_id`, `ac_active` is off, and the unit isn't now showing the command its state helper implies, which would be our own command arriving after the guard came down. For `rest`, `user_off`, `config_off` and `leak` that command is off: the change is ours if the unit is off and its setpoint didn't change, so a setpoint changed while off is still a person's. For `cool` and `boost` it is ours if the unit shows the command's mode and its setpoint to within `reactive_min_delta` (any setpoint, if the command sets none). The fan is never compared, so a person's fan-only change while the unit sits exactly at our command isn't seen. In `manual` every change is a person's. The container's reaction detector and HA's manual-change automation apply the same test, `app.control.matches_command`.
 
 A unit dropping to `unavailable` or `unknown`, or coming back, is never a reaction: nobody can say who changed it. If it comes back in a different power, mode, setpoint or fan from the one it dropped out in, the runtime logs a `control` event saying what changed.
 
@@ -157,7 +157,7 @@ The system only ever cools a unit or turns it off, apart from leak protection. W
 | `user_off` | off, because a person turned it off; hands off until the section changes |
 | `manual` | the mode and fan a person chose; hands off until the section changes |
 | `config_off` | off, because the section's scene config forces it off; maintenance never touches it |
-| `leak` | dry, latched |
+| `leak` | off, latched (no setpoint, no fan: dry would still run the compressor) |
 
 **Base** is the unit's `input_number.ac_base_<room>_<unit>`. At each section change the scene sets it to the almanac's `setpoint_applied`. A person's setpoint change or turn-on resets it (see [Person reactions](#person-reactions)). Almanac pushes never change it mid-section, so a new S takes effect from the section's next run. A base of 0 means unset, and templates fall back to `setpoint_applied`. Every command is base + offset, minus the boost step in `boost`. Offsets build up within a section, reset at the next section change, and never feed learning.
 
@@ -168,7 +168,7 @@ System transitions:
 - `cool` → `rest` when the quorum is met and the direction is too cold, or when cooling is blocked and the unit isn't unblocked.
 - `rest` → `cool` when back at comfort; offset +1. A rest doesn't wake while blocked.
 - Any state → `leak` when the leak sensor is wet. Leak beats everything, including a person turning the unit off. When the leak is fixed and confirmed, the unit is evaluated as at a section change.
-- **Section change:** offsets reset to 0, base = `setpoint_applied`, `since` = now, and `ac_unblocked` and `ac_grace_until` are cleared. Each unit starts in `config_off` if the section's scene forces it off, otherwise in `rest` if cooling is blocked, otherwise in `cool`. `user_off` and `manual` end here; a unit in `leak` stays there, and dry is sent again. A section change overrides minimum times.
+- **Section change:** offsets reset to 0, base = `setpoint_applied`, `since` = now, and `ac_unblocked` and `ac_grace_until` are cleared. Each unit starts in `config_off` if the section's scene forces it off, otherwise in `rest` if cooling is blocked, otherwise in `cool`. `user_off` and `manual` end here; a unit in `leak` stays there, and off is sent again. A section change overrides minimum times.
 
 ### Person reactions
 
@@ -191,7 +191,7 @@ The **grace period** runs until `input_datetime.ac_grace_until_<room>_<unit>`, w
 - **Boost cap:** `system.control.boost_max_minutes` (default 60). The unit then returns to `cool` at −1; if the room is still too warm next heartbeat, another boost can start, so it steps down gradually.
 - **Offsets and limits:** the offset moves in whole steps and is capped at ±3 on its own. The boost step, `system.control.boost_degrees` (default 2), goes on top, and the final command is clamped to the unit's own range (18 to 30° for the baby room, 16 to 30° for the others).
 - **Minimum times:** counted in heartbeats, to protect the compressor: at least 1 in `cool` or `boost` (a boost that a block sends to `rest` included), at least 2 in `rest`. A minimum of n heartbeats is met when the time since `since` is at least (n − 0.5) × the heartbeat interval, which is 5 and 15 minutes at the default 10-minute interval. A section change and a leak override them.
-- **No seed:** while a unit has neither a base nor a `setpoint_applied`, maintenance leaves it alone and a section change resets its fields without a command. A leak still drives it to dry, with no temperature, and a leak released before there is an almanac leaves it cooling at its current setpoint.
+- **No seed:** while a unit has neither a base nor a `setpoint_applied`, maintenance leaves it alone and a section change resets its fields without a command. A leak still turns it off, and a leak released before there is an almanac goes to `rest`: still off, and woken by maintenance once there is a setpoint to cool to.
 - **Commands:** sent only on transitions and at section changes, never re-sent every heartbeat. Maintenance and the leak automations raise `ac_active` around every command, as scenes do.
 - **Fan:** low in `cool`, medium in `boost`. A fan call the unit's current mode rejects is skipped, not fatal (as in v1).
 - **Pause:** while `ac_hold_<room>` is on, scenes and maintenance send no commands. Maintenance doesn't run at all; scenes and a leak release still write the helpers. A leak trip ignores the pause. Only a person turns it on or off.
@@ -237,7 +237,7 @@ k is fixed in v2. Learning it (the "outdoor trust") is deferred.
 
 Cooling is blocked when the section's warmest forecast hour is at least the **margin** M below the room comfort point (Δ of the max ≥ M). The block lifts only when Δ of the max ≤ M − 1. It is decided at each section change and locked for the section.
 
-While blocked, the scene rests the units, "too warm" votes are ignored, and the amber arc shows a lock. Leak protection is unaffected, since that uses dry mode, not cooling.
+While blocked, the scene rests the units, "too warm" votes are ignored, and the amber arc shows a lock. Leak protection is unaffected, since a leak turns the unit off.
 
 If a person turns a unit on during a block, that unit's `ac_unblocked` helper turns on, and the block is ignored for it until the section changes. The margin is per room: it starts at 6 °C, stays between 2 and 10 °C, and learns from reactions:
 
@@ -313,7 +313,7 @@ The Now view becomes the donut sketch: a donut per room, a correction scale and 
 - **Fixed arcs:** blue (rest), green (comfortable), amber (cool). The comfort reading sits at the top.
 - **One marker per sensor,** numbered to match its table row. Positions are in band widths, scaled so the leaned trigger edges land on the fixed arc boundaries. A change in the forecast therefore moves every marker, which is the lean made visible.
 - **Markers pin at the ends** of the scale with an overflow tick, since a trusted sensor can travel far past its band.
-- **Centre fan:** stopped, slow or fast for off, low and medium. The bottom segment names the state: Cool · Low, Boost · Medium, Resting, Off (by you), Manual, Off (scheduled), Leak · Dry.
+- **Centre fan:** stopped, slow or fast for off, low and medium. The bottom segment names the state: Cool · Low, Boost · Medium, Resting, Off (by you), Manual, Off (scheduled), Leak · Off.
 - **Block:** the amber arc greys out with a lock. In shadow mode it gets a dashed lock reading "would block".
 
 ### Now: correction scale
@@ -554,3 +554,4 @@ From the first live run, 27 Oct 2026:
 68. **Startup replays every room before any crossover.** The almanac is empty after a migration, and the first heartbeat's replay came 10 minutes after startup: the 22:00 Sleep crossover, three minutes after a 21:57 start, found no `setpoint_applied` and left every unit in `manual`. `start()` now replays every room and pushes its almanac before the catch-up crossover and before the scheduler starts.
 69. **The UI is served with `Cache-Control: no-cache`.** The Almanac tab's Status column showed "undefined": the browser was running a cached v1 `app.js`, which reads the almanac's `state`, against v2's API, which sends `status` (v2's `app.js` reads `status`). Served without a cache lifetime, the old script could stay in use for days; now every load revalidates (a 304 when unchanged). A browser still holding v1's script needs one hard refresh.
 70. **The deploy check is a real dry run.** `GET /api/deploy/check` returned every list empty with `ok: true`, while the deploy straight after created 18 helpers, removed 3 and wrote 29 automations: the check only verified entities. It now runs the same reconciliation plan with writing switched off and reports what Deploy would create, reuse, update, remove and write (`dry_run: true`). `deploy_reconcile_check` runs it before each deploy and requires it to write nothing and to list exactly what that deploy then does.
+71. **A leak turns the unit off, not dry** (supersedes the dry parts of 44, 45 and 60, and moves `leak` into the off group of 53). Dry still runs the compressor, and a unit with a leak keeps leaking. The leak command is hvac off with no setpoint and no fan, from the trip, from maintenance when the latch is raised by hand, and re-sent by a section change while latched; `leak` implies off for the "is this ours" check. A leak still beats everything, and a release is still a section change. A leak released before there is an almanac goes to `rest` with no command (the unit is already off, and `leak` can't be kept), where it stays off until there is a setpoint to cool to.

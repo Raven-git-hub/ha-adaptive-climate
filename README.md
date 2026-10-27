@@ -117,7 +117,7 @@ cools a unit or turns it off, apart from leak protection:
 | **user_off** | a person turned the unit off | OFF | — | — |
 | **manual** | a person chose another mode or fan | theirs | theirs | theirs |
 | **config_off** | the section's scene forces the unit off | OFF | — | — |
-| **leak** | leak detected (latched) | DRY | LOW | base |
+| **leak** | leak detected (latched) | OFF | — | — |
 
 The **base** is the section's learned setpoint, set at each section change, or
 what a person chose since. The **offset** moves in whole steps within a section:
@@ -146,15 +146,15 @@ by hand in Home Assistant instead.
 
 The full cycle: when the sensor (or your own wiring) trips, the leak
 automation raises `input_boolean.ac_leak_<room>_<unit>` **and immediately puts
-the unit in its leak state** (DRY, fan LOW, its setpoint if one is known),
+the unit in its leak state** (turned OFF: dry would still run the compressor),
 whatever else is going on - a person having turned it off or paused the room
 included. While the boolean is on, the unit stays in leak, and **any scheduled
-crossover that lands mid-leak re-asserts DRY instead of reverting to cooling** -
+crossover that lands mid-leak re-asserts OFF instead of reverting to cooling** -
 leak safety overrides the schedule, not the other way round. Release is
 latched: it fires when the user confirms via
 `input_boolean.ac_leak_confirmed_<room>_<unit>`, blocked while the sensor
 still reads wet if the sensor is known, and on release the unit is treated as
-at a section change immediately rather than sitting in DRY until the next
+at a section change immediately rather than sitting off until the next
 scheduled boundary.
 
 ## Architecture
@@ -291,7 +291,7 @@ python tools/render_generated.py            # render helpers + automations
 python tools/control_check.py               # the control state machine's scenarios
 python tools/control_logic_check.py         # the generated Jinja replayed against them
 python tools/deploy_reconcile_check.py      # deploy create / reuse / update / prune
-python tools/leak_response_check.py         # the leak latch, wet to dry
+python tools/leak_response_check.py         # the leak latch: off when wet, released when dry
 python tools/runtime_check.py               # runtime observer + control loop
 ```
 
