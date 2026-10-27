@@ -7,10 +7,14 @@ Observation (passive):
   * heartbeat loop - every heartbeat_interval, sample each room's sensors
     and units and record them. Defers (does not skip) while a room's guard
     is on, so it never samples a unit mid-transition.
-  * reactive detection - a state_changed subscription; a user setpoint
-    change (NOT automation-caused) opens a consolidation window, snapshots
-    every sensor, and records one reactive event, raising ac_hold so
-    maintenance stands down until the next crossover (until phase 3b).
+  * reactive detection - a state_changed subscription; a person's change
+    to a unit (NOT automation-caused) - its setpoint, turning it on or off,
+    or a mode or fan change while on - opens a consolidation window,
+    snapshots every sensor, and records one reactive event of kind on, off,
+    setpoint or manual, raising ac_hold so maintenance stands down until
+    the next crossover (until phase 3b). A unit dropping out to
+    unavailable/unknown and back is never a reaction; if it comes back
+    changed, that is logged as a control event.
 
 Learning (docs/V2_DESIGN.md, Rebuilding) - replay_room() re-runs the
 reaction replay for a room and pushes the result:
@@ -57,6 +61,7 @@ GUARD_DEFER_MAX_SECONDS = 60
 # The comfort window closes 60 minutes after a reaction; replay 5 later.
 COMFORT_REPLAY_DELAY = timedelta(minutes=65)
 OFFISH = ("off", "unavailable", "unknown", None)
+NO_STATE = ("unavailable", "unknown", None)     # the unit isn't reporting at all
 
 
 def _profiles(config: dict) -> dict:
@@ -76,12 +81,57 @@ def _infer_ac_state(hvac_mode, fan_mode, leak_on: bool) -> str | None:
 
 
 @dataclass
+class UnitWindow:
+    """One unit's changes inside a reactive window: the first and the last
+    value of each, so the window becomes a single reaction."""
+    power_before: bool
+    power_after: bool
+    mode_before: str
+    mode_after: str
+    fan_before: str | None
+    fan_after: str | None
+    setpoint_before: float | None
+    setpoint_after: float | None
+    setpoint_changed: bool = False    # any setpoint change >= reactive_min_delta in the window
+
+    @property
+    def kind(self) -> str:
+        """on/off if power changed (first vs last), else setpoint if the
+        setpoint was changed at all in the window, else manual (a mode or fan
+        change while on)."""
+        if self.power_before != self.power_after:
+            return "on" if self.power_after else "off"
+        return "setpoint" if self.setpoint_changed else "manual"
+
+    def sample(self) -> ReactiveUnitSample:
+        return ReactiveUnitSample(self.setpoint_before, self.setpoint_after,
+                                  self.setpoint_changed, kind=self.kind,
+                                  power_before=self.power_before,
+                                  power_after=self.power_after)
+
+
+def room_kind(unit_kinds) -> str:
+    """The room-level kind: off if any unit went off, else on, else
+    setpoint, else manual."""
+    kinds = set(unit_kinds)
+    return next(k for k in ("off", "on", "setpoint", "manual") if k in kinds)
+
+
+def _snapshot(state: dict) -> dict:
+    """What a unit was doing, for the drop-out comparison."""
+    attrs = state.get("attributes") or {}
+    return {"power": "on" if state.get("state") != "off" else "off",
+            "mode": state.get("state"), "setpoint": attrs.get("temperature"),
+            "fan": attrs.get("fan_mode")}
+
+
+@dataclass
 class RoomState:
     room: dict
     profile: dict
     section: str | None = None
     section_started: datetime | None = None
-    reactive_units: dict = field(default_factory=dict)
+    reactive_units: dict[str, UnitWindow] = field(default_factory=dict)
     reactive_deadline: datetime | None = None
     reactive_task: object | None = None
 
@@ -100,6 +150,7 @@ class Runtime:
         self._tasks: list[asyncio.Task] = []
         self._unit_index: dict[str, tuple[str, str]] = {}   # unit entity -> (room_id, unit_id)
         self._followups: set[asyncio.Task] = set()          # pending comfort-window replays
+        self._dropouts: dict[str, dict] = {}                 # unit entity -> state when it dropped out
         self._stopping = False
 
     # ---- config helpers -------------------------------------------
@@ -225,9 +276,9 @@ class Runtime:
             self._maybe_reactive(event, entity_id, data)
 
     def _is_user_change(self, event: dict, data: dict, room_id: str) -> bool:
-        """A setpoint change is a user intervention only if it was not caused
-        by an automation: no context.parent_id, the room guard is off, and no
-        external guard is on."""
+        """A change is a person's only if it was not caused by an automation:
+        no context.parent_id, the room guard is off, and no external guard is
+        on. (Phase 3b adds: and not what the unit's state helper implies.)"""
         new = data.get("new_state") or {}
         ctx = new.get("context") or event.get("context") or {}
         if ctx.get("parent_id"):
@@ -240,24 +291,42 @@ class Runtime:
         return True
 
     def _maybe_reactive(self, event: dict, entity_id: str, data: dict) -> None:
+        """Buffer a person's change to a unit - its setpoint, its power (off
+        to any mode is on, any mode to off is off) or, while it stays on, its
+        mode or fan - into the room's reactive window."""
         room_id, unit_id = self._unit_index[entity_id]
+        old_s, new_s = data.get("old_state") or {}, data.get("new_state") or {}
+        old_mode, new_mode = old_s.get("state"), new_s.get("state")
+        if old_mode in NO_STATE or new_mode in NO_STATE:
+            # Dropping out or coming back is the unit, not a person.
+            self._track_dropout(entity_id, room_id, unit_id, old_s, new_s)
+            return
         if not self._is_user_change(event, data, room_id):
             return
-        old = (data.get("old_state") or {}).get("attributes", {}) or {}
-        new = (data.get("new_state") or {}).get("attributes", {}) or {}
+        old = old_s.get("attributes") or {}
+        new = new_s.get("attributes") or {}
         before, after = old.get("temperature"), new.get("temperature")
-        if before is None or after is None:
-            return
         min_delta = self._sys.get("reactive_min_delta", 0.5)
-        if abs(after - before) < min_delta:
-            return
+        setpoint_changed = (before is not None and after is not None
+                            and abs(after - before) >= min_delta)
+        power_before, power_after = old_mode != "off", new_mode != "off"
+        mode_or_fan = power_before and power_after and (
+            old_mode != new_mode or old.get("fan_mode") != new.get("fan_mode"))
+        if not (setpoint_changed or power_before != power_after or mode_or_fan):
+            return      # another attribute (current_temperature, ...) changed
 
         rs = self.rooms[room_id]
-        # One record per window: keep the setpoint the unit had before the
-        # window's FIRST change, and the latest value it was changed to.
-        first = rs.reactive_units.get(unit_id)
-        rs.reactive_units[unit_id] = ReactiveUnitSample(
-            first.setpoint_before if first else before, after, True)
+        # One record per window: the first value of everything before the
+        # window's first change, and the last value after its last change.
+        w = rs.reactive_units.get(unit_id)
+        if w is None:
+            w = rs.reactive_units[unit_id] = UnitWindow(
+                power_before, power_after, old_mode, new_mode,
+                old.get("fan_mode"), new.get("fan_mode"), before, after)
+        else:
+            w.power_after, w.mode_after, w.fan_after = power_after, new_mode, new.get("fan_mode")
+            w.setpoint_after = after
+        w.setpoint_changed = w.setpoint_changed or setpoint_changed
         window = self._sys.get("reactive_window_seconds", 120)
         rs.reactive_deadline = datetime.now(self.tz) + timedelta(seconds=window)
         if rs.reactive_task is None or rs.reactive_task.done():
@@ -265,6 +334,34 @@ class Runtime:
             asyncio.create_task(self._safe_service(
                 "input_boolean", "turn_on", {"entity_id": hold_id(room_id)}))
             rs.reactive_task = asyncio.create_task(self._flush_reactive_after(rs))
+
+    def _track_dropout(self, entity_id: str, room_id: str, unit_id: str,
+                       old_s: dict, new_s: dict) -> None:
+        """Remember what a unit was doing when it went unavailable/unknown;
+        if it comes back doing something else, log that as a control event.
+        Never a reaction: nobody can say who changed it."""
+        old_mode, new_mode = old_s.get("state"), new_s.get("state")
+        if old_mode not in NO_STATE and new_mode in NO_STATE:
+            self._dropouts[entity_id] = _snapshot(old_s)
+            return
+        if old_mode not in NO_STATE or new_mode in NO_STATE:
+            return
+        before = self._dropouts.pop(entity_id, None)
+        if before is None:
+            return      # it was already out when we started watching
+        after = _snapshot(new_s)
+        changed = {k: (before[k], after[k]) for k in before if before[k] != after[k]}
+        if not changed:
+            return
+        room = self.rooms[room_id].room
+        name = next((u.get("name", u["id"]) for u in room["units"] if u["id"] == unit_id), unit_id)
+        what = ", ".join(f"{k} {a} -> {b}" for k, (a, b) in changed.items())
+        ts, ts_utc, _, _ = self._now()
+        self.store.log_event(
+            ts, ts_utc, "warning", "control",
+            f"{name} came back from {old_mode} changed ({what}); not counted as a reaction",
+            room_id=room_id,
+            detail={"unit": unit_id, "was": old_mode, "before": before, "after": after})
 
     async def _flush_reactive_after(self, rs: RoomState) -> None:
         try:
@@ -279,10 +376,10 @@ class Runtime:
 
     async def _flush_reactive(self, rs: RoomState) -> None:
         room_id = rs.room["id"]
-        units = dict(rs.reactive_units)
+        windows = dict(rs.reactive_units)
         rs.reactive_units = {}
         rs.reactive_deadline = None
-        if not units:
+        if not windows:
             return
         # Fetch fresh states so any virtual (unit-attribute) sensors can read
         # the reference unit's current_temperature snapshot at reaction time.
@@ -290,13 +387,29 @@ class Runtime:
         sensors = {s["id"]: self._sensor_reading(s, rs.room, states) for s in rs.room["sensors"]}
         ts, ts_utc, local_date, now = self._now()
         window = self._sys.get("reactive_window_seconds", 120)
-        kind = None     # phase 2 records kinds; until then every reaction is a setpoint change
+        units = {uid: w.sample() for uid, w in windows.items()}
+        kind = room_kind(u.kind for u in units.values())
         self.store.record_reactive(room_id, ts, ts_utc, local_date, rs.section or "day",
                                    window, units, sensors, suspended_maint=True, kind=kind)
-        self.store.log_event(ts, ts_utc, "info", "reactive",
-                             f"user changed {', '.join(units)} in {rs.room['name']}",
-                             room_id=room_id, detail={"units": {u: v.__dict__ for u, v in units.items()}})
-        log.info("reactive recorded for %s: %s", room_id, list(units))
+
+        def told(uid: str, w: UnitWindow) -> str:
+            if w.kind in ("on", "off"):
+                return f"turned {uid} {w.kind}"
+            if w.kind == "setpoint":
+                return f"set {uid} {w.setpoint_before} -> {w.setpoint_after}"
+            return (f"changed {uid} {w.mode_before}/{w.fan_before} -> "
+                    f"{w.mode_after}/{w.fan_after} (manual: logged, not learned)")
+        self.store.log_event(
+            ts, ts_utc, "info", "reactive",
+            f"{rs.room['name']}: a person {'; '.join(told(u, w) for u, w in windows.items())}",
+            room_id=room_id,
+            detail={"kind": kind, "units": {u: {**w.sample().__dict__,
+                                                "mode_before": w.mode_before,
+                                                "mode_after": w.mode_after,
+                                                "fan_before": w.fan_before,
+                                                "fan_after": w.fan_after}
+                                            for u, w in windows.items()}})
+        log.info("reactive (%s) recorded for %s: %s", kind, room_id, list(units))
         await self.replay_room(room_id, "reaction")
         if is_setpoint_moving(kind, {u: (v.setpoint_before, v.setpoint_after)
                                      for u, v in units.items()}):

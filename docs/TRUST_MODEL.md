@@ -66,6 +66,14 @@ A **setpoint-moving reaction** is a setpoint change or a knob turn, or a
 reaction of any kind in which a unit's setpoint changed (an `on` with a new
 setpoint). A section is **provisional** until its first one, then **learned**.
 
+**Kinds of reaction.** Besides setpoint changes, a person turning a unit
+**on** or **off**, or changing its mode or fan while it stays on (**manual**),
+is a reaction. On says *too warm* and off *too cold*: both teach bands (below),
+but neither moves the setpoint unless the person changed the setpoint too.
+Manual teaches nothing; it is logged. Every kind, manual included, resets a
+section's quiet count and disqualifies a comfort window it falls inside. A
+unit dropping offline and coming back is never a reaction.
+
 ## Trust and the comfort band
 
 A sensor's **trust** is inferred from how small a deviation makes you react. If

@@ -46,7 +46,9 @@ Targets move only when a person acts. A section with no reaction adds confidence
 
 ### What counts as a reaction
 
-A change is a person's when it carries no `context.parent_id`, `ac_active` is off, and it isn't what the unit's state helper already implies (`rest`, `user_off` or `config_off` → off; `cool` or `boost` → cool; `leak` → dry). The container's reaction detector and HA's manual-change automation apply the same test.
+A change is a person's when it carries no `context.parent_id`, `ac_active` is off, and it isn't what the unit's state helper already implies (`rest`, `user_off` or `config_off` → off; `cool` or `boost` → cool; `leak` → dry). The container's reaction detector and HA's manual-change automation apply the same test; the state-helper part arrives with the helper in phase 3b.
+
+A unit dropping to `unavailable` or `unknown`, or coming back, is never a reaction: nobody can say who changed it. If it comes back in a different power, mode, setpoint or fan from the one it dropped out in, the runtime logs a `control` event saying what changed.
 
 | Event | Detected by | Teaches |
 | --- | --- | --- |
@@ -61,7 +63,7 @@ A change is a person's when it carries no `context.parent_id`, `ac_active` is of
 
 Every reaction kind, the knob included, is grouped by the existing 120-second extending window (`system.reactive_window_seconds`): each further change extends the window, and the whole window is recorded as one reaction. Per unit, the record keeps the **first** `setpoint_before` in the window and the last `setpoint_after`. (v1 overwrites `setpoint_before` on every change; phase 0 fixes this.)
 
-The reaction kind is stored per unit: `setpoint`, `on`, `off`, `manual`, `knob_turn` or `knob_press` (a knob long press records as `off`). The room-level kind is derived from the units' kinds when the reaction is recorded, and stored with it. A unit turned on and given a new setpoint in the same window is one reaction of kind `on`; setpoint learning still applies to it, because its `setpoint_after` changed.
+The reaction kind is stored per unit: `setpoint`, `on`, `off`, `manual`, `knob_turn` or `knob_press` (a knob long press records as `off`). A unit's kind in a window is `on` or `off` if its power changed between the first and last state (off → any mode is on), else `setpoint` if its setpoint was changed at all in the window, else `manual` (a mode or fan change while on). Its `setpoint_before/after` and `power_before/after` keep the first and last values. The room-level kind is derived from the units' kinds when the reaction is recorded, and stored with it: `off` if any unit went off, else `on`, else `setpoint`, else `manual`. A unit turned on and given a new setpoint in the same window is one reaction of kind `on`; setpoint learning still applies to it, because its `setpoint_after` changed.
 
 A **setpoint-moving reaction** is a setpoint change or a knob turn, or a reaction of any kind in which a unit's setpoint changed (an `on` that comes with a new setpoint, say). It moves S, sets the rounding direction, makes the section learned and opens a comfort window.
 
@@ -402,9 +404,9 @@ Phases 0 to 5 are built and checked offline against the existing harnesses, then
 | --- | --- | --- |
 | 0 · Foundations | Storage migrations (`user_version`, backup first, checked transaction, rollback; `almanac` and `event` rebuilt); `section_run` written to CSV; every v2 config key with defaults, and the v1 config migration; `setpoint_before` keeps the first value in a window | `store_check` migrates a v1 database keeping every row, finds it identical to a fresh one, and sees a forced failure leave it untouched; `config_check` migrates the v1 example to exactly the v2 example; a three-step setpoint change records its first `setpoint_before` |
 | 1 · Learning flip | Analyser becomes a replay of reactions from per-unit and per-sensor seeds; rounding toward the latest setpoint-moving reaction; comfort from accepted readings; confidence; the runtime's provisional seeding retired | `analyser_demo` applies a 1° correction the next day; `compare_analyser` diffs v1 and v2 almanacs |
-| 2 · On/off as reactions | Runtime detects a person turning units on or off, or changing mode or fan; reaction kind stored per unit | `runtime_check` records person on/off and still ignores the system's own changes; on plus a setpoint change in one window is one `on` reaction |
+| 2 · On/off as reactions | Runtime detects a person turning units on or off, or changing mode or fan; reaction kind stored per unit and room; a unit coming back from unavailable changed is logged | `runtime_check` records person on/off and still ignores the system's own changes; on plus a setpoint change in one window is one `on` reaction |
 | 3a · Cool-or-rest control | `app/control.py`, generator Jinja, the new unit helpers and the manual-change automation; maintenance raises the guard; the Warming/fan_only path is removed | Jinja matches `app/control.py` for every state, edge and person reaction |
-| 3b · Deploy and leak | `input_number` (and `input_boolean`) helper domains, created at 0; every `ac_since_*` set to now on creation; leak automations write the state helper | `deploy_reconcile_check` creates the new helpers with the right initial values; `leak_response_check` still passes |
+| 3b · Deploy and leak | `input_number` (and `input_boolean`) helper domains, created at 0; every `ac_since_*` set to now on creation; leak automations write the state helper; the runtime's reaction detector also ignores a change that matches what the unit's state helper implies (`rest` → off, and so on), as the manual-change automation does | `deploy_reconcile_check` creates the new helpers with the right initial values; `leak_response_check` still passes |
 | 4 · Outdoor input | Forecast or probe; outdoor value stored on heartbeats, reactions and section runs | The doctor lists weather entities with an hourly forecast; `store_check` sees the new columns |
 | 5 · Lean and block, in shadow | Conditions entity with per-sensor edges; block decisions and margin learning logged, not applied | Published edges reproduce the lean table; shadow decisions appear in the log |
 | **Gate A** | CSV re-ingest works; then cutover: deploy v2 to HA, block in shadow | SQLite rebuilt from CSV alone gives the same almanac |
@@ -483,3 +485,12 @@ Decisions this document hadn't covered:
 From phase 2 planning, 27 Oct 2026:
 
 33. **Setpoint-moving also means "a setpoint changed"**, whatever the kind; this replaces the definition in 21. An `on` (or `off`, or `manual`) reaction in which a unit's setpoint changed moves S, sets the rounding direction, makes the section learned and opens a comfort window; without a setpoint change it does none of these. It closes the hole where turning a unit on at a new setpoint moved S but kept an old rounding direction, so the next day applied a degree off what the person chose.
+
+From phase 2, 27 Oct 2026:
+
+34. **A setpoint changed and back in one window (22 → 23 → 22) is kind `setpoint`**: a unit's kind is `setpoint` if its setpoint was changed at all in the window. So, as in 21, it makes the section learned and opens a comfort window, but leaves S and the rounding direction alone.
+35. **Power is judged first state against last.** Off → on → off → on in one window is one `on`; on → off → on is `manual` (or `setpoint` if the setpoint changed too).
+36. **A unit's kind goes on/off, then setpoint, then manual**, and the room's off, on, setpoint, manual. So off → dry is `on`, and a mode change while on that comes with a setpoint change is `setpoint`. The hold is still raised for every kind until phase 3b.
+37. **Kind decides an `on`'s band direction**: an `on` that also changes the setpoint learns its band as cooler wanted, even if the new setpoint is higher. Its rounding direction still follows how S moved.
+38. **Unavailable/unknown transitions are not reactions.** A unit that comes back in a different power, mode, setpoint or fan from the one it dropped out in is logged as a `control` warning event (it may have been reset by a power cut, or changed on its remote while HA couldn't see it), still not a reaction. Nothing is logged if it was already out when the runtime started.
+39. **Margin-learning inputs are stored now**: room and unit kind, `power_before/after`, the reaction time and section. Control state and `since` (phase 3), the outdoor value (phase 4) and the block decision (phase 5) fill columns that already exist.

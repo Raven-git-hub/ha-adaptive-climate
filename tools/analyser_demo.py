@@ -16,6 +16,8 @@ docs/V2_DESIGN.md and docs/TRUST_MODEL.md:
     few heartbeats or by a boost heartbeat, and kept to its section across
     a boundary
   * bands are direction-matched and measured against the replayed comfort
+  * on and off teach bands as cooler and warmer wanted, manual teaches
+    nothing, and every kind resets quiet and disqualifies a window
   * the confidence curve
   * no seed, no almanac entry
   * tools/compare_analyser.py shows v1 against v2 on the same data
@@ -323,6 +325,48 @@ def check_band_direction() -> None:
     ok("a week-old reaction weighs half (half-life 7 days): band (0.5x1 + 1x2)/1.5 = 1.667")
 
 
+def check_on_off_manual() -> None:
+    print("on / off / manual reactions")
+    readings = {"wall": 23.5, "door": 26.5}      # wall 1.5 below comfort, door 1.5 above
+    for kind, learns, ignores in (("on", "door", "wall"), ("off", "wall", "door")):
+        sc = Scenario()
+        sc.beat(t(1, 8))
+        sc.react(t(1, 10), 21.0, 21.0, readings=readings, kind=kind)
+        day = sc.replay(t(1, 23))["day"]
+        assert abs(day.sensor_band[learns] - 1.5) < 1e-9 and day.sensor_band[ignores] == 5.0
+        assert day.unit_setpoints == {"ac": 21.0} and day.status == "provisional"
+        ok(f"`{kind}` ({'cooler' if kind == 'on' else 'warmer'} wanted) teaches only {learns}, "
+           f"the sensor on the {'warm' if kind == 'on' else 'cold'} side; S stays put")
+
+    sc = Scenario()
+    sc.beat(t(1, 8))
+    sc.react(t(1, 10), 21.0, 21.0, readings=readings, kind="manual")
+    day = sc.replay(t(1, 23))["day"]
+    assert day.sensor_band == {"wall": 5.0, "door": 5.0} and day.unit_setpoints == {"ac": 21.0}
+    assert day.status == "provisional"
+    ok("`manual` (a mode or fan change) teaches nothing")
+
+    for kind in ("on", "off", "manual", None):
+        sc = Scenario()
+        sc.beat(t(1, 8))
+        for day in range(1, 7):
+            sc.run(t(day, 8), t(day, 14))
+            sc.beat(t(day, 9))
+        before = sc.replay(t(7, 1))["day"].confidence
+        sc.react(t(4, 10), 21.0, 22.0 if kind is None else 21.0, kind=kind)
+        after = sc.replay(t(7, 1))["day"].confidence
+        assert abs(before - 0.75) < 1e-9 and abs(after - confidence_from_quiet(2)) < 1e-9, kind
+
+        sc = Scenario()
+        sc.beat(t(1, 8))
+        sc.react(t(1, 10), 21.0, 22.0)
+        sc.beats(t(1, 10, 30), t(1, 11), readings={"wall": 23.0, "door": 24.0})
+        sc.react(t(1, 10, 45), 22.0, 22.0, kind=kind or "setpoint")
+        assert sc.replay(t(1, 23))["day"].sensor_comfort == {"wall": 25.0, "door": 25.0}, kind
+    ok("every kind - on, off, manual, setpoint - resets the quiet count (0.75 -> 0.370) and "
+       "disqualifies a comfort window it falls inside")
+
+
 def check_confidence() -> None:
     print("confidence = 1 - 0.5^(quiet/3)")
     assert [round(confidence_from_quiet(q), 4) for q in (0, 3, 6, 9)] == \
@@ -371,6 +415,7 @@ def main() -> int:
     check_deterministic()
     check_comfort_window()
     check_band_direction()
+    check_on_off_manual()
     check_confidence()
     check_missing_seed()
     print("\nALL ASSERTIONS PASSED")

@@ -199,6 +199,37 @@ def check_fresh_store() -> None:
     sr = c.execute("SELECT outdoor_mean, outdoor_max, comfort_point, lean, blocked, block_mode "
                    "FROM section_run WHERE room_id='baby_room'").fetchone()
     assert tuple(sr) == (29.0, 32.0, 24.1, -0.49, 0, "shadow"), tuple(sr)
+
+    # --- every reaction kind round-trips through CSV and SQLite ---
+    kinds = {  # minute -> (room kind, setpoint before/after, changed, power before/after)
+        20: ("off", 22.0, 22.0, False, True, False),
+        25: ("manual", 22.0, 22.0, False, True, True),
+        30: ("setpoint", 22.0, 24.0, True, True, True),
+        35: ("on", 22.0, 24.0, True, False, True),       # on with a new setpoint
+    }
+    for minute, (kind, before, after, changed, p0, p1) in kinds.items():
+        store.record_reactive(
+            "baby_room", f"{rd}T15:{minute}:00+08:00", f"{rd}T07:{minute}:00+00:00", rd, "day",
+            window_seconds=120, kind=kind,
+            units={"baby_room_ac": ReactiveUnitSample(before, after, changed, kind=kind,
+                                                      power_before=p0, power_after=p1)},
+            sensors={"baby": 26.1})
+    db_rows = [tuple(r) for r in c.execute(
+        "SELECT r.kind, ru.kind, ru.setpoint_before, ru.setpoint_after, ru.changed, "
+        "ru.power_before, ru.power_after FROM reactive r "
+        "JOIN reactive_unit ru ON ru.reactive_id = r.id "
+        "WHERE r.room_id = 'baby_room' ORDER BY r.ts")]
+    csv_rows = list(csvmod.DictReader((tmp / "csv" / "baby_room" / f"{rd}_reactive.csv").open()))
+    assert len(db_rows) == len(csv_rows) == 1 + len(kinds), (db_rows, csv_rows)
+    for (kind, before, after, changed, p0, p1), db, row in zip(
+            kinds.values(), db_rows[1:], csv_rows[1:]):
+        assert db == (kind, kind, before, after, int(changed), int(p0), int(p1)), db
+        unit = json.loads(row["units"])["baby_room_ac"]
+        assert row["kind"] == kind and unit == {
+            "setpoint_before": before, "setpoint_after": after, "changed": changed,
+            "kind": kind, "power_before": p0, "power_after": p1}, (row, unit)
+    print("reaction kinds: on, off, manual and setpoint, with their power and setpoint "
+          "fields, round-trip through the CSV and SQLite alike - OK")
     for bad in ("INSERT INTO heartbeat_unit(heartbeat_id,unit_id,is_on,control_state) "
                 "VALUES (1,'x',1,'warming')",
                 "INSERT INTO reactive_unit(reactive_id,unit_id,kind) VALUES (1,'x','fan')",

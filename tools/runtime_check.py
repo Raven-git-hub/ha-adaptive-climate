@@ -117,13 +117,29 @@ async def eventually(cond, what: str, timeout: float = 5.0) -> None:
         await asyncio.sleep(0.05)
 
 
-def _state_changed(entity_id, before, after, parent_id=None, state="cool"):
+def _state_changed(entity_id, before, after, parent_id=None, state="cool",
+                   new_state=None, fan="low", new_fan=None):
+    """A state_changed event: setpoint before -> after, hvac state (mode)
+    state -> new_state, fan -> new_fan; unchanged unless given."""
     return {"event_type": "state_changed",
             "context": {"id": "c1", "parent_id": parent_id, "user_id": "u1"},
             "data": {"entity_id": entity_id,
-                     "old_state": {"state": state, "attributes": {"temperature": before}},
-                     "new_state": {"state": state, "attributes": {"temperature": after},
+                     "old_state": {"state": state,
+                                   "attributes": {"temperature": before, "fan_mode": fan}},
+                     "new_state": {"state": new_state or state,
+                                   "attributes": {"temperature": after,
+                                                  "fan_mode": new_fan or fan},
                                    "context": {"id": "c1", "parent_id": parent_id, "user_id": "u1"}}}}
+
+
+def last_reaction(c, room_id: str) -> tuple:
+    """(room kind, unit kind, power before, power after, setpoint before,
+    setpoint after, setpoint changed) of the room's latest reaction."""
+    return tuple(c.execute(
+        "SELECT r.kind, ru.kind, ru.power_before, ru.power_after, ru.setpoint_before, "
+        "ru.setpoint_after, ru.changed FROM reactive r "
+        "JOIN reactive_unit ru ON ru.reactive_id = r.id WHERE r.room_id = ? "
+        "ORDER BY r.id DESC LIMIT 1", (room_id,)).fetchone())
 
 
 async def main() -> int:
@@ -245,6 +261,95 @@ async def main() -> int:
     assert len(rows) == 2, [tuple(r) for r in rows]   # the earlier reaction + this window
     assert tuple(rows[-1]) == (22.0, 25.0), tuple(rows[-1])
     print("reactive: 22->23->24->25 in one window recorded once as before 22, after 25 - OK")
+
+    # --- phase 2: on / off / manual reactions ---
+    lounge = "climate.lounge_lounge"
+
+    def n_reactions(room_id: str) -> int:
+        return c.execute("SELECT COUNT(*) FROM reactive WHERE room_id=?", (room_id,)).fetchone()[0]
+
+    def holds(room_id: str) -> int:
+        return sum(1 for call in rest.service_calls if call[:2] == ("input_boolean", "turn_on")
+                   and call[2].get("entity_id") == f"input_boolean.ac_hold_{room_id}")
+
+    async def window(events, room_id: str = "main_room") -> tuple:
+        """Feed one burst of events, wait for its single reaction, return it."""
+        count, held = n_reactions(room_id), holds(room_id)
+        for e in events:
+            rt._on_state_change(e)
+        await eventually(lambda: n_reactions(room_id) == count + 1, "the reaction to flush")
+        assert holds(room_id) == held + 1, "hold not raised"
+        await asyncio.sleep(0.2)                 # it stays one reaction
+        assert n_reactions(room_id) == count + 1
+        return last_reaction(c, room_id)
+
+    off = await window([_state_changed(lounge, 22.0, 22.0, state="cool", new_state="off")])
+    assert off == ("off", "off", 1, 0, 22.0, 22.0, 0), off
+    on = await window([_state_changed(lounge, 22.0, 22.0, state="off", new_state="cool")])
+    assert on == ("on", "on", 0, 1, 22.0, 22.0, 0), on
+    print("reactive: a person turning the unit off and back on gives an off then an on "
+          "reaction with power 1->0 and 0->1, each raising the hold - OK")
+
+    count = n_reactions("baby_room")
+    rt._on_state_change(_state_changed("climate.baby_room_ac", 22.0, 22.0, parent_id="auto-ctx",
+                                       state="cool", new_state="off"))
+    rt._on_state_change(_state_changed("climate.home_s_device_2_home_s_device_2", 22.0, 22.0,
+                                       state="cool", new_state="off"))   # bedroom guard is on
+    assert not rt.rooms["baby_room"].reactive_units
+    assert not rt.rooms["main_bedroom"].reactive_units
+    await asyncio.sleep(1.5)
+    assert n_reactions("baby_room") == count
+    print("reactive: an off carrying context.parent_id, or during the guard, is ignored - OK")
+
+    flicker = await window([
+        _state_changed(lounge, 22.0, 22.0, state="off", new_state="cool"),
+        _state_changed(lounge, 22.0, 22.0, state="cool", new_state="off"),
+        _state_changed(lounge, 22.0, 22.0, state="off", new_state="cool")])
+    assert flicker[:4] == ("on", "on", 0, 1), flicker
+    toggle = await window([
+        _state_changed(lounge, 22.0, 22.0, state="cool", new_state="off"),
+        _state_changed(lounge, 22.0, 22.0, state="off", new_state="cool")])
+    assert toggle[:4] == ("manual", "manual", 1, 1), toggle
+    back = await window([_state_changed(lounge, 22.0, 23.0), _state_changed(lounge, 23.0, 22.0)])
+    assert back == ("setpoint", "setpoint", 1, 1, 22.0, 22.0, 1), back
+    print("reactive: off->on->off->on in one window is one `on` (first off, last on); "
+          "on->off->on is one `manual` (power unchanged); 22->23->22 is one `setpoint` - OK")
+
+    comfort_before = len(replays(store, "main_room", "comfort window"))
+    on_set = await window([
+        _state_changed(lounge, 22.0, 22.0, state="off", new_state="cool"),
+        _state_changed(lounge, 22.0, 24.0)])
+    assert on_set == ("on", "on", 0, 1, 22.0, 24.0, 1), on_set
+    await eventually(lambda: len(replays(store, "main_room", "comfort window")) > comfort_before,
+                     "the comfort replay an on-with-setpoint schedules")
+    print("reactive: on then a setpoint change in one window is one `on` reaction, "
+          "setpoint-moving (22 -> 24, comfort replay scheduled) - OK")
+
+    fan = await window([_state_changed(lounge, 22.0, 22.0, fan="low", new_fan="medium")])
+    assert fan == ("manual", "manual", 1, 1, 22.0, 22.0, 0), fan
+    mode = await window([_state_changed(lounge, 22.0, 22.0, state="cool",
+                                        new_state="fan_only")])
+    assert mode[:2] == ("manual", "manual"), mode
+    events = store.recent_events(room_id="main_room", category="reactive", limit=1)
+    assert "manual: logged, not learned" in events[0]["message"], events[0]
+    assert events[0]["detail"]["units"]["main_room_ac"]["mode_after"] == "fan_only"
+    print("reactive: a fan change, or a mode change, while on is `manual`, logged with "
+          "the modes - OK")
+
+    count, controls = n_reactions("main_room"), len(store.recent_events(category="control"))
+    rt._on_state_change(_state_changed(lounge, 22.0, 22.0, state="cool", new_state="unavailable"))
+    rt._on_state_change(_state_changed(lounge, 22.0, 22.0, state="unavailable", new_state="off"))
+    rt._on_state_change(_state_changed(lounge, 22.0, 22.0, state="off", new_state="unknown"))
+    rt._on_state_change(_state_changed(lounge, 22.0, 22.0, state="unknown", new_state="off"))
+    await asyncio.sleep(1.5)
+    assert n_reactions("main_room") == count and not rt.rooms["main_room"].reactive_units
+    control = store.recent_events(category="control")
+    assert len(control) == controls + 1, control
+    assert "came back from unavailable changed" in control[0]["message"], control[0]
+    assert control[0]["detail"]["before"]["mode"] == "cool"
+    assert control[0]["detail"]["after"]["mode"] == "off"
+    print("drop-out: cooling -> unavailable -> off is no reaction and one control event; "
+          "off -> unknown -> off, unchanged, logs nothing - OK")
 
     # --- section runs: a sleep run crossing midnight, with a restart inside it ---
     from datetime import datetime as dt
