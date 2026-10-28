@@ -39,6 +39,7 @@ _DROPPED_LEARNING = ("analysis_window_days", "bootstrap_min_days", "validity_del
                      "reactive_weight")
 # New keys inside objects that also hold v1 keys (only these get defaults).
 _NEW_LEARNING = ("reaction_rate", "recency_half_life_days")
+_NEW_SYSTEM = ("sensor_stale_minutes",)
 _NEW_ROOM = ("heat_sources", "knobs")
 
 
@@ -171,6 +172,7 @@ def _fill_new_defaults(cfg: dict, schema: dict) -> None:
     _fill(cfg.setdefault("learning", {}), props["learning"]["properties"], _NEW_LEARNING)
     system = cfg.setdefault("system", {})
     if isinstance(system, dict):
+        _fill(system, props["system"]["properties"], _NEW_SYSTEM)
         _fill(system.setdefault("control", {}),
               props["system"]["properties"]["control"]["properties"])
     _fill(cfg.setdefault("outdoor", {}), props["outdoor"]["properties"])

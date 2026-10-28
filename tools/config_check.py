@@ -81,7 +81,8 @@ def main() -> int:
     sparse["rooms"][0]["scenes"] = {"sleep": {"units": {"main_room_ac": {"mode": "off"}}}}
     out = migrate(sparse)
     validate(out)
-    assert set(out["system"]) == {"control"}, out["system"]
+    assert set(out["system"]) == {"control", "sensor_stale_minutes"}, out["system"]
+    assert out["system"]["sensor_stale_minutes"] == 90
     assert out["system"]["control"] == V2["system"]["control"]
     assert set(out["learning"]) == {"reaction_rate", "recency_half_life_days"}
     assert out["outdoor"] == V2["outdoor"]

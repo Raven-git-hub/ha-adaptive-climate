@@ -97,6 +97,8 @@ learns nothing from it.
 - **Low trust ≈ a 5°C band** — this sensor must drift a long way to mean anything.
 
 Each sensor votes into a **quorum** when its reading leaves its comfort band.
+A sensor that is unavailable, or that Home Assistant hasn't heard from for 90
+minutes (`system.sensor_stale_minutes`), has no vote and teaches nothing.
 Corrective action starts once the quorum is met at a heartbeat (1 sensor → 1
 vote; 2 → 2; 3+ → 50% or more): too warm boosts the unit, too cold rests it.
 It ends when the sensors still on that side fall below the quorum, or after

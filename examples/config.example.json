@@ -8,6 +8,7 @@
     "temperature_unit": "C",
     "heartbeat_interval_minutes": 10,
     "reactive_min_delta": 0.5,
+    "sensor_stale_minutes": 90,
     "trust": {
       "high_trust_deviation": 0.5,
       "low_trust_deviation": 5.0

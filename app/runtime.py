@@ -75,6 +75,22 @@ def _profiles(config: dict) -> dict:
     return {p["id"]: p for p in config.get("schedule_profiles", [])}
 
 
+def _parse_ts(value: str | None) -> datetime | None:
+    """An HA timestamp (ISO 8601, with its offset), or None."""
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _ago(delta: timedelta) -> str:
+    minutes = int(delta.total_seconds() // 60)
+    if minutes < 120:
+        return f"{minutes} min"
+    hours = minutes // 60
+    return f"{hours} h" if hours < 48 else f"{hours // 24} d {hours % 24} h"
+
+
 def _number(state: str | None, default: float | None = 0.0) -> float | None:
     """An input_number's state string as a float, or default."""
     try:
@@ -166,6 +182,7 @@ class Runtime:
         self._unit_index: dict[str, tuple[str, str]] = {}   # unit entity -> (room_id, unit_id)
         self._followups: set[asyncio.Task] = set()          # pending comfort-window replays
         self._dropouts: dict[str, dict] = {}                 # unit entity -> state when it dropped out
+        self._stale: dict[tuple[str, str], bool] = {}        # (room, sensor) -> stale, as last logged
         self._stopping = False
 
     # ---- config helpers -------------------------------------------
@@ -230,6 +247,13 @@ class Runtime:
         self.ws.on_reconnect(self._resubscribe)
         self.ws.on_status(self._on_ws_status)
         await self.ws.subscribe_states(self._on_state_change)
+
+        # Which sensors were last logged as stale, so a restart doesn't
+        # repeat the warning for one that still is.
+        for e in reversed(self.store.recent_events(limit=1000, category="validation")):
+            d = e.get("detail") or {}
+            if "stale" in d and "sensor" in d:
+                self._stale[(e["room_id"], d["sensor"])] = bool(d["stale"])
 
         # Replay every room and push its almanac before any crossover can
         # fire, catch-up included: after a migration the almanac is empty,
@@ -479,12 +503,64 @@ class Runtime:
         except (TypeError, ValueError):
             return None
 
+    def _sensor_entity(self, sensor: dict, room: dict) -> str | None:
+        """The entity whose reports a sensor's readings come from: its own,
+        or for a virtual sensor its unit's."""
+        source = sensor.get("source")
+        if source is None:
+            return sensor.get("entity_id")
+        unit = next((u for u in room["units"] if u["id"] == source.get("unit_id")), None)
+        return unit["entity_id"] if unit else None
+
+    def _stale_since(self, sensor: dict, room: dict, states: dict) -> datetime | None:
+        """When Home Assistant last reported the sensor's entity, if that is
+        longer ago than system.sensor_stale_minutes (control.is_stale); else
+        None. A sensor put away can keep its last value for days without
+        going unavailable."""
+        entity = self._sensor_entity(sensor, room)
+        reported = _parse_ts(((states.get(entity) or {}) if entity else {}).get("last_reported"))
+        minutes = self._sys.get("sensor_stale_minutes", control.DEFAULT_STALE_MINUTES)
+        return reported if control.is_stale(reported, self._now()[3], minutes) else None
+
+    def _note_staleness(self, rs: RoomState, states: dict) -> None:
+        """One warning event when a sensor goes stale, one when it reports
+        again. What was last logged survives a restart (start() reads it
+        back from the event log), so a restart doesn't repeat the warning."""
+        room = rs.room
+        minutes = self._sys.get("sensor_stale_minutes", control.DEFAULT_STALE_MINUTES)
+        for sensor in room["sensors"]:
+            key = (room["id"], sensor["id"])
+            since = self._stale_since(sensor, room, states)
+            if (since is not None) == self._stale.get(key, False):
+                continue
+            self._stale[key] = since is not None
+            entity = self._sensor_entity(sensor, room)
+            name = f"{room['name']}: {sensor.get('name', sensor['id'])} ({entity})"
+            ts, ts_utc, _, now = self._now()
+            if since is not None:
+                message = (f"{name} last reported {_ago(now - since)} ago, at "
+                           f"{since.astimezone(self.tz).strftime('%Y-%m-%d %H:%M')}; past "
+                           f"{minutes} minutes it counts as unavailable - no vote, no "
+                           "learning - until it reports again")
+            else:
+                message = f"{name} is reporting again; it votes and learns again"
+            self.store.log_event(
+                ts, ts_utc, "warning" if since is not None else "info", "validation", message,
+                room_id=room["id"],
+                detail={"sensor": sensor["id"], "entity_id": entity, "stale": since is not None,
+                        "last_reported": since.isoformat() if since else None,
+                        "stale_minutes": minutes})
+
     def _sensor_reading(self, sensor: dict, room: dict, states: dict) -> float | None:
         """Physical sensor -> read its own entity state (cheap path via the
         cache when we don't have fresh attributes). Virtual (source-based)
         sensor -> read the referenced unit's attribute out of a states dict,
         which the caller has just fetched. The rest of the trust model
-        doesn't need to know which is which."""
+        doesn't need to know which is which. A stale sensor reads None, like
+        an unavailable one, so heartbeats and reaction snapshots - and so
+        seeds, comfort windows and bands - leave it out."""
+        if self._stale_since(sensor, room, states) is not None:
+            return None
         source = sensor.get("source")
         if source is None:
             return self._sensor_value(sensor["entity_id"])
@@ -527,6 +603,7 @@ class Runtime:
         for eid, s in states.items():
             self._cache[eid] = s.get("state")
 
+        self._note_staleness(rs, states)
         sensors = {s["id"]: self._sensor_reading(s, rs.room, states) for s in rs.room["sensors"]}
         units = {}
         for u in rs.room["units"]:

@@ -93,7 +93,7 @@ Everything should be a tick, ending with the four preflight items:
 
 - `input_datetime: set_datetime with a timestamp round-trips`
 - `input_number (0-100, step 0.5, as ac_base_*): accepts 0 and 23.5`
-- `template API: timestamp attribute, .attributes.get, now()` (its detail shows the
+- `template API: timestamp attribute, .attributes.get, last_reported, now()` (its detail shows the
   clock skew between the host and HA; under a few seconds is normal)
 - `throwaway helpers deleted, nothing left behind`
 
@@ -208,6 +208,7 @@ to see `cool`, `ac_unblocked` on, and a fresh grace period.
 | Through the evening and night | Boosts end within 60 minutes or when the room settles, then another may start a degree lower. Rests wake when the room warms back to comfort. No unit flips state more often than every 10 to 20 minutes |
 | Any time | `ac_state` becomes `manual` or `user_off` only when someone actually touched that unit. If it changes with nobody touching it, note the time and open the manual-change trace at that time (`kind`, `ours`): a late echo of our own command got through |
 | Any time | *reactive* events appear only for real changes on a remote, app or HA |
+| Any time | A *validation* warning "… last reported … ago … counts as unavailable" means a sensor has gone quiet (put away, battery, integration): it has no vote until it reports again, and an info event says when it does |
 | Any time | `ac_active_<room>` is on for seconds only. A **guard watchdog** run means a guard stuck for 5 minutes |
 | Any time | `ac_hold_<room>` stays off unless you paused the room |
 | 00:15 | The nightly replay for each room (*analysis*) |

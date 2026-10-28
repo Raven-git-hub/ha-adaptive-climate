@@ -59,6 +59,16 @@ sensor comfort are separated (docs/TRUST_MODEL.md).
 Baby Room is 18–30, the other two 16–30. Cooling (almanac − 2) and any nudge
 must clamp to the unit's own range.
 
+## Sensors can go quiet without going unavailable
+
+A sensor put away (out of range, battery pulled) kept its last value in Home
+Assistant for three days without going `unavailable`; only its
+`last_reported` (stuck at 2026-10-25T20:03) showed it. So the system treats a
+sensor whose `last_reported` is older than `system.sensor_stale_minutes`
+(default 90) as unavailable, in the maintenance template and the runtime alike,
+logs a warning when it goes stale, and the doctor flags it. A virtual sensor
+goes stale with its unit.
+
 ## Timezone
 
 HA reports `Asia/Hong_Kong`. Because climate is clock-only, the scheduler fires

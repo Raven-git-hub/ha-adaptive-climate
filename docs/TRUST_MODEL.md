@@ -178,8 +178,11 @@ its comfort band:
 votes(sensor) = 1  if  |reading - comfort| >= band   else 0
 ```
 
-The number of votes required (the **quorum**) depends on how many usable
-sensors the room has:
+A sensor that is unavailable, has nothing learned yet, or that Home Assistant
+last reported longer ago than `system.sensor_stale_minutes` (default 90: a
+sensor put away can keep its last value for days without going unavailable)
+casts no vote and isn't usable. The number of votes required (the **quorum**)
+depends on how many usable sensors the room has:
 
 ```
 n == 1        -> 1 vote

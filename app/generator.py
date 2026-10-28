@@ -627,26 +627,40 @@ def build_watchdog_automation(config: dict, room: dict) -> dict:
 # writes helpers and sends a command, under one raised guard.
 # ---------------------------------------------------------------------
 
-def _sensor_reading_expr(sensor: dict, room: dict) -> str:
+def _fresh(entity_id: str, reading: str, stale_minutes: int) -> str:
+    """`reading`, or none once Home Assistant last reported the entity more
+    than stale_minutes ago (control.is_stale): a sensor put away can keep
+    its last value for days without going unavailable."""
+    domain, obj = _split(entity_id)
+    return (f"({reading} if states.{domain}.{obj} is not none and "
+            f"(now() - states.{domain}.{obj}.last_reported).total_seconds() <= "
+            f"{stale_minutes * 60} else none)")
+
+
+def _sensor_reading_expr(sensor: dict, room: dict,
+                         stale_minutes: int = control.DEFAULT_STALE_MINUTES) -> str:
     """The Jinja fragment that yields this sensor's current reading (a
     float or none) inside the votes template. Physical sensor: reads its
     own entity state. Virtual (source-based): reads the referenced unit's
-    attribute. The rest of the vote logic is identical - only where the
-    number comes from changes."""
+    attribute. Either is none once its entity is stale. The rest of the
+    vote logic is identical - only where the number comes from changes."""
     source = sensor.get("source")
     if source is None:
-        return f"states('{sensor['entity_id']}') | float(none)"
+        return _fresh(sensor["entity_id"], f"states('{sensor['entity_id']}') | float(none)",
+                      stale_minutes)
     if source.get("type") == "unit_attribute":
         uid = source.get("unit_id")
         unit = next((u for u in room["units"] if u["id"] == uid), None)
         if unit is None:
             return "none"
         attr = source.get("attribute", "current_temperature")
-        return f"state_attr('{unit['entity_id']}', '{attr}') | float(none)"
+        return _fresh(unit["entity_id"],
+                      f"state_attr('{unit['entity_id']}', '{attr}') | float(none)",
+                      stale_minutes)
     return "none"
 
 
-def _votes_expr(room: dict) -> str:
+def _votes_expr(room: dict, stale_minutes: int = control.DEFAULT_STALE_MINUTES) -> str:
     """control.evaluate_votes as one Jinja expression -> {met, tally,
     required, direction, warm_side, cold_side}, from `sensor_data` and the
     `cold_edge` / `warm_edge` variables. A sensor's position is (reading -
@@ -654,7 +668,7 @@ def _votes_expr(room: dict) -> str:
     quorum; the summed trust of each side picks the direction (too_warm /
     too_cold / none), in the room's sensor order, as app.trust sums it."""
     entries = ", ".join(
-        f"{{'reading': {_sensor_reading_expr(s, room)}, "
+        f"{{'reading': {_sensor_reading_expr(s, room, stale_minutes)}, "
         f"'e': sensor_data.get('{s['id']}') or {{}} }}" for s in room["sensors"])
     return _fill(
         "{%- set sensors = [<<ENTRIES>>] -%}"
@@ -696,7 +710,8 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
         # phase 5 leans these per sensor from the conditions entity
         "cold_edge": "{{ -1.0 }}",
         "warm_edge": "{{ 1.0 }}",
-        "votes": _votes_expr(room),
+        "votes": _votes_expr(room, config.get("system", {}).get(
+            "sensor_stale_minutes", control.DEFAULT_STALE_MINUTES)),
     }
     for unit in room["units"]:
         variables[_unit_var(unit)] = (

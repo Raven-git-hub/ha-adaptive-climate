@@ -58,6 +58,10 @@
           "type": "number", "minimum": 0, "maximum": 20, "default": 0.5,
           "description": "A unit's setpoint only counts as genuinely changed if |after - before| exceeds this many degrees. Filters out rounding noise and transition echo."
         },
+        "sensor_stale_minutes": {
+          "type": "integer", "minimum": 10, "maximum": 10080, "default": 90,
+          "description": "A sensor (or, for a virtual sensor, its unit) that Home Assistant last reported longer ago than this is treated as unavailable: no vote, no learning. Catches a sensor put away that keeps its last value without going unavailable."
+        },
         "control": {
           "type": "object",
           "additionalProperties": false,

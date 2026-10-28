@@ -22,7 +22,9 @@ Checks, in order:
   5. At least one climate.* entity exists
   6. (if AC_CONFIG set) every configured unit exists and supports the modes
      the state machine needs; sensors exist; fan mode reported per unit
-     while the unit is in `cool` (see docs/HARDWARE.md)
+     while the unit is in `cool` (see docs/HARDWARE.md); a sensor whose
+     last_reported is older than system.sensor_stale_minutes is flagged as
+     stale (the runtime and maintenance treat it as unavailable)
 
   7. (--v2-preflight) the Home Assistant behaviour v2's generated helpers
      and templates rely on, tried for real on throwaway ac_preflight_*
@@ -32,7 +34,8 @@ Checks, in order:
        - an input_number shaped like ac_base_* accepts 0 and a mid-range value
        - HA's own Jinja (the template API) renders state_attr(..., 'timestamp'),
          the trigger-style s.attributes.get(...) snapshot the manual-change
-         automation uses, and now().timestamp()
+         automation uses, now() - states.<entity>.last_reported (the
+         maintenance template's stale-sensor check), and now().timestamp()
      The helpers are deleted afterwards, and leftovers from an earlier run
      first, whatever fails in between.
 
@@ -51,6 +54,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app import control                                       # noqa: E402
 from app import generator as g                                 # noqa: E402
 from app.ha import HARest, HAWebSocket, HAAuthError, HAError  # noqa: E402
 
@@ -63,6 +67,23 @@ OK, FAIL, WARN = f"{GREEN}\u2713{RESET}", f"{RED}\u2717{RESET}", f"{YELLOW}!{RES
 def line(marker, msg):  print(f"  {marker} {msg}")
 
 
+def _stale_for(last_reported: str | None, stale_minutes: int) -> str | None:
+    """"N h ago (when)" if HA last reported the entity longer ago than
+    stale_minutes (control.is_stale), else None."""
+    from datetime import datetime, timezone
+    try:
+        when = datetime.fromisoformat(last_reported) if last_reported else None
+    except ValueError:
+        return None
+    now = datetime.now(timezone.utc)
+    if not control.is_stale(when, now, stale_minutes):
+        return None
+    hours = (now - when).total_seconds() / 3600
+    ago = f"{hours * 60:.0f} min" if hours < 2 else (f"{hours:.0f} h" if hours < 48
+                                                       else f"{hours / 24:.1f} days")
+    return f"{ago} ago ({when.astimezone().strftime('%Y-%m-%d %H:%M')})"
+
+
 # ---------------------------------------------------------------------
 # v2 preflight
 # ---------------------------------------------------------------------
@@ -71,7 +92,7 @@ PREFLIGHT_PREFIX = "ac_preflight_"
 PREFLIGHT_DOMAINS = ("input_datetime", "input_number")
 ITEM_DATETIME = "input_datetime: set_datetime with a timestamp round-trips"
 ITEM_NUMBER = "input_number (0-100, step 0.5, as ac_base_*): accepts 0 and 23.5"
-ITEM_TEMPLATE = "template API: timestamp attribute, .attributes.get, now()"
+ITEM_TEMPLATE = "template API: timestamp attribute, .attributes.get, last_reported, now()"
 ITEM_CLEANUP = "throwaway helpers deleted, nothing left behind"
 
 
@@ -173,6 +194,11 @@ async def v2_preflight(rest, ws) -> list[tuple[str, bool, str]]:
             attr = await rest.render_template(
                 f"{{%- set s = states.{dt_id} -%}}{{{{ s.attributes.get('timestamp') | int }}}}")
             checks.append((".attributes.get('timestamp')", attr.strip() == str(stamp), attr.strip()))
+            # the maintenance template's stale check: now() - <state>.last_reported
+            age = (await rest.render_template(
+                f"{{{{ (now() - states.{dt_id}.last_reported).total_seconds() | int }}}}")).strip()
+            checks.append((f"now() - last_reported ({age} s)",
+                           age.lstrip("-").isdigit() and 0 <= int(age) < 600, age))
             now_text = (await rest.render_template(g.NOW_TS)).strip()
             skew = abs(int(now_text) - int(time.time()))
             checks.append((f"now().timestamp() | int (clock skew {skew}s)", skew < 300, now_text))
@@ -331,18 +357,38 @@ async def _run(url: str, token: str, verify_ssl: bool,
                     rng = (attrs.get("min_temp"), attrs.get("max_temp"))
                     line(OK, f"    {u['entity_id']} step={step}  range={rng[0]}\u2013{rng[1]}")
 
+                stale_minutes = (config.get("system") or {}).get(
+                    "sensor_stale_minutes", control.DEFAULT_STALE_MINUTES)
                 for s in room.get("sensors", []):
-                    e = by_id.get(s["entity_id"])
+                    if s.get("source"):           # virtual: read from its unit
+                        unit = next((u for u in room.get("units", [])
+                                     if u["id"] == s["source"].get("unit_id")), None)
+                        entity = unit["entity_id"] if unit else None
+                        label = f"virtual sensor {s['id']} (from {entity})"
+                    else:
+                        entity = s["entity_id"]
+                        label = f"sensor {entity}"
+                    e = by_id.get(entity)
                     if not e:
-                        line(FAIL, f"    sensor {s['entity_id']} not found")
+                        line(FAIL, f"    {label} not found")
                         hard_failures += 1; continue
-                    if e["state"] in ("unavailable", "unknown", None):
-                        line(WARN, f"    sensor {s['entity_id']} is {e['state']!r} now "
+                    stale = _stale_for(e.get("last_reported"), stale_minutes)
+                    if stale:
+                        line(WARN, f"    {label} last reported {stale}: stale past "
+                                   f"{stale_minutes} min, so it counts as unavailable (no vote, "
+                                   "no learning) until it reports again. Put away, or its "
+                                   "integration stopped?")
+                        warnings += 1
+                    elif e["state"] in ("unavailable", "unknown", None):
+                        line(WARN, f"    {label} is {e['state']!r} now "
                                    "(no vote until it returns)")
                         warnings += 1
+                    elif s.get("source"):
+                        attr = s["source"].get("attribute", "current_temperature")
+                        line(OK, f"    {label} = {(e.get('attributes') or {}).get(attr)} ({attr})")
                     else:
                         unit = e.get("attributes", {}).get("unit_of_measurement")
-                        line(OK, f"    sensor {s['entity_id']} = {e['state']} {unit or ''}")
+                        line(OK, f"    {label} = {e['state']} {unit or ''}")
 
     # --- 7. v2 preflight (opt-in) ----------------------------------
     if preflight:

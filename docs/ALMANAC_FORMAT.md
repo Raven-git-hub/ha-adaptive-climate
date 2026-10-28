@@ -84,8 +84,9 @@ for display and tie-breaking; the quorum count itself is unweighted.
 Control). The maintenance automation runs on a `time_pattern` trigger (every
 `heartbeat_interval_minutes`, HA's own clock per D4) and reads the active
 section: each sensor's position is `(reading - comfort) / band` (a missing
-band counts as 5.0; a sensor that is unavailable or has no `comfort` counts
-toward neither the tally nor the quorum base), it votes past either trigger
+band counts as 5.0; a sensor that is unavailable, stale (last reported longer
+ago than `system.sensor_stale_minutes`) or has no `comfort` counts toward
+neither the tally nor the quorum base), it votes past either trigger
 edge (±1 until phase 5 leans them), the pooled quorum is 1→1, 2→2,
 3+→ceil(n/2), and the trust-weighted majority of the voters picks too warm or
 too cold. Each unit then takes one step of the state machine from its helpers.

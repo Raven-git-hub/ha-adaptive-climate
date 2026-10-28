@@ -20,6 +20,10 @@ Store (no Home Assistant, no network). Verifies:
   * startup replays every room and pushes its almanac before any
     crossover: started 3 minutes before 22:00 with an empty almanac but
     history in the store, the Sleep crossover finds setpoint_applied
+  * a sensor Home Assistant last reported longer ago than
+    sensor_stale_minutes reads as unavailable in heartbeats and reaction
+    snapshots, with one warning when it goes stale (not repeated after a
+    restart) and one event when it reports again
   * several changes in one reactive window record the first setpoint_before
   * a sleep section run crossing midnight closes against its start date
   * on restart, comfort-window replays are re-armed for recent setpoint-moving
@@ -488,6 +492,7 @@ async def main() -> int:
     await rt2.stop()
     store.close()
     await check_startup_race()
+    await check_stale_sensor()
     print("\nALL RUNTIME CHECKS PASSED")
     return 0
 
@@ -551,6 +556,77 @@ async def check_startup_race() -> None:
     print("startup race: started 21:57 with an empty almanac and history in the store, each "
           "room's 22:00 Sleep crossover fired after its almanac reached HA with "
           "setpoint_applied 23 - OK")
+
+async def check_stale_sensor() -> None:
+    """A sensor put away keeps its last value in HA without going
+    unavailable; only last_reported shows it. Past sensor_stale_minutes it
+    must read as unavailable everywhere the runtime samples it."""
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+    tmp = Path(tempfile.mkdtemp())
+    store = Store(tmp, SCHEMA)
+    states = _build_states()
+    clock = {"t": datetime(2026, 8, 3, 12, 0, 0, tzinfo=hk)}
+    put_away = datetime(2026, 7, 31, 12, 3, 0, tzinfo=hk)     # three days before
+    wall = next(s for s in states if s["entity_id"] == "sensor.living_room_temp")
+    for st in states:
+        st["last_reported"] = clock["t"].isoformat()
+    wall["last_reported"] = put_away.astimezone(utc).isoformat()
+
+    def runtime() -> Runtime:
+        rt = Runtime(CONFIG, store, StubRest(states), StubWS(), tmp)
+        rt._now = lambda: (clock["t"].isoformat(timespec="seconds"),
+                           clock["t"].astimezone(utc).isoformat(timespec="seconds"),
+                           clock["t"].date().isoformat(), clock["t"])
+        return rt
+
+    def readings() -> list:
+        return [r[0] for r in store._conn.execute(
+            "SELECT hs.temperature FROM heartbeat_sensor hs JOIN heartbeat h ON h.id = "
+            "hs.heartbeat_id WHERE h.room_id = 'main_room' AND hs.sensor_id = 'living1' "
+            "ORDER BY h.id")]
+
+    def stale_events() -> list:
+        return [(e["severity"], e["detail"]["stale"]) for e in reversed(
+            store.recent_events(category="validation", room_id="main_room"))
+            if "stale" in (e.get("detail") or {})]
+
+    async def beat(rt: Runtime) -> None:
+        clock["t"] += timedelta(minutes=10)
+        for st in states:
+            if st is not wall:
+                st["last_reported"] = clock["t"].isoformat()
+        await rt._do_heartbeat(rt.rooms["main_room"])
+
+    rt = runtime()
+    await rt.start()
+    await beat(rt)
+    await beat(rt)
+    assert readings() == [None, None], readings()
+    assert stale_events() == [("warning", True)], stale_events()
+    message = store.recent_events(category="validation", room_id="main_room")[0]["message"]
+    assert "last reported 3 d 0 h ago, at 2026-07-31 12:03" in message, message
+    await rt.stop()
+
+    rt = runtime()                                # a restart while it is still stale
+    await rt.start()
+    await beat(rt)
+    assert readings() == [None, None, None] and stale_events() == [("warning", True)]
+    rt._on_state_change(_state_changed("climate.lounge_lounge", 22.0, 23.0))
+    await rt._flush_reactive(rt.rooms["main_room"])
+    snap = dict(store._conn.execute(
+        "SELECT rs.sensor_id, rs.temperature FROM reactive_sensor rs JOIN reactive r "
+        "ON r.id = rs.reactive_id WHERE r.room_id = 'main_room'").fetchall())
+    assert snap == {"living1": None, "living2": 24.5, "living3": 25.0}, snap
+
+    wall["last_reported"] = (clock["t"] + timedelta(minutes=10)).isoformat()   # back again
+    await beat(rt)
+    assert readings() == [None, None, None, 24.0], readings()
+    assert stale_events() == [("warning", True), ("info", False)], stale_events()
+    await rt.stop()
+    store.close()
+    print("stale sensor: last reported 3 days ago but still showing 24.0, it heartbeats as "
+          "unavailable and is left out of the reaction snapshot; one warning when it went "
+          "stale, none repeated after a restart, one event when it reported again - OK")
 
 
 if __name__ == "__main__":

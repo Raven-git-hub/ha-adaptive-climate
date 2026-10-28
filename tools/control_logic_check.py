@@ -45,8 +45,9 @@ import dataclasses
 import random
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -96,6 +97,30 @@ def as_boolean(value) -> bool:
     if isinstance(value, str):
         return value.lower() in _TRUE
     return False
+
+
+class _States:
+    """HA's `states`: states('sensor.x') for the state string, and
+    states.sensor.x for the state object (none when it doesn't exist), with
+    last_reported - now, unless the entity was given one."""
+
+    def __init__(self, ha: "HA") -> None:
+        self._ha = ha
+
+    def __call__(self, entity_id: str) -> str:
+        return self._ha.states(entity_id)
+
+    def __getattr__(self, domain: str):
+        ha = self._ha
+
+        class Domain:
+            def __getattr__(self, obj: str):
+                e = ha.entities.get(f"{domain}.{obj}")
+                if e is None:
+                    return None
+                return SimpleNamespace(state=e["state"], attributes=e["attributes"],
+                                       last_reported=e.get("last_reported") or ha.now)
+        return Domain()
 
 
 class HA:
@@ -148,7 +173,7 @@ class HA:
         tmpl = self._compiled.get(template)
         if tmpl is None:
             tmpl = self._compiled[template] = self._env.from_string(template)
-        return parse_result(tmpl.render(states=self.states, state_attr=self.state_attr,
+        return parse_result(tmpl.render(states=_States(self), state_attr=self.state_attr,
                                         now=lambda: self.now, namespace=Namespace, **variables))
 
     def render_complex(self, value, variables: dict):
@@ -264,6 +289,7 @@ def _config(ctx: control.Context, sensors: list[str], forced_off: bool) -> tuple
             "scenes": {SECTION: {"units": {UNIT: {"mode": "off"}}}} if forced_off else {}}
     config = {"system": {"heartbeat_interval_minutes": ctx.heartbeat_interval,
                          "reactive_min_delta": ctx.min_delta,
+                         "sensor_stale_minutes": ctx.sensor_stale_minutes,
                          "control": dataclasses.asdict(ctx.config)},
               "rooms": [room]}
     return config, room
@@ -453,6 +479,8 @@ class Replay:
         forced = st.get("forced_off", ctx.forced_off)
         config, room = _config(ctx, list(readings), forced)
         _context(ha, ctx, readings, almanac)
+        for sid, ago in st.get("reported", {}).items():      # still showing a value, but stale
+            ha.entities[f"sensor.{sid}"]["last_reported"] = now - timedelta(seconds=ago)
         edges = st.get("edges")
         overrides = {"blocked": True} if ctx.blocked else {}
         if edges:
@@ -461,14 +489,15 @@ class Replay:
         if do == "votes":
             got = ha.variables(g.build_maintenance_automation(config, room), overrides,
                                until="votes")["votes"]
-            want = dataclasses.asdict(table._votes(st))
+            want = dataclasses.asdict(table._votes(st, now, ctx.sensor_stale_minutes))
             want.pop("positions")
             self.steps += 1
             self.runs += 1
             return unit, None if got == want else f"votes {got}, control {want}"
 
         if do == "step":
-            new, command = control.step(unit, table._votes(st), now, ctx)
+            new, command = control.step(unit, table._votes(st, now, ctx.sensor_stale_minutes),
+                                        now, ctx)
             alternatives = []
             if ctx.leak_on:
                 alternatives.append((g.build_leak_automation(config, room, room["units"][0]),
@@ -618,12 +647,14 @@ def _walk(sequence: list):
 def _fuzz_votes(n: int, seed: int = 7) -> int:
     rnd = random.Random(seed)
     fails = 0
+    stale_count = 0
     for i in range(n):
         k = rnd.randint(1, 5)
-        readings, sensors = {}, {}
+        readings, sensors, ages = {}, {}, {}
         for j in range(k):
             sid = f"s{j}"
             readings[sid] = round(rnd.uniform(18, 30), 1) if rnd.random() > 0.15 else None
+            ages[sid] = rnd.choice((60, 89 * 60, 90 * 60, 90 * 60 + 1, 5 * 3600, 3 * 86400))
             if rnd.random() > 0.1:
                 sensors[sid] = {"comfort": round(rnd.uniform(20, 27), 1),
                                 "band": round(rnd.uniform(0.5, 5.0), 2),
@@ -636,14 +667,20 @@ def _fuzz_votes(n: int, seed: int = 7) -> int:
         ha.now = table.T0
         _seed(ha, control.Unit(), ctx)
         _context(ha, ctx, readings, {"sensors": sensors})
+        reported = {sid: table.T0 - timedelta(seconds=age) for sid, age in ages.items()}
+        for sid, when in reported.items():
+            ha.entities[f"sensor.{sid}"]["last_reported"] = when
         got = ha.variables(g.build_maintenance_automation(config, room),
                            {"cold_edge": edges[0], "warm_edge": edges[1]}, until="votes")["votes"]
-        want = dataclasses.asdict(control.evaluate_votes(readings, {"sensors": sensors}, *edges))
+        fresh = control.fresh_readings(readings, reported, table.T0, ctx.sensor_stale_minutes)
+        stale_count += sum(1 for sid in readings if readings[sid] is not None and fresh[sid] is None)
+        want = dataclasses.asdict(control.evaluate_votes(fresh, {"sensors": sensors}, *edges))
         want.pop("positions")
         if got != want:
             fails += 1
             print(f"[FAIL] vote fuzz {i}: jinja {got}, control {want}")
-    print(f"{n - fails}/{n} fuzzed votes match control.evaluate_votes")
+    print(f"{n - fails}/{n} fuzzed votes match control.evaluate_votes "
+          f"({stale_count} readings stale, at report ages up to 3 days)")
     return fails
 
 
@@ -749,6 +786,29 @@ def _extra_cases() -> int:
     expect(order[0] == g.guard_id(ROOM) and order[-1] == g.guard_id(ROOM)
            and order.index(g.state_id(ROOM, UNIT)) < order.index(ENTITY),
            "maintenance raises the guard, writes the helpers, sends, lowers the guard")
+
+    # A virtual sensor reads its unit's attribute, so it goes stale with its unit.
+    vctx = table._ctx({})
+    vconfig, vroom = _config(vctx, ["s1"], False)
+    vroom["sensors"].append({"id": "internal", "name": "internal",
+                             "source": {"type": "unit_attribute", "unit_id": UNIT,
+                                        "attribute": "current_temperature"}})
+    vroom_alm = {"sensors": {"s1": {"comfort": 24.0, "band": 1.0, "trust": 0.5},
+                             "internal": {"comfort": 24.0, "band": 1.0, "trust": 0.5}}}
+    votes_seen = []
+    for unit_age in (60, 3 * 3600):
+        vha = HA()
+        vha.now = table.T0
+        _seed(vha, control.Unit(), vctx)
+        _context(vha, vctx, {"s1": 25.5}, vroom_alm)
+        vha.entities[ENTITY]["attributes"]["current_temperature"] = 25.5
+        vha.entities[ENTITY]["last_reported"] = table.T0 - timedelta(seconds=unit_age)
+        votes_seen.append(vha.variables(g.build_maintenance_automation(vconfig, vroom),
+                                        until="votes")["votes"])
+    expect([(v["required"], v["tally"], v["met"]) for v in votes_seen] == [(2, 2, True),
+                                                                            (1, 1, True)],
+           "a virtual sensor goes stale with its unit: 2 of 2 vote while the unit reports, "
+           "1 of 1 once it last reported 3 h ago")
 
     automations = [g.build_maintenance_automation(config, room),
                    g.build_scene_automation(config, room, {"id": SECTION}),

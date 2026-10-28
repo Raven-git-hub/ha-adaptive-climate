@@ -40,6 +40,7 @@ _FROM_TRUST = {"cool": TOO_WARM, "warm": TOO_COLD, "none": NONE}
 
 DEFAULT_MIN_TEMP, DEFAULT_MAX_TEMP = 16.0, 30.0
 DEFAULT_BAND = 5.0      # a sensor with no band yet votes like a low-trust one (v1 template)
+DEFAULT_STALE_MINUTES = 90      # system.sensor_stale_minutes
 
 
 # ---------------------------------------------------------------------
@@ -92,6 +93,7 @@ class Context:
     leak_on: bool = False               # the unit's leak latch
     forced_off: bool = False            # the section's scene forces this unit off
     min_delta: float = 0.5              # system.reactive_min_delta
+    sensor_stale_minutes: int = DEFAULT_STALE_MINUTES   # system.sensor_stale_minutes
     config: ControlConfig = ControlConfig()
 
 
@@ -117,6 +119,21 @@ class Votes:
 # ---------------------------------------------------------------------
 # Votes
 # ---------------------------------------------------------------------
+
+def is_stale(last_reported: datetime | None, now: datetime, stale_minutes: int) -> bool:
+    """A sensor Home Assistant last reported more than stale_minutes ago is
+    treated as unavailable: one put away can keep its last value for days
+    without going unavailable. Unknown (None) is not stale."""
+    return last_reported is not None and (now - last_reported).total_seconds() > stale_minutes * 60
+
+
+def fresh_readings(readings: dict[str, float | None], last_reported: dict[str, datetime | None],
+                   now: datetime, stale_minutes: int) -> dict[str, float | None]:
+    """The readings with every stale sensor's reading taken as None, so it
+    has no vote and counts toward no quorum (the maintenance template does
+    the same from each entity's last_reported)."""
+    return {sid: None if is_stale(last_reported.get(sid), now, stale_minutes) else value
+            for sid, value in readings.items()}
 
 def _trusts(trusts: dict[str, float]) -> dict[str, float]:
     return trusts

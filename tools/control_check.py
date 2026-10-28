@@ -57,7 +57,8 @@ READINGS = {
 }
 CTX_DEFAULTS = {"setpoint_applied": 22.0, "unit_min": 16.0, "unit_max": 30.0,
                 "heartbeat_interval": 10, "blocked": False, "leak_on": False,
-                "forced_off": False}
+                "forced_off": False, "sensor_stale_minutes": 90}
+DAYS_3 = 3 * 24 * 60 * 60       # a sensor put away three days ago
 BABY = {"unit_min": 18.0}
 
 
@@ -114,6 +115,18 @@ SCENARIOS = [
     s("votes: a leaned warm edge", [
         votes("near", {"met": False}),
         votes("near", {"met": True, "tally": 2, "direction": "too_warm"}, edges=[-1.0, 0.4])]),
+    # A step's `reported` gives, per sensor, how many seconds ago Home Assistant
+    # last reported it (default: just now); past sensor_stale_minutes its
+    # reading is taken as unavailable, though its state still shows a value.
+    s("votes: a stale sensor has no vote and counts toward no quorum", [votes("hot", {
+        "met": False, "tally": 1, "required": 2, "direction": "none",
+        "warm_side": 2}, reported={"s1": m(91)})]),
+    s("votes: 90 minutes since the last report is not stale yet", [votes("hot", {
+        "met": True, "tally": 2, "required": 2, "direction": "too_warm"},
+        reported={"s1": m(90)})]),
+    s("votes: sensor_stale_minutes is the config's", [votes("hot", {
+        "met": False, "tally": 1, "required": 2}, reported={"s1": m(31)})],
+      ctx={"sensor_stale_minutes": 30}),
     s("votes: no comfort can't vote; a missing band is 5.0", [votes(
         {"s1": 30.0, "s2": 30.0, "s3": 24.0}, {"met": False, "required": 2, "tally": 1},
         almanac={"sensors": {"s1": {"band": 1.0, "trust": 0.9},
@@ -126,6 +139,13 @@ SCENARIOS = [
       unit={"since": -m(10)}),
     s("cool -> rest when too cold", [step("cold", {"state": "rest"}, OFF)],
       unit={"since": -m(10)}),
+    s("a sensor put away 3 days ago doesn't boost with its frozen reading", [
+        step("hot", {"state": "cool", "since": -m(60)}, None, reported={"s1": DAYS_3, "s2": DAYS_3})],
+      unit={"since": -m(60)}),
+    s("a stale cold reading doesn't hold a rest", [
+        step("cold", {"state": "cool", "offset": 1}, cmd("cool", "low", 23.0),
+             reported={"s1": DAYS_3, "s2": DAYS_3})],
+      unit={"state": "rest", "since": -m(60)}),
     s("cool stays cool without votes, and sends nothing", [
         step("settled_warm", {"state": "cool", "since": -m(10)}, None)],
       unit={"since": -m(10)}),
@@ -388,9 +408,12 @@ def _ctx(*layers: dict) -> control.Context:
     return control.Context(config=control.ControlConfig(**config), **merged)
 
 
-def _votes(st: dict) -> control.Votes:
+def _votes(st: dict, now: datetime = T0,
+           stale_minutes: int = control.DEFAULT_STALE_MINUTES) -> control.Votes:
     readings = st["readings"]
     readings = READINGS[readings] if isinstance(readings, str) else readings
+    reported = {sid: now - timedelta(seconds=ago) for sid, ago in st.get("reported", {}).items()}
+    readings = control.fresh_readings(readings, reported, now, stale_minutes)
     return control.evaluate_votes(readings, st.get("almanac", ALMANAC),
                                   *st.get("edges", (-1.0, 1.0)))
 
@@ -402,14 +425,15 @@ def run(scenario: dict) -> list[str]:
         for i, st in enumerate(scenario["steps"], 1):
             now, ctx, expect = _time(st.get("at", 0)), _ctx(scenario["ctx"], st.get("ctx")), st["expect"]
             if st["do"] == "votes":
-                v = _votes(st)
+                v = _votes(st, now, ctx.sensor_stale_minutes)
                 got = {k: getattr(v, k) for k in expect}
                 if got != expect:
                     return [f"step {i}: votes {got}, expected {expect}"]
                 continue
             command = "n/a"
             if st["do"] == "step":
-                unit, command = control.step(unit, _votes(st), now, ctx)
+                unit, command = control.step(unit, _votes(st, now, ctx.sensor_stale_minutes),
+                                             now, ctx)
             elif st["do"] == "section_change":
                 unit, command = control.on_section_change(
                     unit, ctx, st.get("forced_off", ctx.forced_off), now)
@@ -509,6 +533,16 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
         ("an off command's echo keeps the setpoint (just off instead)",
          {"_off_matches": lambda before, after, min_delta: after.mode == "off"},
          ["a setpoint change on a resting unit is a person's: rest, and a wake at the new base"]),
+        ("stale sensors taken as unavailable",
+         {"is_stale": lambda last_reported, now, stale_minutes: False},
+         ["votes: a stale sensor has no vote and counts toward no quorum",
+          "votes: sensor_stale_minutes is the config's",
+          "a sensor put away 3 days ago doesn't boost with its frozen reading",
+          "a stale cold reading doesn't hold a rest"]),
+        ("the stale cut-off at sensor_stale_minutes (stale from the minute instead)",
+         {"is_stale": lambda last_reported, now, stale_minutes: last_reported is not None
+          and (now - last_reported).total_seconds() >= stale_minutes * 60},
+         ["votes: 90 minutes since the last report is not stale yet"]),
         ("the reactive_min_delta tolerance (exact setpoint instead)",
          {"_same_setpoint": lambda shown, commanded, min_delta: shown == commanded},
          ["a setpoint within reactive_min_delta of our command is ours"]),
