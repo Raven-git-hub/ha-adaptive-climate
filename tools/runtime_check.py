@@ -62,7 +62,10 @@ def _build_states():
                 "attributes": {"id": f"ac_scene_{r}_{sec}"}})
         states.append({"entity_id": f"input_boolean.ac_active_{r}", "state": "off", "attributes": {}})
         states.append({"entity_id": f"input_boolean.ac_hold_{r}", "state": "off", "attributes": {}})
-        states.append({"entity_id": f"input_select.ac_scene_{r}", "state": "day", "attributes": {}})
+        # not any real section, so the startup catch-up always re-fires,
+        # whatever the time of day the check runs at
+        states.append({"entity_id": f"input_select.ac_scene_{r}", "state": "unknown",
+                       "attributes": {}})
         if r == "main_bedroom":     # control helpers on one room; the others have none yet
             for u in room["units"]:
                 states += [
