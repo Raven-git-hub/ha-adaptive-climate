@@ -53,6 +53,7 @@ from zoneinfo import ZoneInfo
 
 from app import control
 from app.analyser import LearningConfig, analyse_room, is_setpoint_moving
+from app.config import ConfigError, validate
 from app.generator import (almanac_id, base_id, guard_id, offset_id, scene_automation_id,
                            scene_select_id, state_id)
 from app.scheduler import active_section_at
@@ -191,6 +192,16 @@ class Runtime:
         tzname = cfg.get("time_zone") or "UTC"
         self.tz = ZoneInfo(tzname)
         self.store.save_config_version(self.config)
+        try:
+            validate(self.config)
+        except ConfigError as e:
+            # Keep running on it (stopping would stop observation too), but
+            # say so where it is seen: deploy refuses this config.
+            ts, ts_utc, _, _ = self._now()
+            self.store.log_event(ts, ts_utc, "error", "config",
+                                 f"the config does not validate: {e}. Running on it as it is; "
+                                 "fix it on the Config page, save, and restart",
+                                 detail={"error": str(e)})
 
         states = await self.rest.states()
         for s in states:

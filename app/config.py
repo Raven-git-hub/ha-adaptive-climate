@@ -200,6 +200,29 @@ def validate(cfg: dict, schema_path: str | Path = SCHEMA_PATH) -> None:
     if error is not None:
         where = ".".join(str(p) for p in error.absolute_path) or "config"
         raise ConfigError(f"{where}: {error.message}")
+    _check_unique_ids(cfg)
+
+
+def _check_unique_ids(cfg: dict) -> None:
+    """Ids the schema can't make unique: room ids, and unit and sensor ids
+    within a room. A repeated sensor id once made a second sensor overwrite
+    the first in every heartbeat, so a live sensor was never seen."""
+    def unique(items: list, where: str, what: str, scope: str = "") -> None:
+        seen: dict = {}
+        for j, item in enumerate(items):
+            iid = item.get("id")
+            if iid in seen:
+                raise ConfigError(
+                    f"{where}.{j}.id: duplicate {what} id {iid!r}{scope} ({where}.{seen[iid]} "
+                    f"has it too); each {what} needs its own id")
+            seen[iid] = j
+
+    rooms = cfg.get("rooms") or []
+    unique(rooms, "rooms", "room")
+    for i, room in enumerate(rooms):
+        scope = f" in room {room.get('id')!r}"
+        unique(room.get("units") or [], f"rooms.{i}.units", "unit", scope)
+        unique(room.get("sensors") or [], f"rooms.{i}.sensors", "sensor", scope)
 
 
 def loads(text: str, schema_path: str | Path = SCHEMA_PATH) -> Config:

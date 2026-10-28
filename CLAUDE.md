@@ -63,7 +63,7 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
 | `app/runtime.py` | Observer + control loop: scheduler, reactive detector, replay triggers, almanac push |
 | `app/store.py` | CSV + SQLite storage, event log, almanac persistence |
 | `app/main.py` | FastAPI app, lifespan wiring |
-| `app/config.py` | Config loading: v1 → v2 migration, v2 defaults, schema validation (cross-reference checks still to come — Roadmap Phase 9) |
+| `app/config.py` | Config loading: v1 → v2 migration, v2 defaults, schema validation, unique room ids and unit/sensor ids within a room (other cross-reference checks still to come — Roadmap Phase 9) |
 | `app/static/` | Vanilla-JS UI (no build step) — Now / Analysis / Almanac / Config / Log tabs |
 
 ### Key docs
@@ -153,8 +153,9 @@ up — deploy and the UI see it immediately.
   it is a prerequisite for v2's Gate A.
 - Foreign-automation conflict detection is manual — deploy prunes only its own
   `ac_*` artifacts and reminds the user to check for conflicts by hand.
-- The config loader migrates, defaults and schema-validates, but the
-  cross-reference checks (Phase 9) are still missing; the runtime reads the
-  migrated config as a plain dict.
+- The config loader migrates, defaults, schema-validates and rejects duplicate
+  ids, but the other cross-reference checks (Phase 9) are still missing; the
+  runtime reads the migrated config as a plain dict (logging an error event if
+  it doesn't validate, and deploy refuses it).
 - User-customisable AC state profiles and HA add-on packaging are future work
   (Phases 16–17).

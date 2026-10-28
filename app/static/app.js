@@ -188,6 +188,34 @@ function slugify(s) {
   return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "room";
 }
 
+// `base`, or base_2, base_3... - the first not already in `taken`.
+function uniqueId(base, taken) {
+  const used = new Set(taken);
+  if (!used.has(base)) return base;
+  let n = 2;
+  while (used.has(`${base}_${n}`)) n++;
+  return `${base}_${n}`;
+}
+
+// Ids the server rejects as duplicates: rooms, and units and sensors within
+// a room (a repeated sensor id makes one sensor overwrite the other).
+function duplicateIds(config) {
+  const found = [];
+  const check = (items, what) => {
+    const seen = new Set();
+    for (const it of items || []) {
+      if (seen.has(it.id)) found.push(`${what} "${it.id}"`);
+      seen.add(it.id);
+    }
+  };
+  check(config.rooms, "room");
+  for (const r of config.rooms || []) {
+    check(r.units, `unit in ${r.id}:`);
+    check(r.sensors, `sensor in ${r.id}:`);
+  }
+  return found;
+}
+
 // --- path helpers: "rooms.0.units.1.entity_id", "system.trust.high_trust_deviation" ---
 function getPath(obj, path, def) {
   const parts = path.split(".");
@@ -285,6 +313,15 @@ function wireConfigToolbar() {
   const report = document.getElementById("cfg-report");
 
   document.getElementById("cfg-save").addEventListener("click", async () => {
+    if (cfgMode === "raw") {         // save what is in the text box, not the last form state
+      try { cfg = JSON.parse(document.getElementById("cfg-raw").value); }
+      catch (e) { msg.textContent = "not saved: invalid JSON: " + e.message; return; }
+    }
+    const dupes = duplicateIds(cfg);
+    if (dupes.length) {
+      msg.textContent = "not saved: duplicate id " + dupes.join(", ") + " - give each its own id";
+      return;
+    }
     msg.textContent = "saving\u2026";
     const r = await fetch("/api/config", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -421,7 +458,8 @@ const cfgActions = {
   },
   "add-unit": (d) => {
     const room = cfg.rooms.find((r) => r.id === d.room);
-    const id = slugify(prompt("Unit id:", "")); if (!id) return;
+    const typed = slugify(prompt("Unit id:", "")); if (!typed) return;
+    const id = uniqueId(typed, room.units.map((u) => u.id));
     room.units.push({ id, name: id, entity_id: "climate.", leak_detection: { enabled: false } });
     renderConfigBody();
   },
@@ -432,7 +470,8 @@ const cfgActions = {
   },
   "add-sensor": (d) => {
     const room = cfg.rooms.find((r) => r.id === d.room);
-    const id = slugify(prompt("Sensor id:", "")); if (!id) return;
+    // generated, unique within the room; editable in the id column
+    const id = uniqueId(`${room.id}_sensor`, room.sensors.map((s) => s.id));
     room.sensors.push({ id, name: id, entity_id: "sensor." });
     renderConfigBody();
   },

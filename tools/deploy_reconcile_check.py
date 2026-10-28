@@ -212,6 +212,21 @@ async def main() -> int:
     print("deploy 4 (baby_room removed): pruned exactly its 9 automations + 9 helpers, "
           "other rooms and foreign helpers untouched - OK")
 
+    # a config that doesn't validate (a sensor id repeated in a room): the
+    # check names it, and the deploy writes nothing
+    bad = json.loads(json.dumps(cfg4))
+    bad["rooms"][0]["sensors"].append(dict(bad["rooms"][0]["sensors"][0], name="Second"))
+    before = (copy.deepcopy(ws.store), len(rest.set_calls), len(rest.delete_calls),
+              len(rest.service_calls), d._manifest_path(tmp).read_text())
+    dry = await d.check(bad, rest, ws, tmp)
+    real = await d.deploy(bad, rest, ws, tmp)
+    assert not dry.ok and "duplicate sensor id" in dry.problems[0], dry.problems
+    assert not real.ok and real.helpers_created == real.automations_written == []
+    assert (copy.deepcopy(ws.store), len(rest.set_calls), len(rest.delete_calls),
+            len(rest.service_calls), d._manifest_path(tmp).read_text()) == before
+    print("a config with a duplicate sensor id: the check names it and the deploy aborts "
+          "without writing anything - OK")
+
     print(f"check (the dry run) before each of the 4 deploys wrote nothing and listed exactly "
           f"what the deploy then did: {[r['helpers_created'] for r in dry_runs]} created, "
           f"{[r['helpers_removed'] for r in dry_runs]} removed, "

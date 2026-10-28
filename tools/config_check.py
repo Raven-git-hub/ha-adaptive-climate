@@ -10,8 +10,11 @@ install as version 2). Verifies:
   * only v2's new keys are defaulted, never v1 keys
   * unknown versions, leftover v1 keys and bad outdoor settings are rejected,
     with the outdoor entity required for its source
+  * duplicate ids are rejected: a unit or sensor id repeated within a room,
+    or a room id; the same sensor id in two rooms is fine
   * blank() and load() produce valid version 2 configs
-  * the save endpoint migrates, validates against v2 and writes version 2
+  * the save endpoint migrates, validates against v2 and writes version 2,
+    and refuses duplicate ids, leaving the saved config as it was
 
     PYTHONPATH=. python tools/config_check.py
 """
@@ -149,6 +152,31 @@ def main() -> int:
     print("outdoor: weather_entity required for 'forecast', probe_entity for 'probe', "
           "domains checked; knobs need an id; heat sources accepted - OK")
 
+    # --- duplicate ids: a repeated sensor id once hid a live sensor ---
+    dup_sensor = copy.deepcopy(V2)
+    baby = next(r for r in dup_sensor["rooms"] if r["id"] == "baby_room")
+    baby["sensors"].append({"id": "baby", "name": "Baby Room Temperature 2",
+                            "entity_id": "sensor.baby_room_temperature_2"})
+    expect_error(dup_sensor, "rooms.2.sensors.1.id: duplicate sensor id 'baby' in room "
+                             "'baby_room' (rooms.2.sensors.0 has it too)")
+    dup_unit = copy.deepcopy(V2)
+    dup_unit["rooms"][0]["units"].append({"id": "main_room_ac", "name": "Second AC",
+                                          "entity_id": "climate.lounge_2"})
+    expect_error(dup_unit, "duplicate unit id 'main_room_ac' in room 'main_room'")
+    dup_room = copy.deepcopy(V2)
+    dup_room["rooms"].append(copy.deepcopy(dup_room["rooms"][1]))
+    expect_error(dup_room, "rooms.3.id: duplicate room id 'main_bedroom'")
+    shared = copy.deepcopy(V2)
+    shared["rooms"][0]["sensors"].append({"id": "baby", "name": "Lounge baby monitor",
+                                          "entity_id": "sensor.lounge_baby_monitor"})
+    validate(shared)
+    renamed = copy.deepcopy(dup_sensor)
+    renamed["rooms"][2]["sensors"][1]["id"] = "baby_2"
+    validate(renamed)
+    print("duplicate ids: a sensor or unit id repeated within a room, or a room id, is "
+          "rejected with both places named; the same sensor id in two rooms, or a renamed "
+          "second sensor, is fine - OK")
+
     # --- blank() and load() ---
     validate(blank())
     assert blank()["version"] == 2 and blank()["system"]["control"]["offset_cap"] == 3
@@ -173,6 +201,18 @@ def main() -> int:
         raise AssertionError("save endpoint accepted an invalid config")
     print("save endpoint: a v1 payload is saved as version 2; invalid v2 is a 400; "
           "a v1 file on disk reads back migrated - OK")
+
+    # --- the UI's save path, over HTTP: duplicates are a 400 and nothing is written ---
+    from fastapi.testclient import TestClient
+    main.CONFIG_PATH.write_text(json.dumps(V2))
+    with TestClient(main.app) as client:
+        r = client.post("/api/config", json=dup_sensor)
+        assert r.status_code == 400 and "duplicate sensor id 'baby'" in r.json()["detail"], r.text
+        assert json.loads(main.CONFIG_PATH.read_text()) == V2, "a rejected save was written"
+        assert client.post("/api/config", json=renamed).status_code == 200
+        assert json.loads(main.CONFIG_PATH.read_text()) == renamed
+    print("save path (POST /api/config): a config with a duplicate sensor id is a 400 naming "
+          "it, and the saved config is left as it was; with the id fixed it saves - OK")
 
     print("\nALL CONFIG CHECKS PASSED")
     return 0

@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from app import generator as g
+from app.config import ConfigError, validate
 from app.ha import HAError, HARest, HAWebSocket
 
 MANIFEST_FILENAME = "deploy_manifest.json"
@@ -124,6 +125,11 @@ async def check(config: dict, rest: HARest, ws: HAWebSocket | None = None,
     also the plan deploy() would carry out, built by the same code with
     writing switched off."""
     report = DeployReport(dry_run=True)
+    try:
+        validate(config)
+    except ConfigError as e:
+        report.problems.append(f"the config does not validate: {e}; fix it before deploying")
+        return report
     try:
         states = {s["entity_id"]: s for s in await rest.states()}
     except Exception as e:
@@ -289,9 +295,9 @@ async def _initialise_new_helpers(config: dict, rest: HARest,
 async def deploy(config: dict, rest: HARest, ws: HAWebSocket,
                  data_dir: str | Path) -> DeployReport:
     check_report = await check(config, rest)
-    if check_report.missing_entities:
+    if check_report.problems:
         check_report.dry_run = False
-        check_report.problems.append("deploy aborted: fix missing entities first")
+        check_report.problems.append("deploy aborted: nothing was written")
         return check_report
 
     report = DeployReport(notes=list(check_report.notes))
