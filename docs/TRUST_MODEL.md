@@ -48,6 +48,10 @@ from a **seed**:
   ```
 
   `chosen` is the raw value the person set, whatever offset or boost was active.
+  A **vote** (too cold or too hot, from a room's button or a setpoint change on a
+  remote) moves every unit that has a seed: `chosen` is the value set on the
+  remote for the unit changed there, and for every other unit (and for a button)
+  the `setpoint_applied` in force one step warmer (too cold) or cooler (too hot).
 - **Applied setpoint.** The unit takes whole degrees, so `setpoint_applied` is
   a whole degree tracked through the replay, reaction by reaction:
   - normally the whole step **nearest `S`**, an exact half going toward the
@@ -64,24 +68,32 @@ from a **seed**:
   direction instead, which over-applied: an `S` of 24.17 after a correction up
   to 25 applied 25. With 23 in force when that correction was made, it now
   applies 24, the nearest step and still a step up.
-- **Comfort readings** move only on evidence that you accepted the room: the
+- **Comfort readings** move only on what a person says. A **vote** moves them
+  straight away: each sensor reading r at the vote moves its comfort at the same
+  rate toward r + `person_step_degrees` (too cold) or r − it (too hot), default
+  1°: you felt cold at r, so this sensor's comfort sits a step warmer. Then the
   mean reading 30 to 60 minutes after a setpoint-moving reaction, if nobody
-  reacted in that window, no unit was boosting, resting or in leak mode, and it
-  holds at least two heartbeats. Comfort moves toward that mean at the same
-  rate. The window belongs to the reaction's section even if it runs into the
-  next one.
+  reacted in that window, no unit was boosting, resting or in leak mode (a
+  vote's own forced rest or boost included), and it holds at least two
+  heartbeats. Comfort moves toward that mean at the same rate. The window
+  belongs to the reaction's section even if it runs into the next one.
 
-A **setpoint-moving reaction** is a setpoint change or a knob turn, or a
-reaction of any kind in which a unit's setpoint changed (an `on` with a new
-setpoint). A section is **provisional** until its first one, then **learned**.
+A **setpoint-moving reaction** is a vote, a setpoint change or knob turn
+(recorded before the votes), or a reaction of any kind in which a unit's
+setpoint changed (an `on` with a new setpoint). A section is **provisional**
+until its first one, then **learned**.
 
-**Kinds of reaction.** Besides setpoint changes, a person turning a unit
-**on** or **off**, or changing its mode or fan while it stays on (**manual**),
-is a reaction. On says *too warm* and off *too cold*: both teach bands (below),
-but neither moves the setpoint unless the person changed the setpoint too.
-Manual teaches nothing; it is logged. Every kind, manual included, resets a
-section's quiet count and disqualifies a comfort window it falls inside. A
-unit dropping offline and coming back is never a reaction.
+**Kinds of reaction.** The person is a sensor that always wins: a **vote**,
+`too_cold` or `too_hot`, is the main one (docs/V2_DESIGN.md, Person reactions).
+Home Assistant judges it (one per episode: a press during a forced rest or boost
+is ignored and teaches nothing) and reports it; the container learns only from
+the votes HA reports as accepted. A person turning a unit **on** or **off**, or
+changing its mode or fan while it stays on (**manual**), is a reaction too. On
+says *too warm* and off *too cold*: both teach bands (below), but neither moves
+the setpoint unless the person changed the setpoint too. Manual teaches nothing;
+it is logged. Every kind, manual included, resets a section's quiet count and
+disqualifies a comfort window it falls inside. A unit dropping offline and
+coming back is never a reaction.
 
 ## Trust and the comfort band
 
@@ -101,31 +113,26 @@ The calibration endpoints, from testing:
 Let `D_HIGH = 0.5` and `D_LOW = 5.0` (both configurable under
 `system.trust` in the config).
 
-**Band half-width** for a sensor is the recency-weighted mean of the deviations
-at which you reacted, clamped to `[D_HIGH, D_LOW]`:
+**Band half-width.** Every sensor starts at `D_LOW`, and **each reaction nudges
+each sensor's band**; quiet periods never move it. When you react, the system
+snapshots every sensor. For each, `d = reading − comfort`, against its comfort
+reading **as it stood in the replay just before the reaction**, not today's
+value. A reaction that wants it **warmer** (too cold, a unit turned off, a
+setpoint raised) is on the side of sensors **below** their comfort; one that
+wants it **cooler** (too hot, a unit turned on, a setpoint lowered), of those
+**above**. Then, at `reaction_rate` (halfway by default):
 
 ```
-band = clamp( weighted_mean(reaction_deviations), D_HIGH, D_LOW )
-weight = 0.5 ^ (age_in_days / recency_half_life_days)      # over all history
+same side, |d| <  band   ->  band moves toward |d|          (it should have spoken: tighten)
+same side, |d| >= band   ->  band moves toward 0.8 x band   (it did speak: tighten a little)
+other side               ->  band moves toward band + |d|   (it said the opposite: widen)
+d = 0                    ->  no change                      (it says nothing either way)
+band = clamp(band, D_HIGH, D_LOW)
 ```
 
-The deviation is measured against the sensor's comfort reading **as it stood in
-the replay at the moment of the reaction**, not today's value.
-
-**Attribution — which sensor a reaction teaches.** When you react, the system
-snapshots *every* sensor, but a reaction only teaches the sensors that had
-drifted, and drifted **the way the reaction says**:
-
-- A reaction that wants it **warmer** (setpoint raised, unit turned off, knob
-  warmer) teaches only sensors that were at least `D_HIGH` **below** their
-  comfort reading.
-- A reaction that wants it **cooler** (setpoint lowered, unit turned on, knob
-  cooler) teaches only sensors at least `D_HIGH` **above** it.
-
-A sensor sitting at its comfort, or off on the other side, is evidence of
-nothing about that sensor, so folding its deviation in would wrongly make it
-look trusted. A sensor with no qualifying reactions keeps the widest band (low
-trust). The band itself stays symmetric.
+A manual change teaches no band. The band itself stays symmetric. Because the
+band is the path of these nudges, an old reaction counts as much as a new one,
+until later reactions move it on; there is no recency weighting.
 
 **Trust** is the normalised inverse of the band, purely for display and
 tie-breaking (the quorum itself is vote-count based, below):
@@ -159,12 +166,18 @@ had at least one heartbeat and no reaction. Any reaction resets it to 0.
      to **22°C** (21.5 is a tie, and the tie goes your way too). The section
      is now learned.
    - **Sensor A is trustworthy.** You wanted it warmer and A was `1.0°C` below
-     its comfort, so its band tightens to **±1.0°C** and its trust rises to
-     **0.89**. A second sensor sitting at its comfort learns nothing.
+     its comfort, inside its ±5° band, so the band moves halfway toward 1.0, to
+     **±3.0°C**, and its trust rises to **0.44**. A second sensor sitting at its
+     comfort learns nothing. A second reaction like it would take A to ±2.0°C.
 4. Half an hour to an hour later, if you left the room alone, sensor A's
    readings over that window pull its comfort halfway toward them.
 5. From the next day's run, the unit drives **22°C**, and the moment sensor A
-   reads below about 24°C (comfort − band) it votes.
+   reads below about 22°C (comfort − band) it votes.
+
+The same moment through the room's **too cold** button instead: the unit rests
+at once (forced), the applied setpoint steps a degree to 22, and A's comfort
+moves straight away halfway toward 24 + 1 = 25, so it stays at 25; its band
+tightens as above.
 
 v1, given the same data, learned 21.02 and applied 21: the correction vanished.
 `tools/compare_analyser.py` shows that difference on any data set.

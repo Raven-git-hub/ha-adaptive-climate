@@ -48,11 +48,16 @@ against the section's learned comfort band every ten minutes and nudges the
 thermostats that are already on, by no more than 2 degrees at a time.
 
 Every ten minutes a **heartbeat** records the reading of every temperature
-sensor in each room and the state of every AC unit. When you adjust a thermostat
-by hand, that **reactive** event is captured at five times the weight of a
-heartbeat — you correcting the system is the most valuable signal it gets.
-Overnight at 00:15, a rolling three-week weighted analysis rebuilds the almanac,
-favouring recent days and high-confidence samples.
+sensor in each room and the state of every AC unit. Only a person moves a
+target: **you are a sensor that always wins.** Each room has two buttons in
+Home Assistant, **too cold** and **too hot** (`input_button.ac_too_cold_<room>`,
+`input_button.ac_too_hot_<room>`), which a dashboard, a physical button or a
+knob can press. A press rests or boosts the room's units at once, steps the
+target a degree, and teaches every sensor where your comfort sits. Changing a
+setpoint on the remote counts as the same vote, with the value you chose. One
+correction per episode: while a press's rest or boost is running, further
+presses are logged and ignored. The almanac is a replay of every reaction,
+rebuilt straight after each one and nightly at 00:15.
 
 The goal is convergence: a system that has learned enough to provoke no
 reactions at all.
@@ -88,10 +93,11 @@ all of those are "comfortable".
 
 When a sensor drifts and you then react, two things are learned at once: the
 setpoint was wrong (so it is corrected), and that sensor is trustworthy (a small
-drift on it predicted real discomfort). That sensor keeps its comfort reading,
-gains **trust**, and gets a **tighter comfort band**. A reaction only teaches the
-sensors that actually drifted — a sensor sitting at its comfort when you reacted
-learns nothing from it.
+drift on it predicted real discomfort). Each reaction nudges every sensor's
+**comfort band**: one that had drifted your way tightens (gaining **trust**),
+one on the other side widens, and one sitting exactly at its comfort learns
+nothing. A press also moves each sensor's comfort reading toward its reading
+a degree your way.
 
 - **High trust ≈ a 0.5°C band** — you react to small deviations on this sensor.
 - **Low trust ≈ a 5°C band** — this sensor must drift a long way to mean anything.
@@ -114,8 +120,8 @@ cools a unit or turns it off, apart from leak protection:
 | State | When | AC mode | Fan | Setpoint |
 |---|---|---|---|---|
 | **cool** | the default while a section is running | COOL | LOW | base + offset |
-| **boost** | the quorum says too warm | COOL | MEDIUM | base + offset − 2°C |
-| **rest** | the quorum says too cold, or cooling is blocked | OFF | — | — |
+| **boost** | the quorum says too warm, or you pressed **too hot** | COOL | MEDIUM | base + offset − 2°C |
+| **rest** | the quorum says too cold, you pressed **too cold**, or cooling is blocked | OFF | — | — |
 | **user_off** | a person turned the unit off | OFF | — | — |
 | **manual** | a person chose another mode or fan | theirs | theirs | theirs |
 | **config_off** | the section's scene forces the unit off | OFF | — | — |
@@ -126,10 +132,11 @@ what a person chose since. The **offset** moves in whole steps within a section:
 −1 when a boost ends, +1 when a rest wakes, capped at ±3, and reset at the next
 section change. Commands are sent only on transitions, clamped to the unit's own
 range, and never re-sent every heartbeat. A unit stays in a state for at least
-one heartbeat (two when resting), and a person's setpoint change or turn-on
-holds it in **cool** for 30 minutes. **user_off** and **manual** last until the
-section changes; a person's setpoint change while the unit is off or in manual
-keeps the state and takes effect the next time the unit cools.
+one heartbeat (two when resting), and a person's turn-on holds it in **cool**
+for 30 minutes. **user_off** and **manual** last until the section changes. A
+rest or boost you forced with a press (or a setpoint change on the remote) ends
+by the same rules, but returns to **cool** at the new base, without the offset
+step; until it does, further presses are ignored.
 
 Fan speed availability and min/max range are read from each unit at runtime, so
 one generated automation adapts per unit — including units that hide their fan
@@ -290,7 +297,7 @@ python tools/sweep.py                       # a year of section boundaries
 python tools/store_check.py                 # store writes + reads, into the analyser
 python tools/analyser_demo.py               # the trust-model worked example
 python tools/render_generated.py            # render helpers + automations
-python tools/control_check.py               # the control state machine's scenarios
+python tools/control_check.py               # the control state machine's scenarios, the votes included
 python tools/control_logic_check.py         # the generated Jinja replayed against them
 python tools/deploy_reconcile_check.py      # deploy create / reuse / update / prune
 python tools/leak_response_check.py         # the leak latch: off when wet, released when dry

@@ -16,6 +16,8 @@ Then the storage migrations:
     exactly as it was
   * migration 2 closes the section runs v1 left open, from v1 or from a
     phase 0 database, and a sleep run crossing midnight closes properly
+  * migration 3 lets a storage version 2 database (which refuses them)
+    record a person's votes, too_cold and too_hot, keeping every reaction
   * a database newer than the code is refused
 
     PYTHONPATH=. python tools/store_check.py
@@ -151,12 +153,13 @@ def check_fresh_store() -> None:
     sections = analyse_room(store._conn, ROOM, LearningConfig(), as_of)
     day = next(s for s in sections if s.section == "day")
     sp = day.unit_setpoints["main_room_ac"]
-    # reaction on living1 at reading 23.9 vs its comfort 24.9 -> band ~1.0, trust up
+    # reaction on living1 at reading 23.9 vs its comfort 24.9: on the person's side
+    # (warmer wanted, below comfort) and inside its band, so 5.0 moves halfway to 1.0
     b1 = day.sensor_band["living1"]
     print(f"analyser over stored data: setpoint={sp:.3f}, living1 band=±{b1:.3f} "
           f"trust={day.sensor_trust['living1']:.3f}")
     assert sp == 22.5, sp                            # seed 22, halfway to the chosen 23
-    assert abs(b1 - 1.0) < 1e-6, b1                  # |24.9 - 23.9|, warmer wanted, below
+    assert abs(b1 - 3.0) < 1e-6, b1                  # 5.0 + 0.5 x (|24.9 - 23.9| - 5.0)
     assert day.sensor_band["living2"] == 5.0          # sat at comfort -> learns nothing
     print("end-to-end observe->learn path holds together")
 
@@ -230,6 +233,25 @@ def check_fresh_store() -> None:
             "kind": kind, "power_before": p0, "power_after": p1}, (row, unit)
     print("reaction kinds: on, off, manual and setpoint, with their power and setpoint "
           "fields, round-trip through the CSV and SQLite alike - OK")
+    # a person's votes: a button (no unit rows) and a remote (the value chosen)
+    store.record_reactive("baby_room", f"{rd}T15:40:00+08:00", f"{rd}T07:40:00+00:00", rd,
+                          "day", window_seconds=0, kind="too_cold", units={},
+                          sensors={"baby": 26.1})
+    store.record_reactive("baby_room", f"{rd}T15:45:00+08:00", f"{rd}T07:45:00+00:00", rd,
+                          "day", window_seconds=0, kind="too_hot",
+                          units={"baby_room_ac": ReactiveUnitSample(None, 21.0, True,
+                                                                    kind="too_hot")},
+                          sensors={"baby": 26.4})
+    votes = [tuple(r) for r in c.execute(
+        "SELECT r.kind, ru.kind, ru.setpoint_before, ru.setpoint_after FROM reactive r "
+        "LEFT JOIN reactive_unit ru ON ru.reactive_id = r.id "
+        "WHERE r.room_id = 'baby_room' AND r.kind IN ('too_cold', 'too_hot') ORDER BY r.ts")]
+    assert votes == [("too_cold", None, None, None), ("too_hot", "too_hot", None, 21.0)], votes
+    csv_votes = list(csvmod.DictReader(
+        (tmp / "csv" / "baby_room" / f"{rd}_reactive.csv").open()))[-2:]
+    assert [r["kind"] for r in csv_votes] == ["too_cold", "too_hot"], csv_votes
+    print("a person's votes: too_cold from a button (no unit rows) and too_hot from a remote "
+          "(the value chosen) round-trip through the CSV and SQLite - OK")
     for bad in ("INSERT INTO heartbeat_unit(heartbeat_id,unit_id,is_on,control_state) "
                 "VALUES (1,'x',1,'warming')",
                 "INSERT INTO reactive_unit(reactive_id,unit_id,kind) VALUES (1,'x','fan')",
@@ -369,10 +391,10 @@ def check_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store_mod.MIGRATIONS) == 2
+    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store_mod.MIGRATIONS) == 3
     assert _backups(db) == [store.backup_path], (_backups(db), store.backup_path)
     assert _dump(store.backup_path) == v1_dump, "backup is not a copy of the v1 database"
-    print(f"migration: v1 database backed up to {store.backup_path.name}, now at version 2 - OK")
+    print(f"migration: v1 database backed up to {store.backup_path.name}, now at version 3 - OK")
 
     def n(table: str) -> int:
         return c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -400,7 +422,7 @@ def check_migration() -> None:
     assert sorted(cats) == ["connection", "crossover", "reactive", "storage"], cats
     storage = store.recent_events(category="storage")[0]
     assert str(store.backup_path) in storage["message"], storage
-    assert storage["detail"] == {"from": 0, "to": 2, "backup": str(store.backup_path)}
+    assert storage["detail"] == {"from": 0, "to": 3, "backup": str(store.backup_path)}
     assert store.current_almanac("main_room", as_of=date(2026, 8, 1)) == \
         {"room_id": "main_room", "sections": {}}
     assert c.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -471,7 +493,7 @@ def check_failed_migration() -> None:
 
 def check_phase0_database() -> None:
     """A database left at storage version 1 (v2 phase 0, before the section
-    run fix) gets migration 2 alone, behind its own backup."""
+    run fix) gets migrations 2 and 3, behind its own backup."""
     real = store_mod.MIGRATIONS
     tmp = Path(tempfile.mkdtemp())
     db = build_v1_db(tmp)
@@ -488,15 +510,72 @@ def check_phase0_database() -> None:
     assert still_open == 6, still_open
 
     store = Store(tmp, SCHEMA)
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
     assert _backups(db, "phase0") == [store.backup_path], store.backup_path
     assert _dump(store.backup_path) == phase0
     assert _runs(store._conn) == EXPECTED_RUNS, _runs(store._conn)
     details = [e["detail"] for e in store.recent_events(category="storage")]
-    assert {"from": 1, "to": 2, "backup": str(store.backup_path)} in details, details
+    assert {"from": 1, "to": 3, "backup": str(store.backup_path)} in details, details
     store.close()
-    print(f"phase 0 database: backed up to {store.backup_path.name}, migration 2 alone "
-          f"closes its open runs - OK")
+    print(f"phase 0 database: backed up to {store.backup_path.name}, migration 2 closes its "
+          f"open runs - OK")
+
+
+def check_votes_migration() -> None:
+    """A database at storage version 2, whose reaction tables refuse the
+    vote kinds, gets migration 3 alone: every reaction kept, the kinds
+    allowed, and the shape a fresh database's."""
+    tmp = Path(tempfile.mkdtemp())
+    old_schema = tmp / "storage.v2.schema.sql"
+    text = SCHEMA.read_text()
+    assert text.count(",\n                                        'too_cold','too_hot')") == 2
+    old_schema.write_text(text.replace(",\n                                        'too_cold','too_hot')",
+                                       ")"))
+    real = store_mod.MIGRATIONS
+    store_mod.MIGRATIONS = real[:2]
+    try:
+        old = Store(tmp, old_schema)            # a fresh database at storage version 2
+    finally:
+        store_mod.MIGRATIONS = real
+    rd = "2026-08-01"
+    old.record_reactive("main_room", f"{rd}T10:00:00+08:00", f"{rd}T02:00:00+00:00", rd, "day",
+                        window_seconds=120, kind="setpoint",
+                        units={"main_room_ac": ReactiveUnitSample(22.0, 23.0, True,
+                                                                  kind="setpoint")},
+                        sensors={"living1": 24.0})
+    try:
+        old.record_reactive("main_room", f"{rd}T11:00:00+08:00", f"{rd}T03:00:00+00:00", rd,
+                            "day", window_seconds=0, kind="too_cold", units={}, sensors={})
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("a storage version 2 database took a vote kind")
+    old.close()
+    db = tmp / "db" / "adaptive_climate.db"
+    v2 = _dump(db)
+    assert v2[0] == 2
+
+    store = Store(tmp, SCHEMA)
+    c = store._conn
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert _backups(db, "pre-votes") == [store.backup_path], store.backup_path
+    assert _dump(store.backup_path) == v2
+    assert [tuple(r) for r in c.execute(
+        "SELECT r.kind, ru.unit_id, ru.setpoint_before, ru.setpoint_after, rs.temperature "
+        "FROM reactive r JOIN reactive_unit ru ON ru.reactive_id = r.id "
+        "JOIN reactive_sensor rs ON rs.reactive_id = r.id")] == [
+        ("setpoint", "main_room_ac", 22.0, 23.0, 24.0)]
+    store.record_reactive("main_room", f"{rd}T11:00:00+08:00", f"{rd}T03:00:00+00:00", rd,
+                          "day", window_seconds=0, kind="too_cold", units={}, sensors={})
+    assert c.execute("PRAGMA foreign_key_check").fetchall() == []
+    store.close()
+    fresh = Path(tempfile.mkdtemp())
+    Store(fresh, SCHEMA).close()
+    assert _shape(db) == _shape(fresh / "db" / "adaptive_climate.db"), \
+        "the database migrated to version 3 differs from a fresh one"
+    print(f"migration 3: a version 2 database (refusing too_cold) backed up to "
+          f"{store.backup_path.name}, its reaction, unit and sensor rows kept; it then records "
+          f"a vote, and matches a fresh database - OK")
 
 
 def check_newer_database_refused() -> None:
@@ -519,6 +598,7 @@ def main() -> int:
     check_migration()
     check_failed_migration()
     check_phase0_database()
+    check_votes_migration()
     check_newer_database_refused()
     print("\nALL STORE CHECKS PASSED")
     return 0

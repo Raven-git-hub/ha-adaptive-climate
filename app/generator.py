@@ -17,8 +17,11 @@ module never looks at what is already in HA.
 
 The control logic is app/control.py's, rendered as Jinja (docs/V2_DESIGN.md,
 Control: cool or rest): the scene runs on_section_change, maintenance runs
-evaluate_votes and step, the manual-change automation runs
-on_climate_change, and the leak automations run step's leak rules.
+evaluate_votes and step, the vote automation runs on_button, the
+manual-change automation runs on_climate_change, and the leak automations
+run step's leak rules. The vote and manual-change automations decide
+whether a person's vote is accepted (one per episode) and report it in an
+ac_person_vote event, which is all the runtime learns from.
 tools/control_logic_check.py replays tools/control_check.py's scenario
 table through these templates against app/control.py.
 
@@ -99,6 +102,18 @@ def grace_until_id(room: str, unit: str) -> str:
 def unblocked_id(room: str, unit: str) -> str:
     return f"input_boolean.ac_unblocked_{room}_{unit}"
 
+def forced_id(room: str, unit: str) -> str:
+    return f"input_boolean.ac_forced_{room}_{unit}"
+
+# A person's vote: one button per direction per room. Anything may press
+# them (a dashboard, a physical button's automation, the knob); a remote's
+# setpoint change votes too.
+def button_id(room: str, direction: str) -> str:
+    assert direction in control.PERSON_VOTES, direction
+    return f"input_button.ac_{direction}_{room}"
+
+PERSON_VOTE_EVENT = "ac_person_vote"
+
 def scene_automation_id(room: str, section: str) -> str:
     return f"ac_scene_{room}_{section}"
 
@@ -107,6 +122,9 @@ def maintenance_automation_id(room: str) -> str:
 
 def manual_automation_id(room: str, unit: str) -> str:
     return f"ac_manual_{room}_{unit}"
+
+def vote_automation_id(room: str) -> str:
+    return f"ac_vote_{room}"
 
 def leak_automation_id(room: str, unit: str) -> str:
     return f"ac_leak_{room}_{unit}"
@@ -174,6 +192,8 @@ def build_helpers(config: dict) -> list[dict]:
         specs.append(spec(guard_id(r)))
         specs.append(spec(hold_id(r)))
         specs.append(spec(scene_select_id(r), options=list(SECTIONS)))
+        for direction in control.PERSON_VOTES:
+            specs.append(spec(button_id(r, direction)))
         for unit in room["units"]:
             u = unit["id"]
             specs.append(spec(state_id(r, u), options=list(control.STATES)))
@@ -183,6 +203,7 @@ def build_helpers(config: dict) -> list[dict]:
             specs.append(spec(since_id(r, u), has_date=True, has_time=True))
             specs.append(spec(grace_until_id(r, u), has_date=True, has_time=True))
             specs.append(spec(unblocked_id(r, u)))
+            specs.append(spec(forced_id(r, u)))
         for unit in _leak_units(room):
             specs.append(spec(leak_id(r, unit["id"])))
             specs.append(spec(leak_confirm_id(r, unit["id"])))
@@ -195,7 +216,7 @@ def build_helpers(config: dict) -> list[dict]:
 # Each per-unit template reads the unit's helpers once (_read_unit), runs
 # one entry point of app.control, and renders one dict:
 #
-#   {go, state, offset, base, since, grace, unb, cmd}
+#   {go, state, offset, base, since, grace, unb, forced, cmd}
 #
 # go: write the helpers, and send cmd if there is one. base 0 means unset;
 # since and grace are epoch seconds (whole seconds, as input_datetime keeps
@@ -251,8 +272,8 @@ def _leak_on(room: dict, unit: dict) -> str:
 
 def _read_unit(room: dict, unit: dict, sa: str, leak: str) -> str:
     """The unit's record and context: st, off, b (0 = unset), since, grace,
-    unb, leak, sa (setpoint_applied), tb (target base), lo and hi (its
-    range), and r, the result namespace, starting as the unit is."""
+    unb, frc (forced), leak, sa (setpoint_applied), tb (target base), lo and
+    hi (its range), and r, the result namespace, starting as the unit is."""
     r, u = room["id"], unit["id"]
     return _fill(
         "{%- set st = states('<<STATE>>') -%}"
@@ -261,21 +282,24 @@ def _read_unit(room: dict, unit: dict, sa: str, leak: str) -> str:
         "{%- set since = state_attr('<<SINCE>>', 'timestamp') -%}"
         "{%- set grace = state_attr('<<GRACE>>', 'timestamp') -%}"
         "{%- set unb = states('<<UNB>>') == 'on' -%}"
+        "{%- set frc = states('<<FRC>>') == 'on' -%}"
         "{%- set leak = <<LEAK>> -%}"
         "{%- set sa = <<SA>> -%}"
         "{%- set tb = b if b else sa -%}"
         "{%- set lo = state_attr('<<E>>', 'min_temp') or <<LO>> -%}"
         "{%- set hi = state_attr('<<E>>', 'max_temp') or <<HI>> -%}"
         "{%- set r = namespace(go=false, state=st, offset=off, base=b, since=since, "
-        "grace=grace, unb=unb, cmd=none) -%}",
+        "grace=grace, unb=unb, forced=frc, cmd=none) -%}",
         STATE=state_id(r, u), OFFSET=offset_id(r, u), BASE=base_id(r, u),
         SINCE=since_id(r, u), GRACE=grace_until_id(r, u), UNB=unblocked_id(r, u),
+        FRC=forced_id(r, u),
         LEAK=leak, SA=sa, E=unit["entity_id"],
         LO=repr(control.DEFAULT_MIN_TEMP), HI=repr(control.DEFAULT_MAX_TEMP))
 
 
 _RESULT = ("{{ {'go': r.go, 'state': r.state, 'offset': r.offset, 'base': r.base, "
-           "'since': r.since, 'grace': r.grace, 'unb': r.unb, 'cmd': r.cmd} }}")
+           "'since': r.since, 'grace': r.grace, 'unb': r.unb, 'forced': r.forced, "
+           "'cmd': r.cmd} }}")
 
 
 def _clamp(value: str) -> str:
@@ -299,13 +323,13 @@ def _command(state: str, base: str, offset: str, boost: float) -> str:
 
 def _go(state: str, cfg: control.ControlConfig, offset: str | None = None) -> str:
     """control._go: a transition to `state` (offset capped if given), since
-    = now, and its command."""
+    = now, and its command. It ends any forced state."""
     capped = "" if offset is None else _fill(
         "{%- set r.offset = [[<<O>>, -<<CAP>>] | max, <<CAP>>] | min -%}",
         O=offset, CAP=cfg.offset_cap)
     return capped + _fill(
         "{%- set r.state = '<<S>>' -%}{%- set r.since = now_ts -%}{%- set r.go = true -%}"
-        "{%- set r.cmd = <<CMD>> -%}",
+        "{%- set r.forced = false -%}{%- set r.cmd = <<CMD>> -%}",
         S=state, CMD=_command(f"'{state}'", "tb", "r.offset", cfg.boost_degrees))
 
 
@@ -325,7 +349,7 @@ def _section_change(cfg: control.ControlConfig, forced_off: str) -> str:
     return _fill(
         "{%- set r.offset = 0 -%}{%- set r.base = sa if sa is not none else 0 -%}"
         "{%- set r.unb = false -%}{%- set r.grace = now_ts -%}{%- set r.since = now_ts -%}"
-        "{%- set r.go = true -%}"
+        "{%- set r.forced = false -%}{%- set r.go = true -%}"
         "{%- if leak -%}{%- set r.state = 'leak' -%}"
         "{%- elif <<FORCED>> -%}{%- set r.state = 'config_off' -%}"
         "{%- elif sa is none -%}{%- if st == 'leak' -%}{%- set r.state = 'rest' -%}{%- endif -%}"
@@ -338,6 +362,12 @@ def _section_change(cfg: control.ControlConfig, forced_off: str) -> str:
 
 def _forced_off_live(room: dict, unit: dict) -> str:
     return f"(section in {_forced_off_sections(room, unit)!r})"
+
+
+def _release_offset(change: int) -> str:
+    """control.release_offset: a system boost or rest moves the offset a
+    step; a forced one returns to cool at its base."""
+    return f"(0 if frc else off {'+' if change > 0 else '-'} {abs(change)})"
 
 
 def _step(config: dict, room: dict, unit: dict) -> str:
@@ -361,19 +391,55 @@ def _step(config: dict, room: dict, unit: dict) -> str:
         + f"{{%- if not {cool_min} -%}}"
         + "{%- elif blocked and not unb -%}" + _go("rest", cfg)
         + f"{{%- elif (since is not none and now_ts - since >= {cfg.boost_max_minutes * 60!r}) "
-          f"or votes.warm_side < {release_floor} -%}}" + _go("cool", cfg, "off - 1")
+          f"or votes.warm_side < {release_floor} -%}}" + _go("cool", cfg, _release_offset(-1))
         + "{%- endif -%}"
         + "{%- elif st == 'rest' -%}"
         + f"{{%- if (blocked and not unb) or not {rest_min} -%}}"
-        + f"{{%- elif votes.cold_side < {release_floor} -%}}" + _go("cool", cfg, "off + 1")
+        + f"{{%- elif votes.cold_side < {release_floor} -%}}" + _go("cool", cfg, _release_offset(+1))
         + "{%- endif -%}"
         + "{%- endif -%}")
 
 
-def _climate_change(config: dict) -> str:
-    """control.on_climate_change: implied_command, matches_command,
-    classify_change and on_person_change, over the trigger's `before` and
-    `after` ({mode, temperature, fan}). Sets ours and kind as well as r."""
+def _vote(config: dict, direction: str, chosen: str) -> str:
+    """control.on_person_vote for one unit; direction and chosen are Jinja
+    expressions (chosen none: a button press, one step from the target)."""
+    cfg = control.ControlConfig.from_config(config)
+    return _fill(
+        "{%- set vd = <<D>> -%}{%- set vc = <<C>> -%}"
+        "{%- set nb = vc if vc is not none else (none if tb is none else "
+        "tb + (<<STEP>> if vd == 'too_cold' else -<<STEP>>)) -%}"
+        "{%- if leak or st in <<ALONE>> or nb is none -%}"
+        "{%- else -%}"
+        "{%- set nb = <<CLAMP>> -%}"
+        "{%- set r.base = nb -%}{%- set r.offset = 0 -%}{%- set r.grace = now_ts -%}"
+        "{%- set r.go = true -%}"
+        "{%- set into = 'rest' if vd == 'too_cold' else 'boost' -%}"
+        "{%- if not (vd == 'too_cold' and st == 'user_off') -%}"
+        "{%- if st != into -%}{%- set r.since = now_ts -%}{%- endif -%}"
+        "{%- set r.state = into -%}{%- set r.forced = true -%}"
+        "{%- if not (st == 'rest' and into == 'rest') -%}{%- set r.cmd = <<CMD>> -%}{%- endif -%}"
+        "{%- endif -%}"
+        "{%- endif -%}",
+        D=direction, C=chosen, STEP=repr(control.SETPOINT_STEP),
+        ALONE=list(control.VOTE_HANDS_OFF), CLAMP=_clamp("nb"),
+        CMD=_command("into", "nb", "0", cfg.boost_degrees))
+
+
+def _episode(room: dict) -> str:
+    """control.in_episode: any unit in the room in a forced rest or boost."""
+    r = room["id"]
+    return "{{ " + " or ".join(
+        f"(states('{forced_id(r, u['id'])}') == 'on' and "
+        f"states('{state_id(r, u['id'])}') in {list(control.FORCED_STATES)!r})"
+        for u in room["units"]) + " }}"
+
+
+def _change_kind(config: dict) -> str:
+    """control.person_change_kind (implied_command, matches_command,
+    classify_change) and setpoint_direction, over the trigger's `before`
+    and `after` ({mode, temperature, fan}) with the changed unit's helpers
+    read: {ours, kind, vote}. vote is too_cold / too_hot for a person's
+    setpoint change, else none."""
     cfg = control.ControlConfig.from_config(config)
     md = repr(float(config.get("system", {}).get("reactive_min_delta", 0.5)))
     moved = _fill("(before.temperature is not none and after.temperature is not none "
@@ -388,25 +454,31 @@ def _climate_change(config: dict) -> str:
         "{%- set kind = ('on' if pa else 'off') if pb != pa else ('setpoint' if <<MOVED>> "
         "else ('manual' if pa and (before.mode != after.mode or before.fan != after.fan) "
         "else none)) -%}"
+        "{%- set vote = (('too_cold' if after.temperature > before.temperature else 'too_hot') "
+        "if kind == 'setpoint' and not ours else none) -%}"
+        "{{ {'ours': ours, 'kind': kind, 'vote': vote} }}",
+        CMD=_command("st", "tb", "off", cfg.boost_degrees), MOVED=moved, MD=md)
+
+
+def _person_change(config: dict) -> str:
+    """control.on_person_change for change.kind: on, off or manual. Each
+    ends a forced state; a latched leak keeps its state."""
+    cfg = control.ControlConfig.from_config(config)
+    return _fill(
         "{%- set g = now_ts + <<GRACE>> -%}"
-        "{%- if ours or st == 'leak' or kind is none -%}"
-        "{%- elif kind == 'setpoint' -%}"
-        "{%- set r.base = after.temperature if after.temperature is not none else 0 -%}"
-        "{%- set r.offset = 0 -%}{%- set r.go = true -%}"
-        "{%- if pa and st != 'manual' -%}"
-        "{%- set r.state = 'cool' -%}{%- set r.since = now_ts -%}{%- set r.grace = g -%}"
-        "{%- endif -%}"
-        "{%- elif kind == 'on' -%}"
+        "{%- if st == 'leak' -%}"
+        "{%- elif change.kind == 'on' -%}"
         "{%- set r.state = 'cool' -%}"
         "{%- set r.base = after.temperature if after.temperature is not none else 0 -%}"
         "{%- set r.offset = 0 -%}{%- set r.unb = true -%}{%- set r.since = now_ts -%}"
-        "{%- set r.grace = g -%}{%- set r.go = true -%}"
-        "{%- elif kind == 'off' -%}"
-        "{%- set r.state = 'user_off' -%}{%- set r.since = now_ts -%}{%- set r.go = true -%}"
-        "{%- elif kind == 'manual' -%}"
-        "{%- set r.state = 'manual' -%}{%- set r.since = now_ts -%}{%- set r.go = true -%}"
+        "{%- set r.grace = g -%}{%- set r.forced = false -%}{%- set r.go = true -%}"
+        "{%- elif change.kind == 'off' -%}"
+        "{%- set r.state = 'user_off' -%}{%- set r.since = now_ts -%}"
+        "{%- set r.forced = false -%}{%- set r.go = true -%}"
+        "{%- elif change.kind == 'manual' -%}"
+        "{%- set r.state = 'manual' -%}{%- set r.since = now_ts -%}"
+        "{%- set r.forced = false -%}{%- set r.go = true -%}"
         "{%- endif -%}",
-        CMD=_command("st", "tb", "off", cfg.boost_degrees), MOVED=moved, MD=md,
         GRACE=cfg.person_grace_minutes * 60)
 
 
@@ -446,6 +518,8 @@ def _write_unit(room: dict, unit: dict) -> dict:
                  {"timestamp": f"{{{{ {v}.grace }}}}"})]),
         _when(f"{{{{ {v}.unb }}}}", [_set("input_boolean.turn_on", unblocked_id(r, u))],
               [_set("input_boolean.turn_off", unblocked_id(r, u))]),
+        _when(f"{{{{ {v}.forced }}}}", [_set("input_boolean.turn_on", forced_id(r, u))],
+              [_set("input_boolean.turn_off", forced_id(r, u))]),
     ])
 
 
@@ -476,6 +550,30 @@ def _send_command(unit: dict) -> dict:
 
 def _hold_off(room: dict) -> str:
     return f"{{{{ states('{hold_id(room['id'])}') == 'off' }}}}"
+
+
+def _vote_event(room: dict, direction: str, source: str, **remote: str) -> dict:
+    """The ac_person_vote event: the room, the vote's direction, whether it
+    was accepted (no episode running) and its source; a remote vote adds
+    the unit changed and the setpoint chosen. The runtime records an
+    accepted vote as a reaction and logs an ignored one, and judges
+    nothing itself."""
+    return {"event": PERSON_VOTE_EVENT,
+            "event_data": {"room": room["id"], "direction": direction,
+                           "accepted": "{{ not episode }}", "source": source, **remote}}
+
+
+def _apply_vote(room: dict) -> dict:
+    """An accepted vote's writes and commands for every unit, under the
+    guard; nothing while ac_hold is on (the vote is still reported)."""
+    r = room["id"]
+    any_go = " or ".join(f"{_unit_var(u)}.go" for u in room["units"])
+    return _when(f"{{{{ not episode and states('{hold_id(r)}') == 'off' and ({any_go}) }}}}", [
+        _set("input_boolean.turn_on", guard_id(r)),
+        *[_write_unit(room, unit) for unit in room["units"]],
+        *[_send_command(unit) for unit in room["units"]],
+        _set("input_boolean.turn_off", guard_id(r)),
+    ])
 
 
 # ---------------------------------------------------------------------
@@ -739,11 +837,51 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
 
 
 # ---------------------------------------------------------------------
+# Vote automation - one per room: a press of its too_cold or too_hot button
+# (control.on_button). Home Assistant alone decides whether the vote is
+# accepted (no unit in a forced rest or boost) and reports it in an
+# ac_person_vote event before acting on it.
+# ---------------------------------------------------------------------
+
+def build_vote_automation(config: dict, room: dict) -> dict:
+    r = room["id"]
+    variables: dict[str, str] = {
+        **_live_section_variables(room), "now_ts": NOW_TS,
+        "direction": "{{ trigger.id }}",
+        "episode": _episode(room),
+    }
+    for unit in room["units"]:
+        variables[_unit_var(unit)] = (
+            _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
+            + "{%- if not episode -%}" + _vote(config, "direction", "none") + "{%- endif -%}"
+            + _RESULT)
+    return {
+        "id": vote_automation_id(r),
+        "alias": f"AC {room.get('name', r)} — person vote",
+        # queued: a second press waits for the first run, then finds its episode
+        "mode": "queued",
+        "max": 10,
+        # to: null - a press changes the button's state (its timestamp); an
+        # attribute-only change (a rename) isn't one
+        "trigger": [{"platform": "state", "entity_id": button_id(r, d), "to": None, "id": d}
+                    for d in control.PERSON_VOTES],
+        "condition": [_template(
+            "{{ trigger.from_state is not none and trigger.to_state is not none and "
+            "trigger.from_state.state != 'unavailable' and "
+            "trigger.to_state.state not in ['unavailable', 'unknown'] }}")],
+        "variables": variables,
+        "action": [_vote_event(room, "{{ direction }}", "button"), _apply_vote(room)],
+    }
+
+
+# ---------------------------------------------------------------------
 # Manual-change automation - one per unit. A person's change to the unit
 # (no parent context, guard off, the unit reporting, and not our own
-# command showing up late) is applied to its helpers straight away, so it
-# holds while the container is down. No command: the person already moved
-# the unit. The container records the same change as a reaction.
+# command showing up late): a setpoint change is a vote for the room
+# (control.on_room_vote, with the value chosen as this unit's base),
+# reported and applied like a button press; on, off or a mode/fan change
+# goes to this unit's helpers straight away, with no command (the person
+# already moved the unit). So it all holds while the container is down.
 # ---------------------------------------------------------------------
 
 def _climate_snapshot(state: str) -> str:
@@ -753,8 +891,29 @@ def _climate_snapshot(state: str) -> str:
                  "'fan': s.attributes.get('fan_mode') if s else none} }}", S=state)
 
 
+MANUAL_TRIGGERS = ("mode", "temperature", "fan_mode")
+
+
 def build_manual_change_automation(config: dict, room: dict, unit: dict) -> dict:
-    r, u, v = room["id"], unit["id"], _unit_var(unit)
+    r, u, e = room["id"], unit["id"], unit["entity_id"]
+    variables: dict[str, str] = {
+        **_live_section_variables(room), "now_ts": NOW_TS,
+        "before": _climate_snapshot("trigger.from_state"),
+        "after": _climate_snapshot("trigger.to_state"),
+        "change": _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
+                  + _change_kind(config),
+        "episode": _episode(room),
+    }
+    for other in room["units"]:
+        mine = other["id"] == u
+        body = ("{%- if change.vote is not none -%}{%- if not episode -%}"
+                + _vote(config, "change.vote", "after.temperature" if mine else "none")
+                + "{%- endif -%}")
+        if mine:
+            body += "{%- elif change.kind is not none and not change.ours -%}" + _person_change(config)
+        body += "{%- endif -%}"
+        variables[_unit_var(other)] = (
+            _read_unit(room, other, _sa_live(other), _leak_on(room, other)) + body + _RESULT)
     return {
         "id": manual_automation_id(r, u),
         "alias": f"AC {room.get('name', r)} — manual change ({unit.get('name', u)})",
@@ -762,33 +921,31 @@ def build_manual_change_automation(config: dict, room: dict, unit: dict) -> dict
         "max": 10,
         # Mode changes (to: null fires on state changes only), and the two
         # attributes a person changes: current_temperature updates don't fire
-        # it. A change that moves the mode and an attribute fires twice; the
-        # second run sees the first's helper writes, so it either finds the
-        # change is now "ours" or writes the same record again.
+        # it. One change can fire two of them (a mode and a setpoint at
+        # once); only the first that applies, in this order, goes on, so
+        # each change runs once and a vote is never counted twice.
         "trigger": [
-            {"platform": "state", "entity_id": unit["entity_id"], "to": None},
-            {"platform": "state", "entity_id": unit["entity_id"], "attribute": "temperature"},
-            {"platform": "state", "entity_id": unit["entity_id"], "attribute": "fan_mode"},
+            {"platform": "state", "entity_id": e, "to": None, "id": "mode"},
+            {"platform": "state", "entity_id": e, "attribute": "temperature", "id": "temperature"},
+            {"platform": "state", "entity_id": e, "attribute": "fan_mode", "id": "fan_mode"},
         ],
-        "variables": {
-            **_live_section_variables(room), "now_ts": NOW_TS,
-            "before": _climate_snapshot("trigger.from_state"),
-            "after": _climate_snapshot("trigger.to_state"),
-            v: _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
-               + _climate_change(config)
-               + "{{ {'go': r.go, 'state': r.state, 'offset': r.offset, 'base': r.base, "
-                 "'since': r.since, 'grace': r.grace, 'unb': r.unb, 'cmd': none, "
-                 "'ours': ours, 'kind': kind} }}",
-        },
+        "variables": variables,
         "condition": [
             _template("{{ trigger.to_state is not none and "
                       "trigger.to_state.context.parent_id is none }}"),
             {"condition": "state", "entity_id": guard_id(r), "state": "off"},
             _template("{{ before.mode not in [none, 'unavailable', 'unknown'] and "
                       "after.mode not in [none, 'unavailable', 'unknown'] }}"),
-            _template(f"{{{{ {v}.kind is not none and not {v}.ours }}}}"),
+            _template("{{ change.kind is not none and not change.ours }}"),
+            _template("{{ trigger.id == ('mode' if before.mode != after.mode else "
+                      "('temperature' if before.temperature != after.temperature "
+                      "else 'fan_mode')) }}"),
         ],
-        "action": [_write_unit(room, unit)],
+        "action": [_when("{{ change.vote is not none }}", [
+            _vote_event(room, "{{ change.vote }}", "remote",
+                        chosen="{{ after.temperature }}", unit=u),
+            _apply_vote(room),
+        ], [_write_unit(room, unit)])],
     }
 
 
@@ -803,6 +960,7 @@ def render_all(config: dict) -> dict:
         for section in _sections_for(config, room):
             automations.append(build_scene_automation(config, room, section))
         automations.append(build_maintenance_automation(config, room))
+        automations.append(build_vote_automation(config, room))
         for unit in room["units"]:
             automations.append(build_manual_change_automation(config, room, unit))
         for unit in _leak_units(room):

@@ -20,7 +20,7 @@ v2 changes four things:
 - **Learning:** human reactions move targets; quiet periods only add confidence.
 - **Control:** units are only ever cooling or off.
 - **Outdoor temperature:** it leans the comfort bands and can block cooling outright.
-- **Household input:** a physical knob, so learning isn't limited to one person.
+- **Household input:** two buttons per room, "too cold" and "too hot", which a dashboard, a physical button or the knob can press, so learning isn't limited to one person. The person is a sensor that always wins.
 
 ## What carries over
 
@@ -50,22 +50,30 @@ A change is a person's when it carries no `context.parent_id`, `ac_active` is of
 
 A unit dropping to `unavailable` or `unknown`, or coming back, is never a reaction: nobody can say who changed it. If it comes back in a different power, mode, setpoint or fan from the one it dropped out in, the runtime logs a `control` event saying what changed.
 
+**A person's correction is a vote.** "Too cold" or "too hot" is a room-level vote that always wins: it forces the room's quorum its way (a rest or a boost), steps the target one degree, and moves the room's comfort readings (see [Person reactions](#person-reactions) and the learning sections below). Every human correction is meant to come through the room's two buttons, `input_button.ac_too_cold_<room>` and `input_button.ac_too_hot_<room>`, which deploy creates; a dashboard, a physical button's automation or the knob (phase 8) presses them, through automations that aren't ours. The remote is the fallback: a setpoint change on it is a vote too, too cold if raised and too hot if lowered, with the value chosen as that unit's new target.
+
+**One correction per episode.** A vote is accepted only while no unit in the room is in a forced rest or boost (one a vote started). While one is, a press of either button, or a setpoint change on a remote, is an **ignored press**: logged, changing and teaching nothing. Once the forced state ends, the next vote counts.
+
+**Home Assistant alone decides.** The generated vote automation (a press) and manual-change automation (a remote setpoint change) judge accept or ignore, and report it in an `ac_person_vote` event, `{room, direction, accepted, source}`, plus `unit` and `chosen` for a remote. The runtime records a `too_cold` / `too_hot` reaction, with its sensor snapshot, only from an accepted event, and logs an ignored one; it never judges the episode itself, and never records a remote setpoint change through its own detection window. One physical action, one reaction.
+
 | Event | Detected by | Teaches |
 | --- | --- | --- |
-| Setpoint change (remote, app, HA) | `temperature` attribute change by a person | Setpoint moves toward the chosen value; band and trust learn |
-| Unit turned on by a person | State goes from off to any non-off mode | "Too warm" (cooler wanted): band and trust learn; if cooling was blocked, the margin learns |
-| Unit turned off by a person | State goes to off | "Too cold or unwanted" (warmer wanted): band and trust learn; if we started cooling under 30 min ago, the margin learns |
+| Too cold / too hot button pressed | The room's `input_button`, through HA's `ac_person_vote` event | A vote: every unit's setpoint a step warmer or cooler; comfort readings toward reading ± `person_step_degrees`; bands |
+| Setpoint change (remote, app, HA) | `temperature` attribute change by a person, through HA's `ac_person_vote` event | A vote, too cold if raised and too hot if lowered, with the value chosen as that unit's setpoint |
+| Unit turned on by a person | State goes from off to any non-off mode | "Too warm" (cooler wanted): bands; if cooling was blocked, the margin learns |
+| Unit turned off by a person | State goes to off | "Too cold or unwanted" (warmer wanted): bands; if we started cooling under 30 min ago, the margin learns |
 | Mode or fan change by a person | `hvac_mode` or `fan_mode` changes while the unit stays on | Nothing: logged, not learned. The unit goes to `manual` |
-| Knob turned warmer or cooler | ESPHome event | Same as a setpoint change of one step per detent |
-| Knob pressed ("this is right") | ESPHome event | Comfort readings move toward current readings; confidence rises |
+| Knob turned warmer or cooler (phase 8) | Presses the room's too cold or too hot button | A vote, as any press |
 
 ### Grouping and kind
 
-Every reaction kind, the knob included, is grouped by the existing 120-second extending window (`system.reactive_window_seconds`): each further change extends the window, and the whole window is recorded as one reaction. Per unit, the record keeps the **first** `setpoint_before` in the window and the last `setpoint_after`. (v1 overwrites `setpoint_before` on every change; phase 0 fixes this.)
+A vote is recorded on its own, the moment HA's event arrives, as one reaction of kind `too_cold` or `too_hot` (room and unit kind alike): with no unit rows for a button, and for a remote one row for the unit changed, `setpoint_after` the value chosen. The episode rule already keeps a vote from repeating while its forced state runs.
 
-The reaction kind is stored per unit: `setpoint`, `on`, `off`, `manual`, `knob_turn` or `knob_press` (a knob long press records as `off`). A unit's kind in a window is `on` or `off` if its power changed between the first and last state (off → any mode is on), else `setpoint` if its setpoint was changed at all in the window, else `manual` (a mode or fan change while on). Its `setpoint_before/after` and `power_before/after` keep the first and last values. The room-level kind is derived from the units' kinds when the reaction is recorded, and stored with it: `off` if any unit went off, else `on`, else `setpoint`, else `manual`. A unit turned on and given a new setpoint in the same window is one reaction of kind `on`; setpoint learning still applies to it, because its `setpoint_after` changed.
+Turning a unit on or off, and a mode or fan change, are grouped by the existing 120-second extending window (`system.reactive_window_seconds`): each further change extends the window, and the whole window is recorded as one reaction. A setpoint change on its own is a vote and never enters a window; a window's `setpoint_after` moves only with a change that moved the setpoint itself (an `on` at a new setpoint), so a vote's setpoint never rides on it. Per unit, the record keeps the **first** `setpoint_before` in the window and the last `setpoint_after`. (v1 overwrites `setpoint_before` on every change; phase 0 fixes this.)
 
-A **setpoint-moving reaction** is a setpoint change or a knob turn, or a reaction of any kind in which a unit's setpoint changed (an `on` that comes with a new setpoint, say). It moves S and the applied setpoint, makes the section learned and opens a comfort window.
+The reaction kind is stored per unit: `too_cold`, `too_hot`, `on`, `off`, `manual`, or on rows recorded before the votes `setpoint`, `knob_turn` or `knob_press`. In a window a unit's kind is `on` or `off` if its power changed between the first and last state (off → any mode is on), else `setpoint` if its setpoint was changed at all in the window (an on at a new setpoint, then off), else `manual` (a mode or fan change while on). Its `setpoint_before/after` and `power_before/after` keep the first and last values. The room-level kind is derived from the units' kinds when the reaction is recorded, and stored with it: `off` if any unit went off, else `on`, else `setpoint`, else `manual`. A unit turned on at a new setpoint (one change) is one reaction of kind `on`; setpoint learning still applies to it, because its `setpoint_after` changed.
+
+A **setpoint-moving reaction** is a vote, a setpoint change or knob turn (rows recorded before the votes), or a reaction of any kind in which a unit's setpoint changed (an `on` that comes with a new setpoint, say). It moves S and the applied setpoint, makes the section learned and opens a comfort window.
 
 ### Setpoint
 
@@ -76,6 +84,8 @@ S_new = S_before + rate × (S_chosen − S_before)
 ```
 
 S_chosen is the person's raw value, whatever offset or boost was active at the time. Offsets never feed learning.
+
+**A vote** moves every unit with a seed, whatever its control state (control leaves some units alone, but the room's target still moved). S_chosen is the value chosen on a remote for the unit changed there; for every other unit, and for a button, it is the `setpoint_applied` in force ± one step, warmer for too cold. Through the rule below, that steps the applied setpoint exactly one degree.
 
 The stored value stays fractional. The applied value, `setpoint_applied`, is on whole degrees and is tracked through the replay, reaction by reaction:
 
@@ -88,15 +98,15 @@ This replaced rounding toward the direction of the latest reaction, which over-a
 
 ### Per-sensor comfort readings
 
-A comfort reading moves only from evidence that a person accepted the room:
+A comfort reading moves only from what a person says:
 
+- **A vote:** straight away, for each usable sensor with reading r at the vote, toward r + `system.control.person_step_degrees` (default 1.0) for too cold, or r − it for too hot, at `reaction_rate`. The person felt cold at r, so this sensor's comfort sits a step warmer. The runtime replays the room the moment it records the vote, so HA's next heartbeat already sees the moved comfort.
 - **After a setpoint-moving reaction:** the mean of the sensor's heartbeat readings from 30 to 60 minutes after the reaction. The comfort reading moves toward it at `reaction_rate`.
-- **A knob press:** the current reading, applied immediately at the same rate.
 
 The 30-to-60-minute window belongs to the reaction's section, even if a section boundary falls inside it. It is disqualified by:
 
 - any reaction of any kind in the window,
-- the unit being in `boost`, `rest` or `leak` at any heartbeat in the window, or
+- the unit being in `boost`, `rest` or `leak` at any heartbeat in the window (a vote's own forced rest or boost included, so a vote's window usually is), or
 - fewer than 2 heartbeats in the window.
 
 The update is applied at the first replay after the window closes; the runtime schedules a replay 65 minutes after each setpoint-moving reaction for this.
@@ -105,11 +115,13 @@ Quiet heartbeats no longer feed comfort readings. This keeps heater evenings and
 
 ### Band and trust
 
-A sensor's band is the recency-weighted mean of the deviations at which a person reacted, counting only sensors that had drifted by at least the high-trust deviation, clamped to ±0.5° to ±5°. Trust follows from the band. As in v1, except:
+Each reaction nudges each sensor's band; quiet periods never move it. A band starts at the low-trust deviation (5°). At every reaction with a direction (a vote, on, off, or an older setpoint change), each usable sensor's deviation d = reading − comfort is taken against its comfort reading as it stood in the replay just before the reaction, and its band moves halfway (`reaction_rate`) toward:
 
-- **Deviation** is measured against the sensor's comfort reading as it stood in the replay at the moment of the reaction.
-- **Weighting** uses the `recency_half_life_days` half-life over all history. There is no rolling window.
-- **Direction matching** applies to every reaction kind. A reaction that wants it warmer (setpoint raised, meaning `setpoint_after` above `setpoint_before`; unit turned off; knob warmer) teaches only sensors that were below their comfort reading. One that wants it cooler (setpoint lowered, unit turned on, knob cooler) teaches only sensors above it. The band itself stays symmetric.
+- **|d|**, when the sensor is on the person's side (below comfort when they want it warmer, above when cooler) and inside its band, so it would have spoken;
+- **0.8 × band**, when it is on their side and already past its band (it did speak, so it tightens a little);
+- **band + |d|**, when it is on the other side (it said the opposite, so it widens).
+
+A sensor exactly at comfort says nothing either way. The band is clamped to ±0.5° to ±5° (`system.trust`), and trust follows from it. Warmer is wanted by too cold, a unit turned off or a setpoint raised; cooler by too hot, a unit turned on or a setpoint lowered. Manual changes teach no band. The band itself stays symmetric.
 
 ### Confidence
 
@@ -117,7 +129,7 @@ A sensor's band is the recency-weighted mean of the deviations at which a person
 confidence = 1 − 0.5^(quiet / 3)
 ```
 
-*quiet* counts the section's completed runs since its last reaction that had at least one heartbeat and no reaction of any kind. Any reaction resets it to 0. Confidence drives the UI and the knob's feedback, not control.
+*quiet* counts the section's completed runs since its last reaction that had at least one heartbeat and no reaction of any kind. Any reaction, a vote included (an ignored press is no reaction), resets it to 0. Confidence drives the UI, not control.
 
 ### Rebuilding
 
@@ -134,7 +146,7 @@ The runtime's provisional seeding at crossover is retired. Instead, the runtime 
 **The replay runs:**
 
 - at startup, for every room, and pushed to HA before any crossover (catch-up included), so a crossover just after a start or a migration finds `setpoint_applied`;
-- after every reaction, so the UI updates immediately;
+- after every reaction, so the UI updates immediately (a vote's at once, so HA's next heartbeat sees its comfort move);
 - 65 minutes after each setpoint-moving reaction, to apply its comfort window (on startup the runtime re-arms this for the setpoint-moving reactions of the last 65 minutes, so a restart doesn't hold the comfort update until 00:15);
 - on the first heartbeat in a section with no almanac, or on any heartbeat that can seed a unit or sensor the almanac doesn't have yet (a unit that was off at the section's first heartbeat);
 - nightly at 00:15, as a consistency check.
@@ -152,37 +164,52 @@ The system only ever cools a unit or turns it off, apart from leak protection. W
 | State | Unit does |
 | --- | --- |
 | `cool` | cool, fan low, base + offset |
-| `boost` | cool, fan medium, base + offset − boost step |
-| `rest` | off, waiting |
+| `boost` | cool, fan medium, base + offset − boost step; forced by a too-hot vote, or the system's |
+| `rest` | off, waiting; forced by a too-cold vote, or the system's |
 | `user_off` | off, because a person turned it off; hands off until the section changes |
 | `manual` | the mode and fan a person chose; hands off until the section changes |
 | `config_off` | off, because the section's scene config forces it off; maintenance never touches it |
 | `leak` | off, latched (no setpoint, no fan: dry would still run the compressor) |
 
-**Base** is the unit's `input_number.ac_base_<room>_<unit>`. At each section change the scene sets it to the almanac's `setpoint_applied`. A person's setpoint change or turn-on resets it (see [Person reactions](#person-reactions)). Almanac pushes never change it mid-section, so a new S takes effect from the section's next run. A base of 0 means unset, and templates fall back to `setpoint_applied`. Every command is base + offset, minus the boost step in `boost`. Offsets build up within a section, reset at the next section change, and never feed learning.
+A **forced** rest or boost is one a person's vote started, marked by `input_boolean.ac_forced_<room>_<unit>`. It runs and releases by the same rules as the system's, except that its release returns to `cool` at the base, without the ±1 offset step.
+
+**Base** is the unit's `input_number.ac_base_<room>_<unit>`. At each section change the scene sets it to the almanac's `setpoint_applied`. A person's vote or turn-on resets it (see [Person reactions](#person-reactions)). Almanac pushes never change it mid-section, so a new S takes effect from the section's next run. A base of 0 means unset, and templates fall back to `setpoint_applied`. Every command is base + offset, minus the boost step in `boost`. Offsets build up within a section, reset at the next section change, and never feed learning.
 
 System transitions:
 
 - `cool` → `boost` when the quorum is met and the direction is too warm.
-- `boost` → `cool` when back at comfort or after the boost cap; offset −1.
+- `boost` → `cool` when back at comfort or after the boost cap; offset −1, or for a forced boost back to the base (offset 0).
 - `cool` → `rest` when the quorum is met and the direction is too cold, or when cooling is blocked and the unit isn't unblocked.
-- `rest` → `cool` when back at comfort; offset +1. A rest doesn't wake while blocked.
+- `rest` → `cool` when back at comfort; offset +1, or for a forced rest back to the base (offset 0). A rest doesn't wake while blocked.
+- Every transition clears the forced marker; only a vote sets it.
 - Any state → `leak` when the leak sensor is wet. Leak beats everything, including a person turning the unit off. When the leak is fixed and confirmed, the unit is evaluated as at a section change.
-- **Section change:** offsets reset to 0, base = `setpoint_applied`, `since` = now, and `ac_unblocked` and `ac_grace_until` are cleared. Each unit starts in `config_off` if the section's scene forces it off, otherwise in `rest` if cooling is blocked, otherwise in `cool`. `user_off` and `manual` end here; a unit in `leak` stays there, and off is sent again. A section change overrides minimum times.
+- **Section change:** offsets reset to 0, base = `setpoint_applied`, `since` = now, and `ac_unblocked`, `ac_grace_until` and `ac_forced` are cleared. Each unit starts in `config_off` if the section's scene forces it off, otherwise in `rest` if cooling is blocked, otherwise in `cool`. `user_off` and `manual` end here; a unit in `leak` stays there, and off is sent again. A section change overrides minimum times.
 
 ### Person reactions
 
-The manual-change automation applies these per unit, straight away, so they hold even while the container is down. The container records the same change as a reaction for learning.
+HA applies these straight away, so they hold even while the container is down. The container records them as reactions for learning: votes from HA's `ac_person_vote` event, the rest from its own detection.
 
-- **Setpoint change, unit on:** base = the chosen value, offset 0, state `cool`, `since` = now. The grace period starts.
-- **Setpoint change, unit off or in `manual`:** the state stays as it is (`rest` stays `rest`, `user_off` stays `user_off`, `manual` stays `manual`, and so on), base = the chosen value and offset 0. No grace period starts and `since` is kept, so a rest still keeps its minimum time. The new base applies the next time the unit cools.
+**A vote** (too cold or too hot, from the room's button through the vote automation `ac_vote_<room>`, or a setpoint change on a remote through the manual-change automation) is for the whole room. If any unit is in a forced rest or boost, it is ignored: nothing changes. Otherwise each unit takes its part:
+
+| Unit in | Too cold | Too hot |
+| --- | --- | --- |
+| `cool` | `rest`, forced, off | `boost`, forced, cool at the new base − boost step, fan medium |
+| `boost` | `rest`, forced, off | stays `boost`, forced, `since` kept, the new command |
+| `rest` | stays `rest`, forced, `since` kept, nothing sent (already off) | `boost`, forced |
+| `user_off` | stays `user_off` (the person's off stands), not forced | `boost`, forced |
+| `manual`, `config_off`, `leak` (or its latch on) | left alone | left alone |
+
+Every unit it moves gets base = its target (base, or `setpoint_applied` while unset) one step (1°) warmer for too cold or cooler for too hot, or for the unit changed on a remote the value chosen; offset 0; and no grace. The base is clamped to the unit's range. A unit with neither a base nor an almanac is left alone. A unit already in the state the vote forces keeps its `since`, so its minimum time and the boost cap count from when that state began; any other gets `since` = now. The reaction is recorded whichever units moved. A leak beats a vote.
+
+A forced state releases by the normal rules (back at comfort, the boost cap, minimum times), into `cool` at its base. The marker clears on release, at a section change, on a leak, and when a person turns the unit on or off or changes its mode.
+
 - **Turned off:** state `user_off`.
 - **Turned on:** state `cool`, base = the unit's current setpoint, offset 0, `since` = now. The grace period starts. `input_boolean.ac_unblocked_<room>_<unit>` turns on, so the cooling block is ignored for that unit for the rest of the section.
 - **Mode or fan change while on:** state `manual`. Logged, not learned.
-- **While a leak is latched,** none of these change anything: it stays `leak`.
-- **The knob (phase 8):** a turn counts as a setpoint change; a press changes nothing here.
+- **While a leak is latched,** none of these change that unit: it stays `leak`. A setpoint change on its remote is still a vote for the room's other units.
+- **While `ac_hold` is on,** a vote is still judged and reported (and so learned from), but HA writes no helper and sends nothing.
 
-The **grace period** runs until `input_datetime.ac_grace_until_<room>_<unit>`, which a person's setpoint change or turn-on sets to now + `system.control.person_grace_minutes` (default 30). Until then the unit is held in `cool`: no transition into `boost` or `rest`, a cooling block included. A leak still wins, and a section change clears it.
+The **grace period** runs until `input_datetime.ac_grace_until_<room>_<unit>`, which a person's turn-on sets to now + `system.control.person_grace_minutes` (default 30). Until then the unit is held in `cool`: no transition into `boost` or `rest`, a cooling block included. A leak still wins, a vote clears it, and so does a section change.
 
 ### Rules
 
@@ -191,11 +218,11 @@ The **grace period** runs until `input_datetime.ac_grace_until_<room>_<unit>`, w
 - **Release:** a boost or rest ends when the pooled count of sensors still on the triggering side of their comfort readings falls below the quorum, counted as at least 1. With no usable sensor, a rest wakes into `cool` rather than wait for ever.
 - **Boost cap:** `system.control.boost_max_minutes` (default 60). The unit then returns to `cool` at −1; if the room is still too warm next heartbeat, another boost can start, so it steps down gradually.
 - **Offsets and limits:** the offset moves in whole steps and is capped at ±3 on its own. The boost step, `system.control.boost_degrees` (default 2), goes on top, and the final command is clamped to the unit's own range (18 to 30° for the baby room, 16 to 30° for the others).
-- **Minimum times:** counted in heartbeats, to protect the compressor: at least 1 in `cool` or `boost` (a boost that a block sends to `rest` included), at least 2 in `rest`. A minimum of n heartbeats is met when the time since `since` is at least (n − 0.5) × the heartbeat interval, which is 5 and 15 minutes at the default 10-minute interval. A section change and a leak override them.
+- **Minimum times:** counted in heartbeats, to protect the compressor: at least 1 in `cool` or `boost` (a boost that a block sends to `rest` included), at least 2 in `rest`. A minimum of n heartbeats is met when the time since `since` is at least (n − 0.5) × the heartbeat interval, which is 5 and 15 minutes at the default 10-minute interval. A section change, a leak and a person's vote override them.
 - **No seed:** while a unit has neither a base nor a `setpoint_applied`, maintenance leaves it alone and a section change resets its fields without a command. A leak still turns it off, and a leak released before there is an almanac goes to `rest`: still off, and woken by maintenance once there is a setpoint to cool to.
-- **Commands:** sent only on transitions and at section changes, never re-sent every heartbeat. Maintenance and the leak automations raise `ac_active` around every command, as scenes do.
+- **Commands:** sent only on transitions, at section changes and on a vote, never re-sent every heartbeat. Maintenance, the vote and manual-change automations and the leak automations raise `ac_active` around every command, as scenes do.
 - **Fan:** low in `cool`, medium in `boost`. Every command sets the mode first and the fan last, and the fan waits (up to 30 s, then carries on) until the unit reports the new mode, because a unit offers no fan modes in dry or off. A fan call the unit's mode still rejects is skipped, not fatal (as in v1).
-- **Pause:** while `ac_hold_<room>` is on, scenes and maintenance send no commands. Maintenance doesn't run at all; scenes and a leak release still write the helpers. A leak trip ignores the pause. Only a person turns it on or off.
+- **Pause:** while `ac_hold_<room>` is on, scenes, maintenance and votes send no commands. Maintenance doesn't run at all; scenes and a leak release still write the helpers; a vote writes nothing but is still reported. A leak trip ignores the pause. Only a person turns it on or off.
 
 ## Outdoor temperature
 
@@ -264,17 +291,18 @@ The container decides once per section; Home Assistant acts at every heartbeat. 
 ### Container
 
 - **At each section change:** computes the room comfort point, Δ, the block decision and each sensor's trigger edges in degrees, then publishes them to a new `sensor.ac_conditions_<room>`. It is re-pushed on a timer and on `homeassistant_start`, like the almanac.
-- **On every reaction:** records it with its per-unit kind and the outdoor value, replays the almanac and pushes it. After a setpoint-moving reaction, it schedules another replay 65 minutes later for the comfort window.
+- **On every reaction:** records it with its per-unit kind and the outdoor value, replays the almanac and pushes it. A vote comes from HA's `ac_person_vote` event: an accepted one is recorded at once with every sensor's reading, an ignored one is logged as an "ignored press". After a setpoint-moving reaction, it schedules another replay 65 minutes later for the comfort window.
 - **At startup:** replays every room and pushes its almanac before any crossover.
 - **On the first heartbeat in a section with no almanac:** replays that room.
 - **Nightly:** full replay as a consistency check.
-- **Its own commands** (phase 8, for the knob): the container's REST calls carry no `context.parent_id`, so it raises `ac_active` around any command it sends itself.
+- **No commands of its own:** the knob presses the room's buttons in HA, so the container never drives a unit itself.
 
 ### Home Assistant (generated)
 
 - **Scene automation, per room and section:** raises `ac_active`, records the section, and sets each unit's base, offset, `since`, grace, `ac_unblocked` and state as at a section change, then sends the commands. A unit with no seed is left alone. While `ac_hold` is on, it sends no commands.
-- **Maintenance automation, every heartbeat:** reads the almanac, the conditions entity and each unit's helpers. It counts the pooled quorum against the published edges and runs the state machine. On a transition it raises `ac_active`, writes the helpers, sends the commands and lowers `ac_active`.
-- **Manual-change automation, per unit:** triggered by the unit's mode changing (a state trigger with `to: null`) or its `temperature` or `fan_mode` attribute changing, never by a `current_temperature` update; catches a person's change (no `context.parent_id`, `ac_active` off) and applies the [person reactions](#person-reactions) straight away, reading whether the unit is on after the change. It ignores our own command arriving late, by the test in [What counts as a reaction](#what-counts-as-a-reaction), and classifies the change's kind as the runtime does.
+- **Maintenance automation, every heartbeat:** reads the almanac, the conditions entity and each unit's helpers. It counts the pooled quorum against the published edges and runs the state machine, a forced state's release included. On a transition it raises `ac_active`, writes the helpers, sends the commands and lowers `ac_active`.
+- **Vote automation, per room (`ac_vote_<room>`):** triggered by a press of either button (a state trigger with `to: null`, from a state that isn't unavailable, to one that is neither unavailable nor unknown, so a new button's first press counts). It judges the episode, fires `ac_person_vote`, then, if accepted and the hold is off, raises `ac_active`, writes every unit's helpers, sends the commands and lowers `ac_active`. Mode `queued`, so a second press waits for the first and finds its episode.
+- **Manual-change automation, per unit:** triggered by the unit's mode changing (a state trigger with `to: null`) or its `temperature` or `fan_mode` attribute changing, never by a `current_temperature` update; catches a person's change (no `context.parent_id`, `ac_active` off) and applies the [person reactions](#person-reactions) straight away. A setpoint change is a vote for the room, judged, reported and applied as a press is, with the value chosen as that unit's base; on, off and a mode or fan change go to that unit's helpers alone, with no command. One change can fire two triggers (a mode and a setpoint at once); only the first that applies, in the order mode, temperature, fan, goes on, so each change runs once and a vote is never counted twice. It ignores our own command arriving late, by the test in [What counts as a reaction](#what-counts-as-a-reaction), and classifies the change's kind as the runtime does.
 - **Leak automations, per unit:** set the state helper to `leak` when the sensor trips. On a confirmed release, they evaluate the unit as at a section change.
 - **Heat sources:** the generator writes the room's heat-source entities into the maintenance template, which checks them directly. A heater switching on blocks cooling without waiting for the container.
 
@@ -286,8 +314,10 @@ The container decides once per section; Home Assistant acts at every heartbeat. 
 | `input_number.ac_base_<room>_<unit>` | Unit, new | The section's base setpoint: `setpoint_applied` at the section change, or what a person chose. 0 to 100 in steps of 0.5; created at 0, its minimum, which means unset |
 | `input_number.ac_offset_<room>_<unit>` | Unit, new | Section-scoped offset, −`offset_cap` to +`offset_cap` in whole steps. Deploy sets a new one to 0 |
 | `input_datetime.ac_since_<room>_<unit>` | Unit, new | When the current state began (boost cap, minimum times). Deploy sets a new one to now |
-| `input_datetime.ac_grace_until_<room>_<unit>` | Unit, new | When a person's grace period ends: their setpoint change or turn-on + `person_grace_minutes`. Cleared at a section change (set to now); a past or unset value means no grace. Created at HA's default, today 00:00 |
+| `input_datetime.ac_grace_until_<room>_<unit>` | Unit, new | When a person's grace period ends: their turn-on + `person_grace_minutes`. Cleared at a section change or by a vote (set to now); a past or unset value means no grace. Created at HA's default, today 00:00 |
 | `input_boolean.ac_unblocked_<room>_<unit>` | Unit, new | A person turned the unit on during a block; the block is ignored for it until the section changes |
+| `input_boolean.ac_forced_<room>_<unit>` | Unit, new | This unit's rest or boost was forced by a person's vote: an episode is running while it is on and the unit is in `rest` or `boost`. Cleared on release, at a section change, on a leak and by a person's on, off or mode change. Created off |
+| `input_button.ac_too_cold_<room>`, `input_button.ac_too_hot_<room>` | Room, new | The person's vote. Anything may press them: a dashboard, a physical button's automation, the knob. Created never pressed (unknown) |
 | `sensor.ac_conditions_<room>` | Room, new | Outdoor values, comfort point, block decision, per-sensor edges |
 | `ac_active`, `ac_scene`, `ac_almanac` | Room, kept | As in v1 |
 | `ac_hold_<room>` | Room, changed | A manual pause switch only; the system never sets or clears it |
@@ -303,7 +333,7 @@ No helper has an `initial`: Home Assistant would reset it to that at every resta
 
 ### One logic, checked twice
 
-The state machine, including person reactions, leak precedence and minimum times, lives in a pure-Python module, `app/control.py` (phase 3a). The generator renders the same logic as Jinja (phase 3b). `tools/control_check.py` holds the scenario table, as plain values in vote, step, section-change and person-change steps; The check also removes each rule in turn and requires the scenarios that guard it to fail. `tools/control_logic_check.py` (phase 3b, replacing v1's `maintenance_logic_check`) runs the generated automations as Home Assistant would, replays every scenario through the maintenance, scene, manual-change and leak automations, and compares the helpers and commands with `app/control.py`.
+The state machine, including person reactions and votes, leak precedence and minimum times, lives in a pure-Python module, `app/control.py` (phase 3a). The generator renders the same logic as Jinja (phase 3b). `tools/control_check.py` holds the scenario table, as plain values in vote, step, section-change, person-change, button-press and climate-change steps, over a room of one unit or more; the check also removes each rule in turn and requires the scenarios that guard it to fail. `tools/control_logic_check.py` (phase 3b, replacing v1's `maintenance_logic_check`) runs the generated automations as Home Assistant would, replays every scenario through the maintenance, scene, vote, manual-change and leak automations, and compares every unit's helpers and commands with `app/control.py`, and each `ac_person_vote` event with control's vote: accepted exactly when `control.in_episode` found no forced state.
 
 ## UI
 
@@ -343,22 +373,20 @@ A **"Leak fixed"** button appears on the room card while a leak is latched. It r
 
 ## Household input: the knob
 
-The knob says "warmer" or "cooler", never a number, so anyone in the house can teach the system without understanding setpoints or sensors.
+The knob says "warmer" or "cooler", never a number, so anyone in the house can teach the system without understanding setpoints or sensors. It does that by pressing the room's buttons, and nothing else: a turn warmer presses `input_button.ac_too_cold_<room>`, a turn cooler presses `input_button.ac_too_hot_<room>`. Everything a press does (the vote, the episode rule, the event, the learning) is the buttons'.
 
-| Gesture | Action now | Teaches |
+| Gesture | Presses | Result |
 | --- | --- | --- |
-| Turn one detent warmer | Setpoint +1 (a resting unit stays off) | A warmer reaction |
-| Turn one detent cooler | Setpoint −1; an off or resting unit starts cooling | A cooler reaction |
-| Short press | Nothing changes | "This is right": comfort readings and confidence |
-| Long press (2 s) | Unit off | A person-off reaction (`user_off`) |
+| Turn one detent warmer | too cold | A too-cold vote: a forced rest, the target a degree warmer |
+| Turn one detent cooler | too hot | A too-hot vote: a forced boost, the target a degree cooler |
 
-Detents are grouped like every other reaction, by the 120-second extending window.
+A turn of several detents is one vote: the first press starts the episode, and the rest are ignored presses until its forced state ends.
 
-**Wiring:** ESPHome `rotary_encoder` and a button `binary_sensor` fire HA events carrying the action and the room. The container records the knob event as the reaction, then makes the change itself. Its REST calls carry no `context.parent_id`, so it raises `ac_active` around them, and the change isn't counted twice.
+**Wiring:** ESPHome `rotary_encoder` (and, if it has one, a button `binary_sensor`) fire HA events; a small HA automation, which isn't ours, presses the matching button. A physical too-cold / too-hot button pair is wired the same way. The container sees only the votes, through `ac_person_vote`.
 
-**Scope:** each knob is assigned to one room in config (`rooms[].knobs`) and drives every unit in it.
+**Scope:** each knob is assigned to one room in config (`rooms[].knobs`), and its presses are that room's votes.
 
-**Feedback:** if the knob has an LED, it shows blue for resting, green for cooling, amber for a boost, and a short flash to confirm input. The exact hardware is an open question.
+**Open:** what a knob press and an LED would do (see [Open questions](#open-questions)).
 
 ## Migration
 
@@ -380,13 +408,12 @@ The clean start comes from removing dead code instead:
 Phase 0 defines every v2 key in the schema up front, with defaults, so saving a config works from the start. The loader migrates v1 configs on load.
 
 - `learning.reaction_rate`: 0.5
-- `learning.recency_half_life_days`: 7, kept for band learning (v1's analyser used it, but the schema never listed it)
-- `system.control`: `boost_degrees` 2, `boost_max_minutes` 60, `cool_min_heartbeats` 1, `rest_min_heartbeats` 2, `person_grace_minutes` 30, `offset_cap` 3
+- `system.control`: `boost_degrees` 2, `boost_max_minutes` 60, `cool_min_heartbeats` 1, `rest_min_heartbeats` 2, `person_grace_minutes` 30, `offset_cap` 3, `person_step_degrees` 1.0 (added with the votes)
 - `system.sensor_stale_minutes`: 90 (added after the first live run)
 - `outdoor`: `source` none, `weather_entity` null, `probe_entity` null, `block_mode` shadow, `lean_per_degree` 0.1, `initial_margin` 6. `weather_entity` (a `weather.*` entity) must be set when `source` is `forecast`, and `probe_entity` (a `sensor.*` entity) when it is `probe`. Phase 4 consumes them.
 - `rooms[].heat_sources` (entity ids) and `rooms[].knobs` (`{id, name?}`, a placeholder until the hardware is settled): empty
 
-The loader moves `system.max_step_degrees` to `system.control.boost_degrees` and `system.correction_max_minutes` to `system.control.boost_max_minutes`. `bootstrap_min_days`, `validity_delay_days`, `analysis_window_days` and `reactive_weight` are dropped. A scene's per-unit `mode: off` is kept and maps to the `config_off` state.
+The loader moves `system.max_step_degrees` to `system.control.boost_degrees` and `system.correction_max_minutes` to `system.control.boost_max_minutes`. `bootstrap_min_days`, `validity_delay_days`, `analysis_window_days` and `reactive_weight` are dropped, and so is `learning.recency_half_life_days` (from a config of either version: an earlier v2 build filled it in, and bands no longer use it). A scene's per-unit `mode: off` is kept and maps to the `config_off` state.
 
 ### Storage
 
@@ -400,6 +427,7 @@ Phase 0 gives the database a real migration path:
 - **CSV:** new columns are appended at the end, so old files still ingest. `section_run` is now written to CSV as well.
 - **Re-ingest:** rebuilding SQLite from CSV is a prerequisite for Gate A, not for phase 1. Section runs reach the CSV only from phase 0, so re-ingest has to apply migration 2's rule (close an open run at the room's next run's start) to whatever it rebuilds.
 - **Migration 2 (phase 1, data only):** v1 closed a section run by its close date, so every sleep run and every run a restart interrupted stayed open. Migration 2 closes each open run except the room's latest at the next run's start; the runtime now closes the room's open run by being open, and dates a run by its planned start.
+- **Migration 3 (votes):** rebuilds `reactive` and `reactive_unit` with their rows, so their kind checks allow `too_cold` and `too_hot`. Backed up first as `<name>.pre-votes-backup-<timestamp>`.
 
 ### Seeding from v1 data
 
@@ -420,13 +448,14 @@ Phases 0 to 5 are built and checked offline against the existing harnesses, then
 | 2 · On/off as reactions | Runtime detects a person turning units on or off, or changing mode or fan; reaction kind stored per unit and room; a unit coming back from unavailable changed is logged | `runtime_check` records person on/off and still ignores the system's own changes; on plus a setpoint change in one window is one `on` reaction |
 | 3a · Control core | `app/control.py`: votes, the state machine, section changes and person reactions as pure functions; `app.trust.evaluate_edges` | `control_check` runs the scenario table, and each rule's scenarios fail when it is removed |
 | 3b · Cool-or-rest in HA, deploy and leak | Generator Jinja for maintenance, scenes and the manual-change automation, with the new unit helpers; maintenance raises the guard; the Warming/fan_only path is removed. `input_number` (and `input_boolean`) helper domains, created at 0; every `ac_since_*` set to now on creation; leak automations write the state helper; the runtime's reaction detector also ignores a change that matches what the unit's state helper implies (`rest` → off, and so on), as the manual-change automation does | `control_logic_check` replays every `control_check` scenario through the generated automations with zero differences; `deploy_reconcile_check` creates the new helpers with the right initial values; `leak_response_check` still passes |
+| 3c · The person's vote | Two buttons per room and a forced marker per unit; the vote automation and the manual-change vote path, HA judging one correction per episode and reporting it in `ac_person_vote`; forced release to base; votes as reactions with an immediate comfort move; the per-reaction band nudge; storage migration 3 | `control_check` and `control_logic_check` replay the vote scenarios (the event's accepted flag matches `control.in_episode`); `runtime_check` records only HA's accepted events; `analyser_demo` moves comfort and bands by the new rules |
 | 4 · Outdoor input | Forecast or probe; outdoor value stored on heartbeats, reactions and section runs | The doctor lists weather entities with an hourly forecast; `store_check` sees the new columns |
 | 5 · Lean and block, in shadow | Conditions entity with per-sensor edges; block decisions and margin learning logged, not applied | Published edges reproduce the lean table; shadow decisions appear in the log |
 | **Gate A** | CSV re-ingest works; then cutover: deploy v2 to HA, block in shadow | SQLite rebuilt from CSV alone gives the same almanac |
 | 6 · Now view | Donut, correction scale, sensor table and the Leak fixed button | Every state renders: Cool, Boost, Rest, Off, Manual, Off (scheduled), Leak, blocked and shadow |
 | 7 · Usability | Config hot reload; one Apply button with a change preview | A saved config reaches the running observer without a restart |
 | **Gate B** | Two-week shadow review: the block goes active | |
-| 8 · Knob | ESPHome events, the four gestures and LED feedback, once the hardware is settled | One detent produces exactly one reaction and one setpoint change |
+| 8 · Knob | ESPHome events pressing the room's buttons, once the hardware is settled | A turn of several detents produces exactly one vote |
 
 The shadow review clock starts at cutover, so phases 6 and 7 happen during it. Phases 0 to 3 already fix the snap-back and the cold-room behaviour, so they are worth deploying early if the outdoor work stalls.
 
@@ -444,7 +473,7 @@ The shadow review clock starts at cutover, so phases 6 and 7 happen during it. P
 ### Open questions
 
 - [ ] Which weather entity provides an hourly forecast? The doctor will list candidates.
-- [ ] Knob hardware: detents, button, LED or ring, how many knobs, which rooms.
+- [ ] Knob hardware: detents, how many knobs, which rooms. Whether its press and an LED or ring do anything, now that a turn only presses a button: a "this is right" press would need its own learning rule.
 - [ ] Minimum run and rest times (1 and 2 heartbeats): confirm against how the units behave.
 - [ ] Boost step and offset cap (defaults: 2° boost, offset capped at ±3): confirm in use.
 - [ ] Shadow-mode review length before turning the block on (proposed two weeks).
@@ -563,3 +592,20 @@ From the live install, 28 Oct 2026:
 
 73. **Ids must be unique:** room ids, and unit and sensor ids within a room. The schema accepted two sensors with the id `baby` in one room, and the second overwrote the first in every heartbeat, so a live sensor was never seen. `validate()` rejects a repeated id, naming both places. The UI save path is covered twice: the server's save runs `validate()`, and the Config page refuses to post a duplicate (in raw-JSON mode too, where Save now saves the text box). The page also generates a unique id (`<room>_sensor`, `_2`, ...) when a sensor is added, and de-duplicates a typed unit id. Because a config already on disk is loaded without validation, the deploy check now validates the config and the deploy aborts on any check problem, and the runtime logs an error event at startup for a config that doesn't validate.
 74. **A stale sensor is treated as unavailable.** A sensor put away kept its last value in Home Assistant for three days without going unavailable (`last_reported` stayed at 2026-10-25T20:03), so it kept voting and feeding learning with a frozen reading. Past `system.sensor_stale_minutes` (default 90, a new v2 key) since its `last_reported` - its unit's, for a virtual sensor - a sensor reads as unavailable: no vote and no quorum place in the maintenance template (`now() - states.<entity>.last_reported`), and in the runtime a None in heartbeats and reaction snapshots, which keeps it out of seeds, comfort windows and band samples. Exactly at the limit it is not stale. The runtime logs one `validation` warning when a sensor goes stale and one info event when it reports again, and reads back what it last logged at startup so a restart doesn't repeat the warning; the doctor flags it. Readings recorded before this change keep their frozen values.
+
+The person's vote, 28 Oct 2026 (supersedes 50 and 52 for setpoint changes, 51, the knob parts of 8 and 19, the band weighting of 12 and 26, the double run of 64, and grace from a setpoint change in 49):
+
+75. **The person is a sensor that always wins.** A correction is a room-level "too cold" or "too hot" vote: it forces the room's quorum its way, steps the target one degree and moves the room's comfort readings. Every human correction is meant to come through two buttons per room, `input_button.ac_too_cold_<room>` and `input_button.ac_too_hot_<room>`, created by deploy, which a dashboard, a physical button's automation or the knob presses (those automations aren't ours). A press is a reaction of kind `too_cold` / `too_hot`. The remote is the fallback: a setpoint change counts as too cold (raised) or too hot (lowered), with the value chosen as that unit's new target. Turning a unit off or on keeps its `user_off` / on behaviour.
+76. **Home Assistant is the single authority for the episode rule.** The vote automation `ac_vote_<room>`, and the manual-change automation when it treats a setpoint change as a vote, decide accept or ignore and fire `ac_person_vote` with `{room, direction, accepted, source: button|remote}`, plus `chosen` and `unit` for a remote, before acting on it. The runtime records a too_cold / too_hot reaction, with its sensor snapshot, only from an accepted event, logs an "ignored press" event from an ignored one, never judges the episode itself, and no longer records a remote setpoint change through its own detection window: one physical action, one reaction. Its own detection stays for on, off and manual. `runtime_check` shows a vote HA reports as ignored teaches nothing even when the runtime's cache shows no forced state (and fails against a runtime that judges from its cache); `control_logic_check` asserts every event's accepted flag is `not control.in_episode` over the room as it was.
+77. **One correction per episode.** A vote is accepted only if no unit in the room is in a forced rest or boost: its `input_boolean.ac_forced_<room>_<unit>` marker on and its state `rest` or `boost` (a leftover marker on a unit that has moved on is no episode). While one is, a press of either button, or a remote's setpoint change, changes and teaches nothing. Once the forced state ends the next vote counts.
+78. **A forced state releases by the normal rules** (back at comfort, the boost cap, minimum times) but returns to `cool` at its base, with no ±1 offset step. Every transition clears the marker; so do a section change, a leak, and a person's on, off or mode change.
+79. **What a vote does to each unit** (the brief's table, plus the cases it left open): too cold rests a cooling or boosting unit (off) and keeps a system rest resting, both forced; too hot boosts a unit cooling, resting, in `user_off` or already boosting, forced. A unit already in the state the vote forces keeps its `since` (a system boost's cap and a system rest's minimum time still count from when it began), and a resting unit is sent nothing. Too cold on `user_off` sets base + 1 and offset 0 but leaves it off and unforced, so the person's off stands and a later press still counts. A unit with no base and no almanac is left alone, as are `manual`, `config_off` and `leak` (or its latch on); the reaction is still recorded. Every unit a vote moves gets offset 0 and no grace, its base clamped to its range.
+80. **The remote's vote:** the unit changed gets the value chosen, the room's other units a step; a unit in `manual` or `leak` changed on its remote is left alone, but its change still votes for the others. Grace now comes only from a turn-on.
+81. **While `ac_hold` is on,** a vote is still judged and reported, so it is learned, but HA writes no helper and sends nothing.
+82. **The manual-change automation runs once per change.** Its triggers carry ids (`mode`, `temperature`, `fan_mode`), and a condition lets only the first that applies in that order go on. Replaying a vote twice would have stepped the other units twice; a change that moves the mode and the setpoint at once now gives one vote. Supersedes the double run of 64.
+83. **Learning from a vote.** Comfort moves straight away: each usable sensor with reading r toward r + `system.control.person_step_degrees` (too cold) or r − it (too hot), at `reaction_rate`. S moves toward the value chosen on a remote, else toward the `setpoint_applied` in force ± one step, through `next_applied`, so the applied setpoint steps exactly one. Every unit with a seed moves, whatever its control state. Votes are setpoint-moving (they make the section learned and open a comfort window, which their forced state usually disqualifies) and reset the quiet count. Older `setpoint`, `knob_turn` and NULL rows keep their setpoint and comfort-window handling; the immediate comfort move is the votes' alone. The runtime replays the room the moment it records a vote, so HA's next heartbeat sees the moved comfort.
+84. **The band is nudged by each reaction**, replacing the recency-weighted mean: with d the sensor's deviation from comfort just before the reaction, on the person's side and |d| < band it moves halfway (`reaction_rate`) toward |d|; on their side and |d| ≥ band, toward 0.8 × band; on the other side, toward band + |d|; clamped to [high, low] trust deviation, from the low one; trust follows. A sensor exactly at comfort, or a reaction with no direction (manual), leaves it. Every reaction with a direction nudges (votes, on, off, older setpoint rows); quiet periods never do. `learning.recency_half_life_days` is dropped: the schema refuses it and `migrate()` strips it from configs of either version. **The replay recomputes every band from the full history under this rule, so learned bands, Main Room's especially (three sensors and the most reactions), change on the first replay after the redeploy.**
+85. **Storage migration 3** rebuilds `reactive` and `reactive_unit` so their kind checks allow `too_cold` and `too_hot` (`knob_turn` and `knob_press` stay valid for older rows). A button vote is recorded with no unit rows; a remote's with one row, `setpoint_before` NULL and `setpoint_after` the value chosen. Both are recorded at receipt time with window 0; two reactions in the same second still collide on `UNIQUE(room_id, ts)`, and the second vote is then logged, not recorded.
+86. **The knob just presses the buttons**: a turn warmer presses too cold, cooler presses too hot, through an HA automation that isn't ours, so a turn of several detents is one vote. The container sends no commands of its own. What a knob press or an LED would do is an open question.
+87. **`doctor.py --v2-preflight`** also creates a throwaway `ac_preflight_*` `input_button`, presses it and checks its state moves, and checks a custom event fired on HA's bus reaches the token's websocket subscription, which HA allows only for an administrator's token, as the runtime's `ac_person_vote` subscription needs.
+88. **Rollback** (docs/V2_CUTOVER.md): v1's deploy removes the forced markers (`input_boolean`), but not the `input_button` helpers (a domain v1 never lists) nor the `ac_vote_*` automations (the restored v1 manifest predates them); the runbook deletes those by hand.

@@ -36,6 +36,11 @@ Checks, in order:
          the trigger-style s.attributes.get(...) snapshot the manual-change
          automation uses, now() - states.<entity>.last_reported (the
          maintenance template's stale-sensor check), and now().timestamp()
+       - an input_button shaped like ac_too_cold_* changes state when pressed
+         (what the vote automation triggers on)
+       - a custom event, fired as the vote automations fire ac_person_vote,
+         reaches this token's websocket subscription (HA lets only an admin
+         user's token subscribe to a custom event type)
      The helpers are deleted afterwards, and leftovers from an earlier run
      first, whatever fails in between.
 
@@ -89,10 +94,13 @@ def _stale_for(last_reported: str | None, stale_minutes: int) -> str | None:
 # ---------------------------------------------------------------------
 
 PREFLIGHT_PREFIX = "ac_preflight_"
-PREFLIGHT_DOMAINS = ("input_datetime", "input_number")
+PREFLIGHT_DOMAINS = ("input_datetime", "input_number", "input_button")
+PREFLIGHT_EVENT = "ac_preflight_vote"
 ITEM_DATETIME = "input_datetime: set_datetime with a timestamp round-trips"
 ITEM_NUMBER = "input_number (0-100, step 0.5, as ac_base_*): accepts 0 and 23.5"
 ITEM_TEMPLATE = "template API: timestamp attribute, .attributes.get, last_reported, now()"
+ITEM_BUTTON = "input_button (as ac_too_cold_*): a press changes its state"
+ITEM_EVENT = "a custom event (as ac_person_vote) reaches the websocket subscription"
 ITEM_CLEANUP = "throwaway helpers deleted, nothing left behind"
 
 
@@ -135,6 +143,7 @@ async def v2_preflight(rest, ws) -> list[tuple[str, bool, str]]:
     deleted, and the last item says whether that worked."""
     results: list[tuple[str, bool, str]] = []
     dt_name, num_name = f"{PREFLIGHT_PREFIX}since", f"{PREFLIGHT_PREFIX}base"
+    button_name = f"{PREFLIGHT_PREFIX}too_cold"
     lo, hi, step = g.BASE_RANGE     # the ac_base_* helper's shape (ITEM_NUMBER names it)
     stamp = int(time.time()) - 3 * 86400 + 37        # whole seconds, well clear of the default
     try:
@@ -148,8 +157,10 @@ async def v2_preflight(rest, ws) -> list[tuple[str, bool, str]]:
                                     {"name": dt_name, "has_date": True, "has_time": True})
         num = await ws.create_helper("input_number", {"name": num_name, "min": lo, "max": hi,
                                                       "step": step, "mode": "box"})
+        button = await ws.create_helper("input_button", {"name": button_name})
         dt_id = f"input_datetime.{(dt or {}).get('id') or dt_name}"
         num_id = f"input_number.{(num or {}).get('id') or num_name}"
+        button_id = f"input_button.{(button or {}).get('id') or button_name}"
 
         # 1. set_datetime(timestamp) -> the timestamp attribute
         try:
@@ -207,11 +218,45 @@ async def v2_preflight(rest, ws) -> list[tuple[str, bool, str]]:
                             "; ".join(f"{n}: {'ok' if p else 'got ' + v}" for n, p, v in checks)))
         except Exception as e:
             results.append((ITEM_TEMPLATE, False, f"{type(e).__name__}: {e}"))
+
+        # 4. a press moves the button's state (its last press time)
+        try:
+            before = await _state_attr(rest, button_id, tries=3)
+            await rest.call_service("input_button", "press", {"entity_id": button_id})
+            after = before
+            for _ in range(10):
+                after = await _state_attr(rest, button_id, tries=1)
+                if after not in (None, "unknown", "unavailable", before):
+                    break
+                await asyncio.sleep(0.3)
+            ok = after not in (None, "unknown", "unavailable", before)
+            results.append((ITEM_BUTTON, ok, f"state {before} -> {after}"))
+        except Exception as e:
+            results.append((ITEM_BUTTON, False, f"{type(e).__name__}: {e}"))
+
+        # 5. a custom event reaches a websocket subscriber, as ac_person_vote
+        # must reach the runtime's
+        try:
+            seen: list[dict] = []
+            await ws.subscribe_events(PREFLIGHT_EVENT, seen.append)
+            await rest.fire_event(PREFLIGHT_EVENT, {"room": "preflight", "accepted": True})
+            for _ in range(20):
+                if seen:
+                    break
+                await asyncio.sleep(0.2)
+            data = (seen[0].get("data") if seen else None) or {}
+            ok = data == {"room": "preflight", "accepted": True}
+            results.append((ITEM_EVENT, ok, f"received {data}" if seen else
+                            "nothing received in 4 s: is the token an administrator's?"))
+        except Exception as e:
+            results.append((ITEM_EVENT, False, f"{type(e).__name__}: {e} (the runtime's "
+                            "ac_person_vote subscription needs an administrator's token)"))
     except Exception as e:
         results.append(("create the throwaway helpers", False, f"{type(e).__name__}: {e}"))
         done = {item for item, _, _ in results}
         results += [(item, False, "not run: the helpers could not be created")
-                    for item in (ITEM_DATETIME, ITEM_NUMBER, ITEM_TEMPLATE) if item not in done]
+                    for item in (ITEM_DATETIME, ITEM_NUMBER, ITEM_TEMPLATE, ITEM_BUTTON,
+                                 ITEM_EVENT) if item not in done]
     finally:
         try:
             for _ in range(3):                         # sweep until a pass finds nothing

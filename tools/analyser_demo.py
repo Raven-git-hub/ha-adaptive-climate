@@ -18,7 +18,15 @@ docs/V2_DESIGN.md and docs/TRUST_MODEL.md:
   * the comfort window: accepted, disqualified by a second reaction, by too
     few heartbeats or by a boost heartbeat, and kept to its section across
     a boundary
-  * bands are direction-matched and measured against the replayed comfort
+  * a person's vote (too_cold / too_hot, from a button or a remote): every
+    unit's applied setpoint steps one from the value in force (or goes to
+    the remote's value), and each sensor's comfort moves halfway toward its
+    reading plus or minus person_step_degrees; its forced rest or boost
+    disqualifies the comfort window
+  * bands move by reaction: on the person's side and inside the band,
+    toward |d|; past it, toward 0.8 x band; on the other side, toward
+    band + |d|; clamped; measured against the replayed comfort; quiet
+    periods never move them
   * on and off teach bands as cooler and warmer wanted, manual teaches
     nothing, and every kind resets quiet and disqualifies a window
   * the confidence curve
@@ -40,7 +48,8 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.analyser import (LearningConfig, analyse_room,           # noqa: E402
-                          confidence_from_quiet, nearest_step, next_applied)
+                          confidence_from_quiet, is_setpoint_moving, nearest_step,
+                          next_applied, nudge_band, wanted_direction)
 from app.store import ReactiveUnitSample, Store, UnitSample       # noqa: E402
 from tools.compare_analyser import compare                        # noqa: E402
 
@@ -89,6 +98,18 @@ class Scenario:
             units={"ac": ReactiveUnitSample(before, after, before != after)},
             sensors=dict(STEADY if readings is None else readings), kind=kind)
 
+    def vote(self, when: datetime, kind: str, readings: dict | None = None,
+             chosen: float | None = None, section: str = "day") -> None:
+        """A person's vote as the runtime records HA's ac_person_vote event:
+        no unit rows for a button, the value chosen for a remote."""
+        units = {} if chosen is None else {"ac": ReactiveUnitSample(None, chosen, True,
+                                                                    kind=kind)}
+        self.store.record_reactive(
+            "lounge", when.isoformat(timespec="seconds"),
+            when.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            when.date().isoformat(), section, 0, units=units,
+            sensors=dict(STEADY if readings is None else readings), kind=kind)
+
     def run(self, start: datetime, end: datetime | None, section: str = "day") -> None:
         self.store.record_section_run(
             "lounge", start.date().isoformat(), section,
@@ -116,11 +137,11 @@ def check_headline() -> None:
     day = sc.replay(t(9, 0, 15))["day"]
     assert day.status == "learned", day.status
     assert day.unit_setpoints == {"ac": 21.5} and day.unit_setpoints_applied == {"ac": 22.0}
-    assert abs(day.sensor_band["wall"] - 1.0) < 1e-9          # drifted 1.0 below comfort
-    assert abs(day.sensor_trust["wall"] - 0.889) < 0.001
+    assert abs(day.sensor_band["wall"] - 3.0) < 1e-9          # 5.0 halfway to its 1.0 off
+    assert abs(day.sensor_trust["wall"] - 0.444) < 0.001
     assert day.sensor_band["door"] == 5.0                     # sat at comfort: learns nothing
-    ok("provisional at 21 before; learned, S 21.5, applied 22 after; wall band 1.0, "
-       "trust 0.889; door untouched")
+    ok("provisional at 21 before; learned, S 21.5, applied 22 after; wall band 5.0 -> 3.0 "
+       "(halfway to the 1.0 it was off), trust 0.444; door untouched")
 
     sc.store.publish_almanac("lounge", list(sc.replay(t(9, 0, 15)).values()))
     served = sc.store.current_almanac("lounge", as_of=t(9, 0, 15).date())["sections"]["day"]
@@ -340,24 +361,84 @@ def check_comfort_window() -> None:
     ok("a window crossing into sleep updates the reaction's section (night), not sleep")
 
 
-def check_band_direction() -> None:
-    print("bands: direction matching, replayed comfort, recency")
-    readings = {"wall": 23.5, "door": 26.5}      # wall 1.5 below comfort, door 1.5 above
-    for before, after, learns, ignores, label in ((21.0, 22.0, "wall", "door", "warmer"),
-                                                  (22.0, 21.0, "door", "wall", "cooler")):
-        sc = Scenario()
-        sc.beat(t(1, 8))
-        sc.react(t(1, 10), before, after, readings=readings)
-        day = sc.replay(t(1, 23))["day"]
-        assert abs(day.sensor_band[learns] - 1.5) < 1e-9 and day.sensor_band[ignores] == 5.0
-        ok(f"{label} wanted ({before:.0f} -> {after:.0f}) teaches only {learns}, the sensor "
-           f"on the {'cold' if label == 'warmer' else 'warm'} side")
+def check_votes() -> None:
+    print("a person's vote: too_cold / too_hot")
+    assert is_setpoint_moving("too_cold") and is_setpoint_moving("too_hot")
+    assert wanted_direction("too_cold", {}) == 1 and wanted_direction("too_hot", {}) == -1
+    sc = Scenario()
+    sc.beat(t(1, 8), setpoint=22.0)
+    sc.vote(t(1, 10), "too_cold", readings={"wall": 23.0, "door": 26.0})
+    day = sc.replay(t(1, 10, 1))["day"]
+    assert day.status == "learned" and day.unit_setpoints == {"ac": 22.5}
+    assert day.unit_setpoints_applied == {"ac": 23.0}, day.unit_setpoints_applied
+    assert day.sensor_comfort == {"wall": 24.5, "door": 26.0}, day.sensor_comfort
+    assert day.sensor_band == {"wall": 3.5, "door": 5.0}, day.sensor_band
+    ok("a too_cold press, applied 22: S 22.5 and the applied setpoint a step up to 23; comfort "
+       "halfway to reading + 1 (wall 25 -> 24.5 toward 24, door 25 -> 26.0 toward 27); wall, "
+       "2.0 below on the person's side, band 5.0 -> 3.5; door, on the other side, held at "
+       "5.0 - all straight away, before any window")
+
+    sc.vote(t(1, 12), "too_cold", readings={"wall": 24.5, "door": 26.0})
+    day = sc.replay(t(1, 12, 1))["day"]
+    assert day.unit_setpoints == {"ac": 23.25} and day.unit_setpoints_applied == {"ac": 24.0}
+    ok("a second vote steps from the applied setpoint in force: 23 -> 24 (S 23.25)")
 
     sc = Scenario()
-    sc.beat(t(1, 8))
-    sc.react(t(1, 10), 21.0, 22.0, readings={"wall": 24.8, "door": 25.0})
-    assert sc.replay(t(1, 23))["day"].sensor_band["wall"] == 5.0
-    ok("a 0.2 drift is below the high-trust deviation and teaches nothing")
+    sc.beat(t(1, 8), setpoint=22.0)
+    sc.vote(t(1, 10), "too_hot", readings={"wall": 26.0, "door": 25.0}, chosen=20.0)
+    day = sc.replay(t(1, 10, 1))["day"]
+    assert day.unit_setpoints == {"ac": 21.0} and day.unit_setpoints_applied == {"ac": 21.0}
+    assert day.sensor_comfort == {"wall": 25.0, "door": 24.5}, day.sensor_comfort
+    ok("a remote's too_hot to 20: S 21, applied a step down to 21 (toward 20, not past it); "
+       "comfort halfway to reading - 1 (wall 25 -> 25.0 toward 25, door 25 -> 24.5 toward 24)")
+
+    sc = Scenario()
+    sc.beat(t(1, 8), setpoint=22.0)
+    sc.vote(t(1, 10), "too_cold", readings={"wall": 23.0, "door": 26.0})
+    half = sc.replay(t(1, 10, 1), LearningConfig(person_step_degrees=0.5))["day"]
+    assert half.sensor_comfort == {"wall": 24.25, "door": 25.75}, half.sensor_comfort
+    ok("person_step_degrees 0.5: wall 25 -> 24.25 (toward 23.5), door 25 -> 25.75")
+
+    def windowed(state: str) -> dict:
+        sc = Scenario()
+        sc.beat(t(1, 8), setpoint=22.0)
+        sc.vote(t(1, 10), "too_cold", readings={"wall": 23.0, "door": 26.0})
+        for minute in (30, 40, 50, 60):
+            sc.beat(t(1, 10) + timedelta(minutes=minute), readings={"wall": 24.0, "door": 24.0},
+                    state=state)
+        return sc.replay(t(1, 23))["day"].sensor_comfort
+    assert windowed("rest") == {"wall": 24.5, "door": 26.0}
+    assert windowed("user_off") == {"wall": 24.25, "door": 25.0}
+    ok("its forced rest disqualifies the vote's comfort window (only the vote's own move "
+       "stands); with no rest or boost in it (a unit left off) the window applies on top")
+
+    sc = Scenario()
+    sc.beat(t(1, 8), setpoint=22.0)
+    sc.react(t(1, 10), 22.0, 23.0, readings={"wall": 23.0, "door": 26.0})
+    day = sc.replay(t(1, 10, 1))["day"]
+    assert day.sensor_comfort == {"wall": 25.0, "door": 25.0}
+    assert day.sensor_band == {"wall": 3.5, "door": 5.0}
+    ok("a `setpoint` row recorded before the votes moves no comfort straight away (only its "
+       "window does), but its band nudge is the same rule")
+
+
+def check_band_nudge() -> None:
+    print("bands: one nudge per reaction")
+    cfg = LearningConfig()
+    cases = [(5.0, -1.0, 1, 3.0, "the person's side, inside the band: toward |d|"),
+             (1.0, -2.0, 1, 0.9, "the person's side, past the band: toward 0.8 x band"),
+             (1.0, 1.5, 1, 1.75, "the other side: toward band + |d|"),
+             (2.0, 1.0, -1, 1.5, "too hot, above comfort, inside the band: toward |d|"),
+             (2.0, -1.0, -1, 2.5, "too hot, below comfort: toward band + |d|"),
+             (0.5, -3.0, 1, 0.5, "past the band at the floor: clamped to 0.5"),
+             (5.0, 2.0, 1, 5.0, "the other side at the ceiling: clamped to 5.0"),
+             (3.0, 0.0, 1, 3.0, "right at comfort: no change"),
+             (3.0, -1.0, 0, 3.0, "no direction (manual): no change")]
+    for band, d, want, expect, what in cases:
+        got = nudge_band(band, d, want, cfg)
+        assert abs(got - expect) < 1e-9, (what, got)
+        ok(f"band {band}, d {d:+}, {'warmer' if want > 0 else 'cooler' if want < 0 else 'none'}"
+           f" wanted -> {got:g} ({what})")
 
     sc = Scenario()
     sc.beat(t(1, 8))
@@ -366,17 +447,18 @@ def check_band_direction() -> None:
     sc.react(t(1, 14), 22.0, 23.0, readings={"wall": 22.5, "door": 25.0})
     day = sc.replay(t(1, 23))["day"]
     assert day.sensor_comfort["wall"] == 24.0
-    assert abs(day.sensor_band["wall"] - 1.5) < 1e-9, day.sensor_band
+    assert abs(day.sensor_band["wall"] - 3.25) < 1e-9, day.sensor_band
     ok("deviation is taken against comfort as replayed then (24.0 after the first window), "
-       "so 22.5 is 1.5 off, not 2.5")
+       "so 22.5 is 1.5 off, not 2.5: band 5.0 -> 3.25")
 
     sc = Scenario()
     sc.beat(t(1, 8))
-    sc.react(t(1, 10), 21.0, 22.0, readings={"wall": 24.0, "door": 25.0})    # 1.0 off
-    sc.react(t(8, 10), 22.0, 23.0, readings={"wall": 23.0, "door": 25.0})    # 2.0 off
-    day = sc.replay(t(8, 23))["day"]
-    assert abs(day.sensor_band["wall"] - (0.5 * 1.0 + 1.0 * 2.0) / 1.5) < 1e-9
-    ok("a week-old reaction weighs half (half-life 7 days): band (0.5x1 + 1x2)/1.5 = 1.667")
+    sc.vote(t(1, 10), "too_cold", readings={"wall": 24.0, "door": 25.0})    # wall 1.0 below
+    after_one = sc.replay(t(1, 11))["day"].sensor_band
+    sc.beats(t(1, 11), t(9, 11), readings={"wall": 20.0, "door": 30.0})     # a week of quiet
+    assert sc.replay(t(9, 12))["day"].sensor_band == after_one == {"wall": 3.0, "door": 5.0}
+    ok("a week of quiet heartbeats far from comfort leaves the bands where the last reaction "
+       "put them (no recency decay)")
 
 
 def check_on_off_manual() -> None:
@@ -387,10 +469,11 @@ def check_on_off_manual() -> None:
         sc.beat(t(1, 8))
         sc.react(t(1, 10), 21.0, 21.0, readings=readings, kind=kind)
         day = sc.replay(t(1, 23))["day"]
-        assert abs(day.sensor_band[learns] - 1.5) < 1e-9 and day.sensor_band[ignores] == 5.0
+        assert abs(day.sensor_band[learns] - 3.25) < 1e-9 and day.sensor_band[ignores] == 5.0
         assert day.unit_setpoints == {"ac": 21.0} and day.status == "provisional"
-        ok(f"`{kind}` ({'cooler' if kind == 'on' else 'warmer'} wanted) teaches only {learns}, "
-           f"the sensor on the {'warm' if kind == 'on' else 'cold'} side; S stays put")
+        ok(f"`{kind}` ({'cooler' if kind == 'on' else 'warmer'} wanted) tightens {learns}, on "
+           f"the {'warm' if kind == 'on' else 'cold'} side (5.0 -> 3.25), and widens "
+           f"{ignores}, held at 5.0; S stays put")
 
     sc = Scenario()
     sc.beat(t(1, 8))
@@ -400,7 +483,10 @@ def check_on_off_manual() -> None:
     assert day.status == "provisional"
     ok("`manual` (a mode or fan change) teaches nothing")
 
-    for kind in ("on", "off", "manual", None):
+    # a vote's readings a step from comfort, so its own comfort move is nil
+    at_comfort = {"too_cold": {"wall": 24.0, "door": 24.0},
+                  "too_hot": {"wall": 26.0, "door": 26.0}}
+    for kind in ("on", "off", "manual", None, "too_cold", "too_hot"):
         sc = Scenario()
         sc.beat(t(1, 8))
         for day in range(1, 7):
@@ -415,10 +501,11 @@ def check_on_off_manual() -> None:
         sc.beat(t(1, 8))
         sc.react(t(1, 10), 21.0, 22.0)
         sc.beats(t(1, 10, 30), t(1, 11), readings={"wall": 23.0, "door": 24.0})
-        sc.react(t(1, 10, 45), 22.0, 22.0, kind=kind or "setpoint")
+        sc.react(t(1, 10, 45), 22.0, 22.0, kind=kind or "setpoint",
+                 readings=at_comfort.get(kind))
         assert sc.replay(t(1, 23))["day"].sensor_comfort == {"wall": 25.0, "door": 25.0}, kind
-    ok("every kind - on, off, manual, setpoint - resets the quiet count (0.75 -> 0.370) and "
-       "disqualifies a comfort window it falls inside")
+    ok("every kind - on, off, manual, setpoint, too_cold, too_hot - resets the quiet count "
+       "(0.75 -> 0.370) and disqualifies a comfort window it falls inside")
 
 
 def check_confidence() -> None:
@@ -468,7 +555,8 @@ def main() -> int:
     check_on_with_setpoint()
     check_deterministic()
     check_comfort_window()
-    check_band_direction()
+    check_votes()
+    check_band_nudge()
     check_on_off_manual()
     check_confidence()
     check_missing_seed()

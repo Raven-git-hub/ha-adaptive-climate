@@ -5,9 +5,11 @@ Loads a config of either version, migrates version 1 forward to 2, fills
 in the keys v2 added, and validates against schema/config.schema.json.
 The loaded Config is the typed view the rest of the app uses.
 
-Defaults are filled only for the keys v2 introduced (learning.reaction_rate
-and recency_half_life_days, system.control.*, outdoor.*, rooms[].heat_sources
-and rooms[].knobs), read from the schema so each lives in one place. v1
+Defaults are filled only for the keys v2 introduced (learning.reaction_rate,
+system.sensor_stale_minutes, system.control.*, outdoor.*,
+rooms[].heat_sources and rooms[].knobs), read from the schema so each lives
+in one place. learning.recency_half_life_days, which an earlier v2 build
+filled in, is taken out of any config: bands no longer use it. v1
 keys are left as written: the code that reads them carries its own
 fallbacks, and some differ from the schema's documented default (a scene's
 transition_seconds falls back to 0 in the generator but documents 120), so
@@ -37,8 +39,11 @@ _MOVED_TO_CONTROL = (("max_step_degrees", "boost_degrees"),
 # and learns from reactions alone, so no reaction-vs-heartbeat weight.
 _DROPPED_LEARNING = ("analysis_window_days", "bootstrap_min_days", "validity_delay_days",
                      "reactive_weight")
+# Learning keys an earlier v2 build wrote that v2 now drops, from a config of
+# either version: bands move by reaction, not by a recency-weighted mean.
+_RETIRED_LEARNING = ("recency_half_life_days",)
 # New keys inside objects that also hold v1 keys (only these get defaults).
-_NEW_LEARNING = ("reaction_rate", "recency_half_life_days")
+_NEW_LEARNING = ("reaction_rate",)
 _NEW_SYSTEM = ("sensor_stale_minutes",)
 _NEW_ROOM = ("heat_sources", "knobs")
 
@@ -137,6 +142,10 @@ def migrate(cfg: dict, schema_path: str | Path = SCHEMA_PATH) -> dict:
     elif version != CURRENT_VERSION:
         raise ConfigError(f"unsupported config version {version!r} "
                           f"(expected 1 or {CURRENT_VERSION})")
+    learning = out.get("learning")
+    if isinstance(learning, dict):
+        for key in _RETIRED_LEARNING:
+            learning.pop(key, None)
     _fill_new_defaults(out, _load_schema(schema_path))
     return out
 

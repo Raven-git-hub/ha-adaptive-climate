@@ -19,12 +19,12 @@
       "cool_min_heartbeats": 1,
       "rest_min_heartbeats": 2,
       "person_grace_minutes": 30,
-      "offset_cap": 3
+      "offset_cap": 3,
+      "person_step_degrees": 1.0
     }
   },
   "learning": {
-    "reaction_rate": 0.5,
-    "recency_half_life_days": 7
+    "reaction_rate": 0.5
   },
   "outdoor": {
     "source": "none",

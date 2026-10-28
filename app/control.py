@@ -11,19 +11,24 @@ rule is a small named function, written the way a template can say it.
                       direction (app.trust), and the release counts
   step                one maintenance heartbeat for one unit
   on_section_change   what the scene does to a unit at a crossover
-  on_person_change    what a person's change does to the unit's record (no
+  on_room_vote        a person's too_cold / too_hot vote for the room (a
+                      button press, or a setpoint change on a remote): one
+                      per episode, forcing a rest or a boost
+  on_person_change    what a person turning a unit on or off, or changing
+                      its mode or fan, does to the unit's record (no
                       command: the person already moved the unit)
   on_climate_change   the manual-change automation: one climate state change,
                       ignored when it is our own command showing up
-                      (matches_command), else classified and passed to
-                      on_person_change
+                      (matches_command); a setpoint change is a vote
+                      (on_room_vote), anything else goes to on_person_change
 
 A unit's state lives in its helpers (phase 3b): ac_state, ac_base,
-ac_offset, ac_since, ac_grace_until and ac_unblocked.
+ac_offset, ac_since, ac_grace_until, ac_unblocked and ac_forced.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
@@ -37,6 +42,15 @@ HANDS_OFF = ("user_off", "manual", "config_off")   # maintenance never moves the
 # the two meet.
 TOO_WARM, TOO_COLD, NONE = "too_warm", "too_cold", "none"
 _FROM_TRUST = {"cool": TOO_WARM, "warm": TOO_COLD, "none": NONE}
+
+# A person's vote: the room is too cold, or too hot (their word for
+# too_warm). Each is a button per room; a setpoint change on a remote counts
+# as one too (raised: too cold).
+TOO_HOT = "too_hot"
+PERSON_VOTES = (TOO_COLD, TOO_HOT)
+SETPOINT_STEP = 1.0             # a vote moves the target this far
+FORCED_STATES = ("rest", "boost")      # what a vote forces
+VOTE_HANDS_OFF = ("leak", "config_off", "manual")   # a vote leaves these alone
 
 DEFAULT_MIN_TEMP, DEFAULT_MAX_TEMP = 16.0, 30.0
 DEFAULT_BAND = 5.0      # a sensor with no band yet votes like a low-trust one (v1 template)
@@ -73,6 +87,7 @@ class Unit:
     since: datetime | None = None       # when the current state began
     grace_until: datetime | None = None  # end of a person's grace period
     unblocked: bool = False             # a person turned it on during a block
+    forced: bool = False                # this rest or boost is a person's vote
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,18 @@ class Climate:
     mode: str
     temperature: float | None = None
     fan: str | None = None
+
+
+@dataclass(frozen=True)
+class PersonVote:
+    """A person's vote as the ac_person_vote event reports it: accepted, or
+    ignored because an episode is running. source is button or remote; a
+    remote vote also names the unit changed and the setpoint chosen."""
+    direction: str                      # too_cold | too_hot
+    accepted: bool
+    source: str
+    unit: str | None = None
+    chosen: float | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +223,13 @@ def released(side_count: int, required: int) -> bool:
     return side_count < max(required, 1)
 
 
+def release_offset(unit: Unit, change: int) -> int:
+    """The offset a boost or rest returns to cool with: a system one moves
+    it a step (change, -1 or +1); one a person's vote forced goes back to
+    cool at its base."""
+    return 0 if unit.forced else unit.offset + change
+
+
 def capped_offset(offset: int, cap: int) -> int:
     return max(-cap, min(cap, offset))
 
@@ -219,9 +253,10 @@ def command_for(state: str, base: float | None, offset: int, ctx: Context) -> Co
 
 def _go(unit: Unit, state: str, now: datetime, ctx: Context,
         offset: int | None = None) -> tuple[Unit, Command | None]:
-    """A transition: new state, since = now, and its command."""
+    """A transition: new state, since = now, and its command. It ends any
+    forced state: only a vote forces one."""
     offset = unit.offset if offset is None else capped_offset(offset, ctx.config.offset_cap)
-    new = replace(unit, state=state, offset=offset, since=now)
+    new = replace(unit, state=state, offset=offset, since=now, forced=False)
     return new, command_for(state, target_base(new, ctx), offset, ctx)
 
 
@@ -238,16 +273,6 @@ def _leak_step(unit: Unit, now: datetime, ctx: Context) -> tuple[Unit, Command |
     if unit.state == "leak":                 # fixed and confirmed: as at a section change
         return on_section_change(unit, ctx, ctx.forced_off, now)
     return None
-
-
-def _kept_off(power_after: bool) -> bool:
-    """A setpoint change made while the unit is off keeps its state."""
-    return not power_after
-
-
-def _kept_manual(state: str) -> bool:
-    """So does one made while a person has the unit in manual."""
-    return state == "manual"
 
 
 def setpoint_moved(before: float | None, after: float | None, min_delta: float) -> bool:
@@ -308,7 +333,96 @@ def classify_change(before: Climate, after: Climate, min_delta: float) -> str | 
 
 
 # ---------------------------------------------------------------------
-# The three entry points
+# A person's vote
+# ---------------------------------------------------------------------
+
+def forced_now(unit: Unit) -> bool:
+    """A forced rest or boost: the marker, and still in the state the vote
+    forced (a leftover marker on a unit that has moved on is no episode)."""
+    return unit.forced and unit.state in FORCED_STATES
+
+
+def in_episode(units: Iterable[Unit]) -> bool:
+    """One correction per episode: while any unit in the room is in a forced
+    rest or boost, a vote changes and teaches nothing."""
+    return any(forced_now(u) for u in units)
+
+
+def vote_base(direction: str, unit: Unit, ctx: Context,
+              chosen: float | None = None) -> float | None:
+    """The unit's new base: the setpoint a person chose on its remote, else
+    its target one step warmer (too_cold) or cooler (too_hot); clamped to
+    its range. None with no target at all (no base, no almanac)."""
+    if chosen is None:
+        tb = target_base(unit, ctx)
+        if tb is None:
+            return None
+        chosen = tb + (SETPOINT_STEP if direction == TOO_COLD else -SETPOINT_STEP)
+    return clamp(chosen, ctx.unit_min, ctx.unit_max)
+
+
+def _votes_alone(unit: Unit, ctx: Context) -> bool:
+    """A vote leaves a unit in leak (or with its latch on), config_off or
+    manual as it is; the reaction is still recorded."""
+    return ctx.leak_on or unit.state in VOTE_HANDS_OFF
+
+
+def _keeps_since(unit: Unit, state: str) -> bool:
+    """A unit already in the state a vote forces keeps its since, so its
+    minimum time and the boost cap count from when that state began."""
+    return unit.state == state
+
+
+def _force(unit: Unit, state: str, now: datetime, ctx: Context) -> tuple[Unit, Command | None]:
+    """Into a forced rest or boost at the voted base, offset 0. A unit
+    already resting is already off, so it is sent nothing."""
+    since = unit.since if _keeps_since(unit, state) else now
+    new = replace(unit, state=state, since=since, forced=True)
+    if unit.state == "rest" and state == "rest":
+        return new, None
+    return new, command_for(state, target_base(new, ctx), 0, ctx)
+
+
+def on_person_vote(direction: str, unit: Unit, now: datetime, ctx: Context,
+                   chosen: float | None = None) -> tuple[Unit, Command | None]:
+    """One unit's part in an accepted vote. too_cold: a cooling or boosting
+    unit rests (off), a resting one stays resting, both forced; user_off
+    stays off with the new base. too_hot: a unit cooling, resting, boosting
+    or in user_off boosts, forced. Base = vote_base, offset 0, no grace."""
+    if _votes_alone(unit, ctx):
+        return _stay(unit, ctx)
+    base = vote_base(direction, unit, ctx, chosen)
+    if base is None:
+        return _stay(unit, ctx)
+    voted = replace(unit, base=base, offset=0, grace_until=None)
+    if direction == TOO_COLD:
+        if unit.state == "user_off":
+            return voted, None               # the person's off stands
+        return _force(voted, "rest", now, ctx)
+    return _force(voted, "boost", now, ctx)
+
+
+def on_room_vote(direction: str, units: dict[str, Unit], now: datetime,
+                 ctxs: dict[str, Context], chosen: dict[str, float] | None = None
+                 ) -> tuple[bool, dict[str, tuple[Unit, Command | None]]]:
+    """A person's vote for the whole room: (accepted, {unit_id: (unit,
+    command)}). Ignored, changing nothing, while an episode is running;
+    else every unit takes its part. chosen: {unit_id: setpoint} for a unit
+    changed on its remote."""
+    if in_episode(units.values()):
+        return False, {uid: (u, None) for uid, u in units.items()}
+    chosen = chosen or {}
+    return True, {uid: on_person_vote(direction, u, now, ctxs[uid], chosen.get(uid))
+                  for uid, u in units.items()}
+
+
+def setpoint_direction(before: Climate, after: Climate) -> str:
+    """A setpoint raised on a remote says too cold; lowered, too hot."""
+    return TOO_COLD if after.temperature > before.temperature else TOO_HOT
+
+
+# ---------------------------------------------------------------------
+# The entry points
 # ---------------------------------------------------------------------
 
 def step(unit: Unit, votes: Votes, now: datetime, ctx: Context) -> tuple[Unit, Command | None]:
@@ -342,14 +456,14 @@ def step(unit: Unit, votes: Votes, now: datetime, ctx: Context) -> tuple[Unit, C
         if blocked:
             return _go(unit, "rest", now, ctx)
         if boost_capped(unit, now, cfg) or released(votes.warm_side, votes.required):
-            return _go(unit, "cool", now, ctx, offset=unit.offset - 1)
+            return _go(unit, "cool", now, ctx, offset=release_offset(unit, -1))
         return _stay(unit, ctx)
 
     if unit.state == "rest":
         if blocked or not min_time_met(unit, now, cfg.rest_min_heartbeats, interval):
             return _stay(unit, ctx)
         if released(votes.cold_side, votes.required):
-            return _go(unit, "cool", now, ctx, offset=unit.offset + 1)
+            return _go(unit, "cool", now, ctx, offset=release_offset(unit, +1))
         return _stay(unit, ctx)
 
     return _stay(unit, ctx)
@@ -360,10 +474,10 @@ def on_section_change(unit: Unit, ctx: Context, forced_off: bool,
     """The scene at a crossover (and a confirmed leak release). Resets the
     section-scoped fields, then: leak if the latch is on (off is re-sent),
     else config_off if the scene forces the unit off, else rest if cooling
-    is blocked, else cool. user_off and manual end here. Minimum times
-    don't apply."""
+    is blocked, else cool. user_off, manual and a forced state end here.
+    Minimum times don't apply."""
     reset = replace(unit, offset=0, base=ctx.setpoint_applied, unblocked=False,
-                    grace_until=None, since=now)
+                    grace_until=None, since=now, forced=False)
     if ctx.leak_on:
         state = "leak"
     elif forced_off:
@@ -380,40 +494,58 @@ def on_section_change(unit: Unit, ctx: Context, forced_off: bool,
     return new, command_for(state, target_base(new, ctx), 0, ctx)
 
 
-def on_person_change(kind: str, unit: Unit, new_setpoint: float | None, power_after: bool,
-                     now: datetime, ctx: Context) -> Unit:
-    """What a person's change does to the unit's record. No command: the
-    person already moved the unit. kind as the reaction detector records
-    it: setpoint, on, off, manual (knob_turn counts as setpoint, and a knob
-    press changes nothing). A latched leak keeps its state."""
+def on_person_change(kind: str, unit: Unit, new_setpoint: float | None, now: datetime,
+                     ctx: Context) -> Unit:
+    """What a person turning the unit on or off, or changing its mode or
+    fan, does to the unit's record. No command: the person already moved
+    the unit. kind as the reaction detector records it: on, off, manual (a
+    setpoint change is a vote, on_room_vote). Each ends a forced state; a
+    latched leak keeps its state."""
     if unit.state == "leak":
         return unit
-    grace = now + timedelta(minutes=ctx.config.person_grace_minutes)
-    if kind in ("setpoint", "knob_turn"):
-        if _kept_off(power_after) or _kept_manual(unit.state):
-            # changed while off, or in manual: remember it for the next time
-            # the unit cools
-            return replace(unit, base=new_setpoint, offset=0)
-        return replace(unit, state="cool", base=new_setpoint, offset=0, since=now,
-                       grace_until=grace)
     if kind == "on":
         return replace(unit, state="cool", base=new_setpoint, offset=0, unblocked=True,
-                       since=now, grace_until=grace)
+                       since=now, forced=False,
+                       grace_until=now + timedelta(minutes=ctx.config.person_grace_minutes))
     if kind == "off":
-        return replace(unit, state="user_off", since=now)
+        return replace(unit, state="user_off", since=now, forced=False)
     if kind == "manual":
-        return replace(unit, state="manual", since=now)
+        return replace(unit, state="manual", since=now, forced=False)
     return unit
 
 
-def on_climate_change(unit: Unit, before: Climate, after: Climate, now: datetime,
-                      ctx: Context) -> Unit:
-    """The manual-change automation, once it knows the change carries no
-    parent context, the guard is off and the unit is reporting: our own
-    command showing up late changes nothing; anything else is a person's."""
+def person_change_kind(unit: Unit, before: Climate, after: Climate, ctx: Context) -> str | None:
+    """A climate change's kind if it is a person's: None when it is our own
+    command showing up late, or not something a person changes."""
     if matches_command(implied_command(unit, ctx), before, after, ctx.min_delta):
-        return unit
-    kind = classify_change(before, after, ctx.min_delta)
-    if kind is None:
-        return unit
-    return on_person_change(kind, unit, after.temperature, after.mode != "off", now, ctx)
+        return None
+    return classify_change(before, after, ctx.min_delta)
+
+
+def on_button(direction: str, units: dict[str, Unit], now: datetime,
+              ctxs: dict[str, Context]) -> tuple[dict[str, tuple[Unit, Command | None]],
+                                                 PersonVote]:
+    """The vote automation: a press of the room's too_cold or too_hot
+    button."""
+    accepted, results = on_room_vote(direction, units, now, ctxs)
+    return results, PersonVote(direction, accepted, "button")
+
+
+def on_climate_change(units: dict[str, Unit], uid: str, before: Climate, after: Climate,
+                      now: datetime, ctxs: dict[str, Context]
+                      ) -> tuple[dict[str, tuple[Unit, Command | None]], PersonVote | None]:
+    """The manual-change automation for unit `uid`, once it knows the change
+    carries no parent context, the guard is off and the unit is reporting.
+    Our own command showing up late changes nothing. A setpoint change is a
+    vote for the room, with the value chosen as that unit's new base; on,
+    off and manual change that unit's record alone."""
+    results = {u: (x, None) for u, x in units.items()}
+    kind = person_change_kind(units[uid], before, after, ctxs[uid])
+    if kind == "setpoint":
+        direction = setpoint_direction(before, after)
+        accepted, results = on_room_vote(direction, units, now, ctxs, {uid: after.temperature})
+        return results, PersonVote(direction, accepted, "remote", uid, after.temperature)
+    if kind is not None:
+        results[uid] = (on_person_change(kind, units[uid], after.temperature, now, ctxs[uid]),
+                        None)
+    return results, None

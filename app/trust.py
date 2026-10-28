@@ -39,8 +39,9 @@ def band_from_deviation(
 
     A user who reacts at 0.5 deg gets the tightest band; one who only
     reacts at 5 deg gets the widest. Clamped to the calibrated range.
-    In practice the analyser feeds the recency-weighted mean of a
-    sensor's reaction deviations here, not a single raw value.
+    The v2 analyser no longer calls this: it nudges each band reaction by
+    reaction (app.analyser.nudge_band) within the same range. The frozen
+    v1 analyser (tools/fixtures/analyser_v1.py) still does.
     """
     return clamp(deviation, high_dev, low_dev)
 

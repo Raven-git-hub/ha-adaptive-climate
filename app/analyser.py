@@ -15,7 +15,10 @@ Per room and section:
               so the generated automations leave it alone.
   setpoint    every reaction whose setpoint_after differs from its
               setpoint_before moves S toward the raw chosen value:
-              S += reaction_rate * (chosen - S).
+              S += reaction_rate * (chosen - S). A person's vote (too_cold
+              / too_hot) moves every unit's S the same way, toward the
+              value chosen on a remote, else one step from the applied
+              setpoint in force (warmer for too_cold).
   applied     tracked through the replay, on whole degrees. A seed applies
               its nearest step (half up). A setpoint-moving reaction whose
               chosen value differs from the applied value in force moves it
@@ -24,24 +27,31 @@ Per room and section:
               one step toward the chosen value and never past it; one whose
               chosen value equals the applied value keeps it. Nothing else
               moves it, so quiet days never do.
-  comfort     30-60 min after each setpoint-moving reaction, the window's
-              mean reading moves comfort toward it at reaction_rate, unless
-              the window holds another reaction, a heartbeat with a unit in
-              boost/rest/leak, or fewer than 2 heartbeats. It applies once
-              the window has closed, to the reaction's section even across
-              a boundary.
-  band        recency-weighted (half-life over all history) mean deviation
-              at reactions, measured against comfort as it stood in the
-              replay then, from sensors that drifted at least the high-trust
-              deviation the way the reaction says: warmer wanted teaches
-              sensors below comfort, cooler wanted those above.
+  comfort     at a vote, each usable sensor's comfort moves at
+              reaction_rate toward its reading plus person_step_degrees
+              (too_cold) or minus it (too_hot). Then, 30-60 min after each
+              setpoint-moving reaction, the window's mean reading moves
+              comfort toward it at reaction_rate, unless the window holds
+              another reaction, a heartbeat with a unit in boost/rest/leak
+              (a vote's forced state included), or fewer than 2 heartbeats.
+              It applies once the window has closed, to the reaction's
+              section even across a boundary.
+  band        starts at the low-trust deviation; every reaction with a
+              direction nudges each sensor's band at reaction_rate, by its
+              deviation d from comfort (as it stood in the replay before the
+              reaction): on the person's side (below comfort when warmer is
+              wanted) and inside its band, toward |d|; on their side and
+              already past it, toward 0.8 x band; on the other side, toward
+              band + |d|. Clamped to [high, low] trust deviation; quiet
+              periods never move it.
   confidence  1 - 0.5^(quiet/3); quiet = completed runs since the last
               reaction with at least one heartbeat and no reaction.
   status      provisional until the first setpoint-moving reaction, then
               learned.
 
-A setpoint-moving reaction is a setpoint change or knob turn, or a reaction
-of any kind in which a unit's setpoint changed (an `on` with a new setpoint).
+A setpoint-moving reaction is a vote, a setpoint change or knob turn (rows
+recorded before the votes), or a reaction of any kind in which a unit's
+setpoint changed (an `on` with a new setpoint).
 
 Pure over a sqlite connection, a room dict and an as_of datetime. Nothing
 after as_of is read, so the same database and as_of give the same almanac.
@@ -55,7 +65,8 @@ import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
-from app.trust import band_from_deviation, trust_from_band
+from app.control import SETPOINT_STEP
+from app.trust import trust_from_band
 
 SECTIONS = ("sunrise", "day", "afternoon", "sunset", "night", "sleep")
 
@@ -64,8 +75,12 @@ COMFORT_WINDOW = (timedelta(minutes=30), timedelta(minutes=60))
 COMFORT_MIN_HEARTBEATS = 2
 DISQUALIFYING_STATES = ("boost", "rest", "leak")
 
+# A person's vote: the too_cold / too_hot buttons, or a remote's setpoint
+# change, as Home Assistant's ac_person_vote event reports it.
+VOTE_KINDS = ("too_cold", "too_hot")
 # A NULL kind is a row recorded before kinds existed: a setpoint change.
-SETPOINT_MOVING_KINDS = (None, "setpoint", "knob_turn")
+SETPOINT_MOVING_KINDS = (None, "setpoint", "knob_turn") + VOTE_KINDS
+BAND_TIGHTEN = 0.8      # a sensor already past its band on the person's side
 
 _EPS = 1e-9
 
@@ -77,22 +92,23 @@ _EPS = 1e-9
 @dataclass(frozen=True)
 class LearningConfig:
     reaction_rate: float = 0.5
-    recency_half_life_days: float = 7.0
     high_trust_deviation: float = 0.5
     low_trust_deviation: float = 5.0
+    person_step_degrees: float = 1.0
 
     @classmethod
     def from_config(cls, config: dict) -> LearningConfig:
-        """From a (migrated) config dict: learning.* and system.trust.*."""
+        """From a (migrated) config dict: learning.*, system.trust.* and
+        system.control.person_step_degrees."""
         learn = config.get("learning", {})
         trust = config.get("system", {}).get("trust", {})
+        control = config.get("system", {}).get("control", {})
         base = cls()
         return cls(
             reaction_rate=learn.get("reaction_rate", base.reaction_rate),
-            recency_half_life_days=learn.get("recency_half_life_days",
-                                             base.recency_half_life_days),
             high_trust_deviation=trust.get("high_trust_deviation", base.high_trust_deviation),
             low_trust_deviation=trust.get("low_trust_deviation", base.low_trust_deviation),
+            person_step_degrees=control.get("person_step_degrees", base.person_step_degrees),
         )
 
 
@@ -117,7 +133,8 @@ class _Reaction:
     section: str
     local_date: str
     kind: str | None                # room-level
-    units: dict                     # unit_id -> (setpoint_before, setpoint_after)
+    units: dict                     # unit_id -> (setpoint_before, setpoint_after);
+                                    # a remote's vote: (None, the value chosen)
     sensors: dict                   # sensor_id -> temperature
 
 
@@ -133,10 +150,10 @@ def changed_setpoint(units: dict) -> bool:
 
 
 def is_setpoint_moving(kind: str | None, units: dict | None = None) -> bool:
-    """A setpoint change or knob turn, or a reaction of any kind in which a
-    unit's setpoint changed - an `on` that comes with a new setpoint, say
-    (docs/V2_DESIGN.md). It moves S and the applied setpoint, makes the
-    section learned and opens a comfort window."""
+    """A vote, a setpoint change or knob turn, or a reaction of any kind in
+    which a unit's setpoint changed - an `on` that comes with a new
+    setpoint, say (docs/V2_DESIGN.md). It moves S and the applied setpoint,
+    makes the section learned and opens a comfort window."""
     return kind in SETPOINT_MOVING_KINDS or changed_setpoint(units or {})
 
 
@@ -179,17 +196,37 @@ def confidence_from_quiet(quiet: int) -> float:
 
 def wanted_direction(kind: str | None, units: dict) -> int:
     """What the person asked for: +1 warmer, -1 cooler, 0 nothing to learn
-    a band from. On means too warm, off too cold; a setpoint change or knob
-    turn goes by how the person moved the setpoint (summed over units)."""
-    if kind == "on":
+    a band from. too_cold and off mean warmer, too_hot and on cooler; a
+    setpoint change or knob turn goes by how the person moved the setpoint
+    (summed over units)."""
+    if kind in ("on", "too_hot"):
         return -1
-    if kind == "off":
+    if kind in ("off", "too_cold"):
         return 1
     if kind not in SETPOINT_MOVING_KINDS:
         return 0                    # manual, knob_press
     delta = math.fsum(after - before for before, after in units.values()
                       if before is not None and after is not None)
     return 1 if delta > _EPS else -1 if delta < -_EPS else 0
+
+
+def nudge_band(band: float, deviation: float, want: int, cfg: LearningConfig) -> float:
+    """One reaction's nudge to a sensor's band (docs/TRUST_MODEL.md).
+    deviation: reading - comfort at the reaction; want: +1 warmer wanted,
+    -1 cooler. On the person's side (below comfort when they want it
+    warmer) and inside its band, the band moves toward |d|, so the sensor
+    would have spoken; on their side and already past it, toward 0.8 x
+    band; on the other side, toward band + |d|. A sensor right at comfort
+    says nothing either way. Clamped to [high, low] trust deviation."""
+    if abs(deviation) < _EPS or not want:
+        return band
+    d = abs(deviation)
+    if want * deviation < 0:                         # the person's side
+        toward = d if d < band else BAND_TIGHTEN * band
+    else:
+        toward = band + d
+    band += cfg.reaction_rate * (toward - band)
+    return min(max(band, cfg.high_trust_deviation), cfg.low_trust_deviation)
 
 
 def _utc(dt: datetime) -> str:
@@ -302,6 +339,18 @@ def _confidence(conn, room_id: str, section: str, room_reactions: list[_Reaction
     return confidence_from_quiet(quiet)
 
 
+def _move_setpoint(uid: str, chosen: float, setpoint: dict, direction: dict, applied: dict,
+                   rate: float) -> None:
+    """A setpoint-moving reaction for one unit: S toward the value chosen,
+    the rounding direction from S toward it, and the applied setpoint by
+    next_applied."""
+    s_before = setpoint[uid]
+    setpoint[uid] = s_before + rate * (chosen - s_before)
+    if abs(chosen - s_before) >= _EPS:
+        direction[uid] = 1 if chosen > s_before else -1
+    applied[uid] = next_applied(applied[uid], setpoint[uid], chosen, direction[uid])
+
+
 def _replay_section(conn, room_id: str, section: str, unit_seeds: dict, sensor_seeds: dict,
                     room_reactions: list[_Reaction], cfg: LearningConfig,
                     as_of: datetime) -> SectionAlmanac:
@@ -310,7 +359,7 @@ def _replay_section(conn, room_id: str, section: str, unit_seeds: dict, sensor_s
     direction = {u: 0 for u in setpoint}             # +1 / -1 / 0: none yet
     applied = {u: nearest_step(s, 0) for u, s in setpoint.items()}   # setpoint_applied
     comfort = dict(sensor_seeds)                     # sensor -> comfort reading
-    samples: dict[str, list[tuple[float, float]]] = {s: [] for s in comfort}
+    band = {s: cfg.low_trust_deviation for s in comfort}
     here = [r for r in room_reactions if r.section == section]
 
     # Reactions at their own time; comfort windows once they have closed.
@@ -325,41 +374,38 @@ def _replay_section(conn, room_id: str, section: str, unit_seeds: dict, sensor_s
                     comfort[sid] += rate * (mean - comfort[sid])
             continue
 
+        # Each sensor's band, against comfort as it stands before this
+        # reaction moves it.
         want = wanted_direction(r.kind, r.units)
-        if want:
-            age = max(0, (as_of.date() - date.fromisoformat(r.local_date)).days)
-            weight = 0.5 ** (age / cfg.recency_half_life_days)
-            for sid, t in r.sensors.items():
-                c = comfort.get(sid)
-                if t is None or c is None:
-                    continue
-                dev = t - c
-                if (want > 0 and dev <= -cfg.high_trust_deviation) or \
-                        (want < 0 and dev >= cfg.high_trust_deviation):
-                    samples[sid].append((abs(dev), weight))
+        usable = {sid: t for sid, t in r.sensors.items()
+                  if t is not None and comfort.get(sid) is not None}
+        for sid, t in usable.items():
+            band[sid] = nudge_band(band[sid], t - comfort[sid], want, cfg)
+
+        if r.kind in VOTE_KINDS:
+            # The person is a sensor that always wins: comfort moves toward
+            # each reading a step their way, and every unit's S toward the
+            # value they chose on a remote, else a step from the applied
+            # setpoint in force.
+            for sid, t in usable.items():
+                comfort[sid] += rate * (t + want * cfg.person_step_degrees - comfort[sid])
+            for uid in setpoint:
+                chosen = (r.units.get(uid) or (None, None))[1]
+                if chosen is None:
+                    chosen = applied[uid] + want * SETPOINT_STEP
+                _move_setpoint(uid, chosen, setpoint, direction, applied, rate)
+            continue
 
         # A unit whose setpoint changed makes this a setpoint-moving reaction
         # whatever its kind (an `on` with a new setpoint included): S moves,
         # and so does the applied setpoint, from the value in force toward
         # what the person chose. On/off alone, or manual, leaves both alone.
         for uid, (before, after) in r.units.items():
-            if uid not in setpoint or not changed_setpoint({uid: (before, after)}):
-                continue
-            s_before = setpoint[uid]
-            setpoint[uid] = s_before + rate * (after - s_before)
-            if abs(after - s_before) >= _EPS:
-                direction[uid] = 1 if after > s_before else -1
-            applied[uid] = next_applied(applied[uid], setpoint[uid], after, direction[uid])
+            if uid in setpoint and changed_setpoint({uid: (before, after)}):
+                _move_setpoint(uid, after, setpoint, direction, applied, rate)
 
-    band: dict[str, float] = {}
-    trust: dict[str, float] = {}
-    for sid, pairs in samples.items():
-        total = math.fsum(w for _, w in pairs)
-        b = (band_from_deviation(math.fsum(d * w for d, w in pairs) / total,
-                                 cfg.high_trust_deviation, cfg.low_trust_deviation)
-             if total > 0 else cfg.low_trust_deviation)
-        band[sid] = b
-        trust[sid] = trust_from_band(b, cfg.high_trust_deviation, cfg.low_trust_deviation)
+    trust = {sid: trust_from_band(b, cfg.high_trust_deviation, cfg.low_trust_deviation)
+             for sid, b in band.items()}
 
     last_reaction = here[-1].at if here else None
     return SectionAlmanac(

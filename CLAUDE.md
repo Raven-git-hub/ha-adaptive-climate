@@ -48,19 +48,23 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
   `context.parent_id`, or the unit showing the command its state helper
   implies - `app.control.matches_command`), so the maintenance loop doesn't
   learn from itself.
+- **Home Assistant judges a person's vote, the container only records it.**
+  The vote and manual-change automations decide accept/ignore (one correction
+  per episode) and fire `ac_person_vote`; the runtime learns only from that
+  event and never judges the episode itself.
 
 ### Core modules (`app/`)
 
 | Module | Responsibility |
 |---|---|
 | `app/trust.py` | Pure-function core: sensor trust, comfort band, quorum evaluation |
-| `app/control.py` | Pure-function control core: votes, the cool/boost/rest state machine, section changes, person reactions, the "is this ours" check (rendered as Jinja by the generator) |
-| `app/analyser.py` | Deterministic replay of reactions from a seed: setpoints, applied setpoints, per-sensor comfort/band/trust, confidence |
-| `app/generator.py` | Builds HA helpers (incl. six per-unit control helpers) and automations (scene, maintenance, manual change, leak, watchdog) from config, rendering `app/control.py` as Jinja |
+| `app/control.py` | Pure-function control core: votes, the cool/boost/rest state machine, section changes, a person's too_cold/too_hot vote (one per episode, forced rest/boost), person reactions, the "is this ours" check (rendered as Jinja by the generator) |
+| `app/analyser.py` | Deterministic replay of reactions from a seed: setpoints, applied setpoints, per-sensor comfort/band (nudged per reaction)/trust, confidence |
+| `app/generator.py` | Builds HA helpers (seven per-unit control helpers, two vote buttons per room) and automations (scene, maintenance, vote, manual change, leak, watchdog) from config, rendering `app/control.py` as Jinja |
 | `app/scheduler.py` | Clock-only section-boundary computation (no sun-based triggers) |
 | `app/ha.py` | Home Assistant REST + WebSocket client |
 | `app/deploy.py` | Reconciles generated helpers/automations into HA; owns the `ac_*` namespace; manifest-based automation pruning |
-| `app/runtime.py` | Observer + control loop: scheduler, reactive detector, replay triggers, almanac push |
+| `app/runtime.py` | Observer + control loop: scheduler, reactive detector (on/off/manual), HA's `ac_person_vote` events as votes, replay triggers, almanac push |
 | `app/store.py` | CSV + SQLite storage, event log, almanac persistence |
 | `app/main.py` | FastAPI app, lifespan wiring |
 | `app/config.py` | Config loading: v1 → v2 migration, v2 defaults, schema validation, unique room ids and unit/sensor ids within a room (other cross-reference checks still to come — Roadmap Phase 9) |
@@ -118,7 +122,7 @@ python tools/config_check.py                # config v1 -> v2 migration, default
 python tools/analyser_demo.py               # reaction replay: worked examples + acceptance checks
 python tools/compare_analyser.py DATA_DIR   # frozen v1 vs v2 almanacs on a COPY of a data dir (migrates it)
 python tools/render_generated.py            # render helpers + automations
-python tools/control_check.py               # control state machine scenarios; each rule removed must fail
+python tools/control_check.py               # control state machine and vote scenarios; each rule removed must fail
 python tools/control_logic_check.py         # the generated automations replayed against app/control.py
 python tools/deploy_reconcile_check.py      # deploy create / reuse / update / prune
 python tools/runtime_check.py               # runtime observer + control loop

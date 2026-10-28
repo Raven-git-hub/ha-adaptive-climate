@@ -100,6 +100,11 @@ class HARest:
                            data: dict | None = None) -> Any:
         return await self._post(f"/api/services/{domain}/{service}", data or {})
 
+    async def fire_event(self, event_type: str, data: dict | None = None) -> Any:
+        """Fire an event on HA's bus (POST /api/events/<type>); the doctor
+        uses it to check a custom event reaches a websocket subscriber."""
+        return await self._post(f"/api/events/{event_type}", data or {})
+
     async def render_template(self, template: str) -> str:
         """POST /api/template: Home Assistant renders a template with its own
         Jinja and returns the text (used by the doctor's v2 preflight)."""
@@ -372,12 +377,15 @@ class HAWebSocket:
 
     # ---- convenience ----------------------------------------------
 
-    async def subscribe_states(self, callback) -> int:
-        """Fire `callback(event_dict)` on every state_changed. Returns the
-        subscription id (for future unsubscribe)."""
-        return await self.request({"type": "subscribe_events",
-                                   "event_type": "state_changed"},
+    async def subscribe_events(self, event_type: str, callback) -> int:
+        """Fire `callback(event_dict)` on every event of `event_type`.
+        Returns the subscription id (for future unsubscribe)."""
+        return await self.request({"type": "subscribe_events", "event_type": event_type},
                                   stream_cb=callback)
+
+    async def subscribe_states(self, callback) -> int:
+        """Fire `callback(event_dict)` on every state_changed."""
+        return await self.subscribe_events("state_changed", callback)
 
     async def create_helper(self, domain: str, payload: dict) -> dict:
         """Create an input_* helper via the storage collection."""

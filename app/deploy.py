@@ -48,7 +48,8 @@ from app.config import ConfigError, validate
 from app.ha import HAError, HARest, HAWebSocket
 
 MANIFEST_FILENAME = "deploy_manifest.json"
-HELPER_DOMAINS = ("input_boolean", "input_select", "input_number", "input_datetime")
+HELPER_DOMAINS = ("input_boolean", "input_select", "input_number", "input_datetime",
+                  "input_button")
 # A newly created unit is hands off until its room's next section change,
 # so deploying sends no command to any unit.
 NEW_UNIT_STATE = "manual"
@@ -261,8 +262,10 @@ async def _initialise_new_helpers(config: dict, rest: HARest,
     No helper carries an `initial` (HA would reset it to that at every
     restart), so a new one starts at HA's default: an input_number at its
     minimum, an input_select at its first option, an input_datetime at
-    today 00:00, a boolean off. That is right for the base (0, unset), the
-    grace period (in the past) and the unblock (off). The rest are set here,
+    today 00:00, a boolean off, a button unknown (never pressed). That is
+    right for the base (0, unset), the grace period (in the past), the
+    unblock and the forced marker (off: no forced state), and the room's
+    two vote buttons. The rest are set here,
     and only for helpers that didn't exist before, so a running boost or
     rest keeps its clock:
 

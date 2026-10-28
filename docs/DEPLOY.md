@@ -5,8 +5,8 @@ boundaries of what it will and won't touch.
 
 ## Two reconciliation strategies, because HA has two different APIs
 
-**Helpers** (`input_boolean`, `input_select`, `input_number`, `input_datetime`)
-live in HA's storage collections, which expose a reliable `{domain}/list` over
+**Helpers** (`input_boolean`, `input_select`, `input_number`, `input_datetime`,
+`input_button`) live in HA's storage collections, which expose a reliable `{domain}/list` over
 WebSocket. So helpers are reconciled by **list-diff**: list what exists, create
 what's missing, update ours whose settings changed (`{domain}/update`: the
 offset helper's range after an `offset_cap` change, say, or a select's
@@ -69,13 +69,15 @@ acts without a learned setpoint); this brought the scene automation in line.
 
 ## Starting values: no `initial`, and new units start hands off
 
-Each unit has six control helpers (`ac_state`, `ac_base`, `ac_offset`,
-`ac_since`, `ac_grace_until`, `ac_unblocked`). None is created with an
-`initial`: in Home Assistant, a helper's `initial` overrides its restored value
+Each unit has seven control helpers (`ac_state`, `ac_base`, `ac_offset`,
+`ac_since`, `ac_grace_until`, `ac_unblocked`, `ac_forced`), and each room two
+vote buttons (`input_button.ac_too_cold_<room>`, `input_button.ac_too_hot_<room>`).
+None is created with an `initial`: in Home Assistant, a helper's `initial` overrides its restored value
 at **every** restart, which would wipe a person's chosen base, a `user_off` or
 an unblock each time HA restarts. So a new helper starts at HA's default (an
 `input_number` at its minimum, an `input_select` at its first option, an
-`input_datetime` at today 00:00, a boolean off), and deploy then sets the
+`input_datetime` at today 00:00, a boolean off, a button never pressed), and
+deploy then sets the
 starting values of the helpers **it has just created**, and only those:
 
 | Helper | Starts at | How |
@@ -83,6 +85,8 @@ starting values of the helpers **it has just created**, and only those:
 | `ac_base_<room>_<unit>` | 0 (unset: templates fall back to `setpoint_applied`) | its minimum is 0 |
 | `ac_grace_until_…` | today 00:00, in the past: no grace | HA's default |
 | `ac_unblocked_…` | off | HA's default |
+| `ac_forced_…` | off: no forced state | HA's default |
+| `ac_too_cold_<room>`, `ac_too_hot_<room>` | never pressed (`unknown`); the first press counts | HA's default |
 | `ac_offset_…` | 0 | deploy sets it (its minimum is −`offset_cap`) |
 | `ac_since_…` | now, as an epoch timestamp | deploy sets it |
 | `ac_state_…` | `manual` | deploy sets it |
@@ -113,6 +117,12 @@ the current section's scene automation in HA to start a room at once).
   A room with no almanac yet is still left alone: the scene sends nothing
   without a `setpoint_applied`, and maintenance never acts without a base.
 - Never deploy a v2 build that has phase 0 but not phase 1 (see CLAUDE.md).
+- **The vote buttons are ours, the things that press them aren't.** Deploy
+  creates each room's `input_button.ac_too_cold_<room>` and
+  `ac_too_hot_<room>` and the `ac_vote_<room>` automation that acts on them. A
+  dashboard card, a physical button's automation or the knob's that presses them
+  is yours, outside the `ac_` namespace, and deploy never touches it; if a room
+  is removed, its buttons are pruned and those presses go nowhere.
 - **After the first v2 deploy, check the holds.** v1 raised
   `input_boolean.ac_hold_<room>` on every reaction and its scenes cleared it;
   in v2 it is only a manual pause that nothing clears automatically, so one

@@ -9,13 +9,19 @@ Store (no Home Assistant, no network). Verifies:
   * a heartbeat samples every sensor and unit and records it, and the first
     heartbeat in an unseeded section (or one that can seed a unit the
     almanac lacks) replays and pushes the almanac
-  * reactive detection records a genuine user setpoint change, never raising
-    the hold, and replays the almanac at once and again after the comfort
-    window
+  * a person's vote comes only from Home Assistant's ac_person_vote event:
+    a setpoint change on a remote opens no reactive window, and HA's event
+    for it is recorded as one too_cold / too_hot reaction (the unit and the
+    value chosen, every sensor's reading), never raising the hold, replayed
+    at once and again after the comfort window; a button's accepted vote
+    the same with no unit rows; an ignored one is logged as an "ignored
+    press" and teaches nothing, even when the runtime's own cache shows no
+    forced state (HA alone judges the episode), and an accepted one is
+    recorded even when the cache shows one
   * an automation-caused change (context.parent_id set) is ignored
   * a change during the guard window is ignored
   * a late echo of our own command (what the unit's state helper implies)
-    is ignored, while a setpoint change made while resting is recorded
+    is ignored
   * a heartbeat records the unit's control_state and control_offset
   * startup replays every room and pushes its almanac before any
     crossover: started 3 minutes before 22:00 with an empty almanac but
@@ -24,7 +30,8 @@ Store (no Home Assistant, no network). Verifies:
     sensor_stale_minutes reads as unavailable in heartbeats and reaction
     snapshots, with one warning when it goes stale (not repeated after a
     restart) and one event when it reports again
-  * several changes in one reactive window record the first setpoint_before
+  * several changes in one reactive window record the first setpoint_before,
+    and a vote's setpoint change inside a window doesn't ride on it
   * a sleep section run crossing midnight closes against its start date
   * on restart, comfort-window replays are re-armed for recent setpoint-moving
     reactions only
@@ -116,15 +123,19 @@ class StubRest:
 class StubWS:
     def __init__(self):
         self.callback = None
+        self.subscribed: dict[str, object] = {}
     def on_reconnect(self, cb):
         pass
     def on_status(self, cb):
         pass
     async def connect(self):
         pass
+    async def subscribe_events(self, event_type, callback):
+        self.subscribed[event_type] = callback
+        return len(self.subscribed)
     async def subscribe_states(self, callback):
         self.callback = callback
-        return 1
+        return await self.subscribe_events("state_changed", callback)
     async def close(self):
         pass
 
@@ -156,6 +167,17 @@ def _state_changed(entity_id, before, after, parent_id=None, state="cool",
                                    "attributes": {"temperature": after,
                                                   "fan_mode": new_fan or fan},
                                    "context": {"id": "c1", "parent_id": parent_id, "user_id": "u1"}}}}
+
+
+def vote_event(room: str, direction: str, accepted=True, source: str = "button",
+               chosen: float | None = None, unit: str | None = None) -> dict:
+    """An ac_person_vote event as HA's vote or manual-change automation
+    fires it."""
+    data = {"room": room, "direction": direction, "accepted": accepted, "source": source}
+    if source == "remote":
+        data.update(chosen=chosen, unit=unit)
+    return {"event_type": "ac_person_vote", "data": data,
+            "context": {"id": "c2", "parent_id": "the automation's run", "user_id": None}}
 
 
 def last_reaction(c, room_id: str) -> tuple:
@@ -250,12 +272,19 @@ async def main() -> int:
     print("heartbeat: control_state and control_offset recorded from the unit's helpers "
           "(NULL where a room has none yet) - OK")
 
-    # --- reactive: genuine user change ---
+    # --- a person's vote: a setpoint change on the remote ---
+    assert set(ws.subscribed) == {"state_changed", "ac_person_vote"}, ws.subscribed
+    ws.subscribed.clear()                         # a dropped socket loses both
+    await rt._resubscribe()
+    assert set(ws.subscribed) == {"state_changed", "ac_person_vote"}, ws.subscribed
     rt._cache["input_boolean.ac_active_main_room"] = "off"
     rt._on_state_change(_state_changed("climate.lounge_lounge", 22.0, 24.0))
-    assert rt.rooms["main_room"].reactive_units, "user change not buffered"
-    await asyncio.sleep(0.05)  # let the scheduled hold-raise task run
-    await asyncio.sleep(1.5)  # let the flush window elapse
+    assert not rt.rooms["main_room"].reactive_units, "a remote's setpoint change opened a window"
+    await asyncio.sleep(1.5)  # a window would have flushed by now
+    assert c.execute("SELECT COUNT(*) FROM reactive").fetchone()[0] == 0
+    ws.subscribed["ac_person_vote"](vote_event("main_room", "too_cold", source="remote",
+                                               chosen=24.0, unit="main_room_ac"))
+    await eventually(lambda: replays(store, "main_room", "vote"), "the vote's replay")
     hold_calls = [c for c in rest.service_calls
                   if c[2].get("entity_id", "").startswith("input_boolean.ac_hold_")]
     assert not hold_calls, f"the hold was raised on a reaction: {hold_calls}"
@@ -263,16 +292,23 @@ async def main() -> int:
     rxs = c.execute("SELECT COUNT(*) FROM reactive_sensor").fetchone()[0]
     assert rx == 1, rx
     assert rxs == 3, rxs   # all sensors snapshotted at reaction time
-    print("reactive: user setpoint change recorded, hold not raised, 3 sensors snapshotted - OK")
-    assert len(replays(store, "main_room", "reaction")) == 1
+    assert last_reaction(c, "main_room") == ("too_cold", "too_cold", None, None, None, 24.0, 1)
+    print("vote: subscribed to ac_person_vote as well as state_changed, both again after a "
+          "reconnect - OK")
+    print("vote: a remote's setpoint change opens no window of the runtime's own; HA's event for "
+          "it is one too_cold reaction (unit, chosen 24), hold not raised, 3 sensors "
+          "snapshotted - OK")
+    assert len(replays(store, "main_room", "vote")) == 1
     alm = store.current_almanac("main_room", as_of=rt._today())["sections"][sec]
     assert alm["status"] == "learned", alm
     assert alm["units"]["main_room_ac"]["setpoint"] == 23.0          # 22 + 0.5 x (24 - 22)
     assert alm["units"]["main_room_ac"]["setpoint_applied"] == 23.0
-    print("reactive: replayed at once - learned, setpoint 22 -> 23 and applied 23 - OK")
+    assert alm["sensors"]["living1"]["comfort"] == 24.5               # 24 + 0.5 x (24 + 1 - 24)
+    print("vote: replayed at once - learned, setpoint 22 -> 23, applied 23, comfort moved "
+          "toward reading + 1 - OK")
     await eventually(lambda: replays(store, "main_room", "comfort window"),
                      "the comfort-window replay")
-    print("reactive: replayed again once the comfort window had closed - OK")
+    print("vote: replayed again once the comfort window had closed - OK")
 
     # --- reactive: automation-caused change is ignored ---
     before_rx = c.execute("SELECT COUNT(*) FROM reactive").fetchone()[0]
@@ -286,18 +322,21 @@ async def main() -> int:
 
     # --- reactive: three changes in one window are one record that keeps
     #     the FIRST setpoint_before and the LAST setpoint_after ---
-    for before, after in ((22.0, 23.0), (23.0, 24.0), (24.0, 25.0)):
-        rt._on_state_change(_state_changed("climate.lounge_lounge", before, after))
+    for before, after, mode, new_mode in ((22.0, 23.0, "off", "cool"), (23.0, 23.0, "cool", "off"),
+                                          (23.0, 25.0, "off", "cool")):
+        rt._on_state_change(_state_changed("climate.lounge_lounge", before, after, state=mode,
+                                           new_state=new_mode))
     buffered = rt.rooms["main_room"].reactive_units["main_room_ac"]
     assert (buffered.setpoint_before, buffered.setpoint_after) == (22.0, 25.0), buffered
     await asyncio.sleep(1.5)  # let the flush window elapse
     rows = c.execute(
-        "SELECT ru.setpoint_before, ru.setpoint_after FROM reactive r "
+        "SELECT r.kind, ru.setpoint_before, ru.setpoint_after FROM reactive r "
         "JOIN reactive_unit ru ON ru.reactive_id = r.id "
         "WHERE r.room_id='main_room' ORDER BY r.id").fetchall()
-    assert len(rows) == 2, [tuple(r) for r in rows]   # the earlier reaction + this window
-    assert tuple(rows[-1]) == (22.0, 25.0), tuple(rows[-1])
-    print("reactive: 22->23->24->25 in one window recorded once as before 22, after 25 - OK")
+    assert len(rows) == 2, [tuple(r) for r in rows]   # the earlier vote + this window
+    assert tuple(rows[-1]) == ("on", 22.0, 25.0), tuple(rows[-1])
+    print("reactive: on at 23, off, on at 25 in one window recorded once as an `on`, before "
+          "22, after 25 - OK")
 
     # --- phase 2: on / off / manual reactions ---
     lounge = "climate.lounge_lounge"
@@ -347,20 +386,22 @@ async def main() -> int:
         _state_changed(lounge, 22.0, 22.0, state="cool", new_state="off"),
         _state_changed(lounge, 22.0, 22.0, state="off", new_state="cool")])
     assert toggle[:4] == ("manual", "manual", 1, 1), toggle
-    back = await window([_state_changed(lounge, 22.0, 23.0), _state_changed(lounge, 23.0, 22.0)])
-    assert back == ("setpoint", "setpoint", 1, 1, 22.0, 22.0, 1), back
     print("reactive: off->on->off->on in one window is one `on` (first off, last on); "
-          "on->off->on is one `manual` (power unchanged); 22->23->22 is one `setpoint` - OK")
+          "on->off->on is one `manual` (power unchanged) - OK")
 
     comfort_before = len(replays(store, "main_room", "comfort window"))
-    on_set = await window([
-        _state_changed(lounge, 22.0, 22.0, state="off", new_state="cool"),
-        _state_changed(lounge, 22.0, 24.0)])
+    on_set = await window([_state_changed(lounge, 22.0, 24.0, state="off", new_state="cool")])
     assert on_set == ("on", "on", 0, 1, 22.0, 24.0, 1), on_set
     await eventually(lambda: len(replays(store, "main_room", "comfort window")) > comfort_before,
                      "the comfort replay an on-with-setpoint schedules")
-    print("reactive: on then a setpoint change in one window is one `on` reaction, "
-          "setpoint-moving (22 -> 24, comfort replay scheduled) - OK")
+    on_then_vote = await window([
+        _state_changed(lounge, 22.0, 22.0, state="off", new_state="cool"),
+        _state_changed(lounge, 22.0, 24.0),                         # a vote: HA's to record
+        _state_changed(lounge, 24.0, 24.0, fan="low", new_fan="high")])
+    assert on_then_vote == ("on", "on", 0, 1, 22.0, 22.0, 0), on_then_vote
+    print("reactive: turned on at a new setpoint (one change) is one `on` reaction, "
+          "setpoint-moving (22 -> 24, comfort replay scheduled); an on and then a setpoint "
+          "change in one window is an `on` that leaves the vote's setpoint to HA's event - OK")
 
     fan = await window([_state_changed(lounge, 22.0, 22.0, fan="low", new_fan="medium")])
     assert fan == ("manual", "manual", 1, 1, 22.0, 22.0, 0), fan
@@ -405,17 +446,74 @@ async def main() -> int:
     assert n_reactions("main_bedroom") == count
     print("reactive: a late echo of our own rest (off) and cool (cool at base + offset) is "
           "not a reaction - OK")
-    # ...but a person's setpoint change while the unit rests is (decision 50)
+    # ...while a person's setpoint change, resting or away from our command,
+    # is a vote: HA's event records it, not a window of the runtime's own
     rt._cache[f"input_select.ac_state_{bed_helper}"] = "rest"
-    resting = await window([_state_changed(bedroom, 22.0, 24.0, state="off", new_state="off")],
-                           "main_bedroom")
-    assert resting == ("setpoint", "setpoint", 0, 0, 22.0, 24.0, 1), resting
-    # ...and so is a setpoint a person picks away from our command
+    rt._on_state_change(_state_changed(bedroom, 22.0, 24.0, state="off", new_state="off"))
     rt._cache[f"input_select.ac_state_{bed_helper}"] = "cool"
-    away = await window([_state_changed(bedroom, 25.0, 23.0)], "main_bedroom")
-    assert away == ("setpoint", "setpoint", 1, 1, 25.0, 23.0, 1), away
-    print("reactive: a setpoint change while resting, and one away from our command, are "
-          "a person's - OK")
+    rt._on_state_change(_state_changed(bedroom, 25.0, 23.0))
+    assert not rt.rooms["main_bedroom"].reactive_units
+    await asyncio.sleep(1.5)
+    assert n_reactions("main_bedroom") == count
+    print("reactive: a setpoint change while resting, or away from our command, opens no "
+          "window: it is a vote, which HA's event reports - OK")
+
+    # --- a person's vote from a button: HA alone judges the episode ---
+    forced = f"input_boolean.ac_forced_{bed_helper}"
+    state = f"input_select.ac_state_{bed_helper}"
+    vote_cb = ws.subscribed["ac_person_vote"]
+
+    def ignored(room_id: str) -> list:
+        return [e for e in store.recent_events(limit=1000, room_id=room_id, category="reactive")
+                if (e.get("detail") or {}).get("ignored")]
+    rt._cache[forced], rt._cache[state] = "off", "cool"     # the cache shows no forced state
+    count, n_ignored = n_reactions("main_bedroom"), len(ignored("main_bedroom"))
+    n_replays = len(replays(store, "main_bedroom", "vote"))
+    almanac_before = store.current_almanac("main_bedroom", as_of=rt._today())
+    vote_cb(vote_event("main_bedroom", "too_hot", accepted=False))
+    await eventually(lambda: len(ignored("main_bedroom")) == n_ignored + 1, "the ignored press")
+    await asyncio.sleep(0.3)
+    assert n_reactions("main_bedroom") == count
+    assert len(replays(store, "main_bedroom", "vote")) == n_replays
+    assert store.current_almanac("main_bedroom", as_of=rt._today()) == almanac_before
+    msg = ignored("main_bedroom")[0]["message"]
+    assert "ignored press: too_hot from the button" in msg, msg
+    print("vote: HA says ignored while the runtime's cache shows no forced state - an "
+          "\"ignored press\" is logged, and nothing is recorded, replayed or learned - OK")
+
+    rt._cache[forced], rt._cache[state] = "on", "rest"      # the cache shows an episode
+    vote_cb(vote_event("main_bedroom", "too_cold", accepted=True))
+    await eventually(lambda: n_reactions("main_bedroom") == count + 1, "the accepted vote")
+    await eventually(lambda: len(replays(store, "main_bedroom", "vote")) == n_replays + 1,
+                     "the vote's replay")
+    kind, units, sensors = c.execute(
+        "SELECT r.kind, (SELECT COUNT(*) FROM reactive_unit WHERE reactive_id = r.id), "
+        "(SELECT COUNT(*) FROM reactive_sensor WHERE reactive_id = r.id) FROM reactive r "
+        "WHERE r.room_id = 'main_bedroom' ORDER BY r.id DESC LIMIT 1").fetchone()
+    assert (kind, units, sensors) == ("too_cold", 0, 2), (kind, units, sensors)
+    print("vote: HA says accepted while the cache shows a forced rest - recorded (a "
+          "too_cold reaction, no unit rows, both sensors snapshotted) and replayed at once; "
+          "the runtime doesn't judge - OK")
+
+    await asyncio.sleep(1.05)                    # reactions are unique per room and second
+    vote_cb(vote_event("main_bedroom", "too_cold", accepted="True"))     # a string flag
+    await eventually(lambda: n_reactions("main_bedroom") == count + 2, "a string 'True'")
+    warnings = len(store.recent_events(category="reactive", severity="warning"))
+    vote_cb(vote_event("no_such_room", "too_cold"))
+    vote_cb(vote_event("main_bedroom", "sideways"))
+    await eventually(lambda: len(store.recent_events(category="reactive", severity="warning"))
+                     == warnings + 2, "the two warnings")
+    assert n_reactions("main_bedroom") == count + 2
+    count = n_reactions("main_bedroom")
+    rt._on_state_change({"event_type": "state_changed", "context": {"parent_id": None},
+                         "data": {"entity_id": "input_button.ac_too_cold_main_bedroom",
+                                  "old_state": {"state": "2026-08-01T09:00:00+00:00"},
+                                  "new_state": {"state": "2026-08-01T10:00:00+00:00"}}})
+    await asyncio.sleep(1.5)
+    assert n_reactions("main_bedroom") == count
+    print("vote: an accepted flag sent as a string still counts; an unknown room or "
+          "direction is a warning, not a reaction; the button's own state change is not a "
+          "reaction (only HA's event is) - OK")
 
     # --- section runs: a sleep run crossing midnight, with a restart inside it ---
     from datetime import datetime as dt
@@ -611,12 +709,17 @@ async def check_stale_sensor() -> None:
     await rt.start()
     await beat(rt)
     assert readings() == [None, None, None] and stale_events() == [("warning", True)]
-    rt._on_state_change(_state_changed("climate.lounge_lounge", 22.0, 23.0))
-    await rt._flush_reactive(rt.rooms["main_room"])
-    snap = dict(store._conn.execute(
-        "SELECT rs.sensor_id, rs.temperature FROM reactive_sensor rs JOIN reactive r "
-        "ON r.id = rs.reactive_id WHERE r.room_id = 'main_room'").fetchall())
-    assert snap == {"living1": None, "living2": 24.5, "living3": 25.0}, snap
+    await rt._record_vote(vote_event("main_room", "too_cold"))         # a vote's snapshot
+    clock["t"] += timedelta(seconds=5)
+    rt._on_state_change(_state_changed("climate.lounge_lounge", 22.0, 22.0, state="cool",
+                                       new_state="off"))
+    await rt._flush_reactive(rt.rooms["main_room"])                      # a window's
+    snaps = [(kind, dict(store._conn.execute(
+        "SELECT rs.sensor_id, rs.temperature FROM reactive_sensor rs WHERE rs.reactive_id = ?",
+        (rid,)).fetchall())) for rid, kind in store._conn.execute(
+        "SELECT id, kind FROM reactive WHERE room_id = 'main_room' ORDER BY id")]
+    want = {"living1": None, "living2": 24.5, "living3": 25.0}
+    assert snaps == [("too_cold", want), ("off", want)], snaps
 
     wall["last_reported"] = (clock["t"] + timedelta(minutes=10)).isoformat()   # back again
     await beat(rt)
@@ -625,7 +728,8 @@ async def check_stale_sensor() -> None:
     await rt.stop()
     store.close()
     print("stale sensor: last reported 3 days ago but still showing 24.0, it heartbeats as "
-          "unavailable and is left out of the reaction snapshot; one warning when it went "
+          "unavailable and is left out of a vote's and a window's reaction snapshot; one "
+          "warning when it went "
           "stale, none repeated after a restart, one event when it reported again - OK")
 
 

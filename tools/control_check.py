@@ -5,10 +5,13 @@ A data-driven scenario table for app.control, the cool-or-rest state
 machine, in plain JSON-compatible values: times are seconds from T0,
 readings are named sets (or dicts) against an almanac-shaped section,
 expectations are partial unit records and exact commands. Steps are votes,
-a heartbeat (step), a section change, a person's change of a given kind,
-or one climate state change (before and after, as HA's manual-change
-automation sees it). tools/control_logic_check.py imports SCENARIOS and
-replays the same table through the generated automations.
+a heartbeat (step), a section change, a person's change of a given kind
+(on, off, manual), a press of the room's too_cold or too_hot button, or one
+climate state change (before and after, as HA's manual-change automation
+sees it; a setpoint change is a vote). A scenario's room has the unit `u`
+and, where it is about the whole room, peers: every step runs on all of
+them. tools/control_logic_check.py imports SCENARIOS and replays the same
+table through the generated automations.
 
 After the table passes, each rule is removed in turn (MUTANTS) and the
 scenarios that guard it must fail - proof the table actually pins every
@@ -19,6 +22,7 @@ rule rather than passing by accident.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -60,10 +64,13 @@ CTX_DEFAULTS = {"setpoint_applied": 22.0, "unit_min": 16.0, "unit_max": 30.0,
                 "forced_off": False, "sensor_stale_minutes": 90}
 DAYS_3 = 3 * 24 * 60 * 60       # a sensor put away three days ago
 BABY = {"unit_min": 18.0}
+MAIN = "u"                      # the scenario's unit; peers are the room's others
 
 
-def s(name: str, steps: list, unit: dict | None = None, ctx: dict | None = None) -> dict:
-    return {"name": name, "unit": unit or {}, "ctx": ctx or {}, "steps": steps}
+def s(name: str, steps: list, unit: dict | None = None, ctx: dict | None = None,
+      peers: dict | None = None) -> dict:
+    return {"name": name, "unit": unit or {}, "ctx": ctx or {}, "peers": peers or {},
+            "steps": steps}
 
 
 def step(readings, expect_unit: dict, command, at: int = 0, **extra) -> dict:
@@ -80,17 +87,36 @@ def section(expect_unit: dict, command, at: int = 0, **extra) -> dict:
             "expect": {"unit": expect_unit, "command": command}, **extra}
 
 
-def person(kind: str, expect_unit: dict, setpoint=None, power_after: bool = True,
-           at: int = 0) -> dict:
+def person(kind: str, expect_unit: dict, setpoint=None, at: int = 0) -> dict:
+    """A person turning the unit on or off (setpoint: what it shows after),
+    or changing its mode (manual)."""
     return {"do": "person", "at": at, "kind": kind, "setpoint": setpoint,
-            "power_after": power_after, "expect": {"unit": expect_unit}}
-
-
-def change(before: tuple, after: tuple, expect_unit: dict, at: int = 0) -> dict:
-    """One climate state change, (mode, setpoint, fan) before and after, as
-    the manual-change automation sees it."""
-    return {"do": "change", "at": at, "before": climate(*before), "after": climate(*after),
             "expect": {"unit": expect_unit}}
+
+
+_ROOM = ("peers", "peer_commands")
+
+
+def press(direction: str, expect_unit: dict, command, accepted: bool = True, at: int = 0,
+          **room) -> dict:
+    """A press of the room's too_cold or too_hot button; accepted or
+    ignored (an episode is running). room: peers / peer_commands."""
+    assert set(room) <= set(_ROOM), room
+    return {"do": "press", "at": at, "direction": direction,
+            "expect": {"unit": expect_unit, "command": command, "accepted": accepted, **room}}
+
+
+def change(before: tuple, after: tuple, expect_unit: dict, at: int = 0, **expect) -> dict:
+    """One climate state change, (mode, setpoint, fan) before and after, as
+    the manual-change automation sees it. expect: command, vote ({direction,
+    accepted}, or None for no vote), peers, peer_commands."""
+    assert set(expect) <= {"command", "vote", *_ROOM}, expect
+    return {"do": "change", "at": at, "before": climate(*before), "after": climate(*after),
+            "expect": {"unit": expect_unit, **expect}}
+
+
+def vote(direction: str, accepted: bool = True) -> dict:
+    return {"direction": direction, "accepted": accepted}
 
 
 def climate(mode: str, temperature: float | None = None, fan: str | None = None) -> dict:
@@ -222,10 +248,10 @@ SCENARIOS = [
 
     # --- a person's grace ----------------------------------------------------
     s("grace holds cool against a cold vote, then lets it rest", [
-        person("setpoint", {"state": "cool", "base": 24.0, "grace_until": m(30)}, setpoint=24.0),
+        person("on", {"state": "cool", "base": 24.0, "grace_until": m(30)}, setpoint=24.0),
         step("cold", {"state": "cool"}, None, at=m(20)),
         step("cold", {"state": "rest"}, OFF, at=m(31))],
-      unit={"since": -m(10)}),
+      unit={"state": "user_off", "since": -m(10)}),
 
     # --- leak ----------------------------------------------------------------
     s("leak overrides the minimum time and grace", [
@@ -299,39 +325,166 @@ SCENARIOS = [
       ctx={**BABY, "setpoint_applied": 17.0}),
 
     # --- a person's change ----------------------------------------------------------
-    s("person setpoint: cool at the new base, with grace", [
-        person("setpoint", {"state": "cool", "base": 24.0, "offset": 0, "since": 0,
-                            "grace_until": m(30)}, setpoint=24.0)],
-      unit={"state": "boost", "offset": -1, "since": -m(10)}),
-    s("person off: user_off", [person("off", {"state": "user_off", "since": 0},
-                                      power_after=False)]),
+    s("person off: user_off", [person("off", {"state": "user_off", "since": 0})]),
     s("person on: cool, unblocked, with grace", [
         person("on", {"state": "cool", "base": 23.0, "offset": 0, "unblocked": True,
                       "grace_until": m(30)}, setpoint=23.0)],
       unit={"state": "rest", "offset": 2}),
     s("person manual: manual", [person("manual", {"state": "manual"})]),
     s("a latched leak ignores people", [
-        person("setpoint", {"state": "leak"}, setpoint=25.0),
-        person("off", {"state": "leak"}, power_after=False),
+        change(("off", 22.0, "low"), ("off", 25.0, "low"), {"state": "leak", "base": None},
+               command=None, vote=vote("too_cold")),
+        person("off", {"state": "leak"}),
         person("on", {"state": "leak", "unblocked": False}, setpoint=25.0),
         person("manual", {"state": "leak"})],
-      unit={"state": "leak", "since": -m(5)}),
-    s("setpoint change while resting stays rest, and wakes later at the new base", [
-        person("setpoint", {"state": "rest", "base": 24.0, "offset": 0, "grace_until": None,
-                            "since": -m(20)}, setpoint=24.0, power_after=False),
-        step("settled_warm", {"state": "cool", "offset": 1}, cmd("cool", "low", 25.0), at=m(1))],
-      unit={"state": "rest", "offset": -1, "since": -m(20)}),
-    s("setpoint change while user_off stays user_off", [
-        person("setpoint", {"state": "user_off", "base": 20.0, "offset": 0, "grace_until": None},
-               setpoint=20.0, power_after=False)],
-      unit={"state": "user_off", "offset": 1}),
-    s("setpoint change in manual stays manual, with no grace", [
-        person("setpoint", {"state": "manual", "base": 25.0, "offset": 0, "grace_until": None,
-                            "since": -m(15)}, setpoint=25.0),
-        person("knob_turn", {"state": "manual", "base": 26.0, "grace_until": None},
-               setpoint=26.0, at=m(1)),
-        step("cold", {"state": "manual"}, None, at=m(2))],
-      unit={"state": "manual", "offset": 2, "since": -m(15)}),
+      unit={"state": "leak", "since": -m(5)}, ctx={"leak_on": True}),
+
+    # --- a person's vote: the too_cold / too_hot buttons -----------------------------
+    s("too_cold while cooling: a forced rest, then cool at base+1 with no extra offset", [
+        press("too_cold", {"state": "rest", "base": 23.0, "offset": 0, "forced": True,
+                           "since": 0, "grace_until": None}, OFF),
+        step("settled_warm", {"state": "rest", "forced": True}, None, at=m(10)),
+        step("cold", {"state": "rest", "forced": True}, None, at=m(20)),
+        step("settled_warm", {"state": "cool", "base": 23.0, "offset": 0, "forced": False,
+                              "since": m(30)}, cmd("cool", "low", 23.0), at=m(30))],
+      unit={"since": -m(60)}),
+    s("too_hot while cooling: a forced boost, then back at comfort to cool at base-1", [
+        press("too_hot", {"state": "boost", "base": 21.0, "offset": 0, "forced": True,
+                          "since": 0}, cmd("cool", "medium", 19.0)),
+        step("hot", {"state": "boost", "forced": True}, None, at=m(10)),
+        step("settled_cool", {"state": "cool", "base": 21.0, "offset": 0, "forced": False},
+             cmd("cool", "low", 21.0), at=m(20))],
+      unit={"since": -m(60)}),
+    s("too_hot: the boost cap releases a forced boost to cool at base-1", [
+        press("too_hot", {"state": "boost", "base": 21.0}, cmd("cool", "medium", 19.0)),
+        step("hot", {"state": "cool", "base": 21.0, "offset": 0, "forced": False},
+             cmd("cool", "low", 21.0), at=m(60))],
+      unit={"since": -m(60)}),
+    s("too_hot from user_off: a forced boost", [
+        press("too_hot", {"state": "boost", "base": 21.0, "offset": 0, "forced": True,
+                          "since": 0}, cmd("cool", "medium", 19.0))],
+      unit={"state": "user_off", "offset": 1, "since": -m(30)}),
+    s("too_hot from a system rest: a forced boost, ahead of the rest's minimum time", [
+        press("too_hot", {"state": "boost", "base": 21.0, "offset": 0, "forced": True,
+                          "since": 0}, cmd("cool", "medium", 19.0))],
+      unit={"state": "rest", "offset": 1, "since": -m(5)}),
+    s("too_hot during a system boost: base-1, and the boost keeps its since", [
+        press("too_hot", {"state": "boost", "base": 21.0, "offset": 0, "forced": True,
+                          "since": -m(20)}, cmd("cool", "medium", 19.0)),
+        step("hot", {"state": "cool", "base": 21.0, "offset": 0}, cmd("cool", "low", 21.0),
+             at=m(40))],
+      unit={"state": "boost", "offset": -1, "since": -m(20)}),
+    s("too_cold during a system rest: base+1, still resting, since kept, nothing sent", [
+        press("too_cold", {"state": "rest", "base": 23.0, "offset": 0, "forced": True,
+                           "since": -m(5)}, None),
+        step("settled_warm", {"state": "cool", "base": 23.0, "offset": 0},
+             cmd("cool", "low", 23.0), at=m(10))],
+      unit={"state": "rest", "offset": -1, "since": -m(5)}),
+    s("too_cold in user_off: base+1, the unit stays off, and no episode starts", [
+        press("too_cold", {"state": "user_off", "base": 23.0, "offset": 0, "forced": False,
+                           "since": -m(30)}, None),
+        press("too_cold", {"state": "user_off", "base": 24.0}, None, at=m(1))],
+      unit={"state": "user_off", "since": -m(30)}),
+    s("one correction per episode: a second press of either button is ignored; "
+      "one after the release counts", [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        press("too_hot", {"state": "rest", "base": 23.0, "forced": True, "since": 0}, None,
+              accepted=False, at=m(2)),
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, None,
+              accepted=False, at=m(3)),
+        step("settled_warm", {"state": "cool", "base": 23.0, "offset": 0, "forced": False},
+             cmd("cool", "low", 23.0), at=m(20)),
+        press("too_cold", {"state": "rest", "base": 24.0, "forced": True, "since": m(25)}, OFF,
+              at=m(25))],
+      unit={"since": -m(60)}),
+    s("a forced state on another unit holds the whole room's episode", [
+        press("too_hot", {"state": "cool", "base": None, "forced": False}, None, accepted=False,
+              peers={"v": {"state": "rest", "base": 23.0, "forced": True}},
+              peer_commands={"v": None})],
+      unit={"since": -m(60)}, peers={"v": {"state": "rest", "base": 23.0, "forced": True,
+                                           "since": -m(5)}}),
+    s("a vote moves every unit in the room", [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF,
+              peers={"v": {"state": "rest", "base": 23.0, "offset": 0, "forced": True,
+                           "since": 0}},
+              peer_commands={"v": OFF})],
+      unit={"since": -m(60)}, peers={"v": {"state": "boost", "offset": -1, "since": -m(10)}}),
+    s("presses with the unit in leak are taken but leave it alone", [
+        press("too_cold", {"state": "leak", "base": None, "forced": False}, None),
+        press("too_hot", {"state": "leak", "base": None, "forced": False}, None, at=m(1))],
+      unit={"state": "leak", "since": -m(5)}, ctx={"leak_on": True}),
+    s("leak beats a vote: a latched unit not yet in leak is left alone", [
+        press("too_hot", {"state": "cool", "base": None, "forced": False}, None)],
+      unit={"since": -m(60)}, ctx={"leak_on": True}),
+    s("a press with the unit in config_off is taken but leaves it alone", [
+        press("too_hot", {"state": "config_off", "base": None, "forced": False}, None)],
+      unit={"state": "config_off", "since": -m(5)}),
+    s("a press with the unit in manual is taken but leaves it alone", [
+        press("too_cold", {"state": "manual", "base": None, "forced": False}, None)],
+      unit={"state": "manual", "since": -m(5)}),
+    s("a section change during a forced state ends it, and the next press counts", [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        section({"state": "cool", "base": 22.0, "offset": 0, "forced": False},
+                cmd("cool", "low", 22.0), at=m(5)),
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF, at=m(6))],
+      unit={"since": -m(60)}),
+    s("a person's on ends a forced rest, and the next press counts", [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        person("on", {"state": "cool", "base": 24.0, "forced": False, "unblocked": True,
+                      "grace_until": m(32)}, setpoint=24.0, at=m(2)),
+        press("too_hot", {"state": "boost", "base": 23.0, "forced": True, "grace_until": None},
+              cmd("cool", "medium", 21.0), at=m(3))],
+      unit={"since": -m(60)}),
+    s("a vote's base is clamped to the unit's range (bottom)", [
+        press("too_hot", {"state": "boost", "base": 18.0}, cmd("cool", "medium", 18.0))],
+      unit={"base": 18.5, "since": -m(60)}, ctx=BABY),
+    s("a vote's base is clamped to the unit's range (top)", [
+        press("too_cold", {"state": "rest", "base": 30.0}, OFF)],
+      unit={"base": 29.5, "since": -m(60)}, ctx=BABY),
+    s("no base and no almanac: a press is taken but leaves the unit alone", [
+        press("too_cold", {"state": "cool", "base": None, "forced": False}, None)],
+      unit={"since": -m(60)}, ctx={"setpoint_applied": None}),
+    s("a leftover marker on a cooling unit doesn't hold an episode", [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF)],
+      unit={"since": -m(60), "forced": True}),
+
+    # --- the remote: a setpoint change is a vote ------------------------------------
+    s("a remote setpoint up is too_cold, with the chosen value as the base", [
+        change(("cool", 22.0, "low"), ("cool", 25.0, "low"),
+               {"state": "rest", "base": 25.0, "offset": 0, "forced": True, "since": 0},
+               command=OFF, vote=vote("too_cold")),
+        step("settled_warm", {"state": "cool", "base": 25.0, "offset": 0},
+             cmd("cool", "low", 25.0), at=m(20))],
+      unit={"since": -m(60)}),
+    s("a remote setpoint down is too_hot, with the chosen value as the base", [
+        change(("cool", 22.0, "low"), ("cool", 20.0, "low"),
+               {"state": "boost", "base": 20.0, "offset": 0, "forced": True},
+               command=cmd("cool", "medium", 18.0), vote=vote("too_hot"))],
+      unit={"since": -m(60)}),
+    s("a remote setpoint change during a forced state is ignored", [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        change(("off", 22.0, "low"), ("off", 25.0, "low"),
+               {"state": "rest", "base": 23.0, "forced": True}, at=m(2),
+               command=None, vote=vote("too_cold", accepted=False))],
+      unit={"since": -m(60)}),
+    s("a remote setpoint up while user_off keeps the unit off, at the chosen base", [
+        change(("off", 22.0, "low"), ("off", 24.0, "low"),
+               {"state": "user_off", "base": 24.0, "offset": 0, "forced": False},
+               command=None, vote=vote("too_cold"))],
+      unit={"state": "user_off", "offset": 1, "since": -m(30)}),
+    s("a setpoint change on a unit in manual is a vote for the room's other units", [
+        change(("dry", 22.0, None), ("dry", 24.0, None), {"state": "manual", "base": None},
+               command=None, vote=vote("too_cold"),
+               peers={"v": {"state": "rest", "base": 23.0, "forced": True}},
+               peer_commands={"v": OFF})],
+      unit={"state": "manual", "since": -m(15)}, peers={"v": {"since": -m(60)}}),
+    s("a delayed echo of a forced boost is ours", [
+        press("too_hot", {"state": "boost", "base": 21.0}, cmd("cool", "medium", 19.0)),
+        change(("cool", 22.0, "low"), ("cool", 19.0, "medium"),
+               {"state": "boost", "base": 21.0, "forced": True}, at=m(1), command=None,
+               vote=None)],
+      unit={"since": -m(60)}),
+
     # --- a climate change: our own command showing up late, or a person ---
     s("a delayed echo of our own off command is ignored", [
         change(("cool", 22.0, "low"), ("off", 22.0, "low"),
@@ -351,26 +504,24 @@ SCENARIOS = [
       unit={"state": "leak", "since": -m(1)}, ctx={"leak_on": True}),
     s("a setpoint within reactive_min_delta of our command is ours", [
         change(("cool", 21.0, "low"), ("cool", 22.4, "low"), {"state": "cool", "base": None})]),
-    s("a setpoint change on a resting unit is a person's: rest, and a wake at the new base", [
+    s("a setpoint change on a resting unit is a person's: a forced rest, waking at the new base", [
         change(("off", 22.0, "low"), ("off", 24.0, "low"),
-               {"state": "rest", "base": 24.0, "offset": 0, "since": -m(20),
-                "grace_until": None}),
-        step("settled_warm", {"state": "cool", "offset": 1}, cmd("cool", "low", 25.0), at=m(1))],
+               {"state": "rest", "base": 24.0, "offset": 0, "since": -m(20), "forced": True,
+                "grace_until": None}, command=None, vote=vote("too_cold")),
+        step("settled_warm", {"state": "cool", "offset": 0}, cmd("cool", "low", 24.0), at=m(1))],
       unit={"state": "rest", "offset": -1, "since": -m(20)}),
     s("a person turning a resting unit on is not an echo", [
         change(("off", 22.0, "low"), ("cool", 23.0, "low"),
-               {"state": "cool", "base": 23.0, "unblocked": True, "grace_until": m(30)})],
+               {"state": "cool", "base": 23.0, "unblocked": True, "grace_until": m(30)},
+               command=None, vote=None)],
       unit={"state": "rest"}),
     s("a mode change away from our command is manual", [
-        change(("cool", 22.0, "low"), ("fan_only", 22.0, "low"), {"state": "manual", "since": 0})]),
+        change(("cool", 22.0, "low"), ("fan_only", 22.0, "low"), {"state": "manual", "since": 0},
+               vote=None)]),
     s("in manual, a change of nothing we track does nothing", [
-        change(("dry", 22.0, None), ("dry", 22.2, None), {"state": "manual", "since": -m(10)})],
+        change(("dry", 22.0, None), ("dry", 22.2, None), {"state": "manual", "since": -m(10)},
+               vote=None)],
       unit={"state": "manual", "since": -m(10)}),
-
-    s("a knob turn counts as a setpoint change; a knob press changes nothing", [
-        person("knob_turn", {"state": "cool", "base": 23.0, "grace_until": m(30)}, setpoint=23.0),
-        person("knob_press", {"state": "cool", "base": 23.0}, at=m(5))],
-      unit={"state": "rest"}),
 ]
 
 
@@ -390,13 +541,13 @@ def _unit(d: dict) -> control.Unit:
     return control.Unit(state=d.get("state", "cool"), offset=d.get("offset", 0),
                         base=d.get("base", 0.0), since=_time(d.get("since", -m(60))),
                         grace_until=_time(d.get("grace_until")),
-                        unblocked=d.get("unblocked", False))
+                        unblocked=d.get("unblocked", False), forced=d.get("forced", False))
 
 
 def _view(unit: control.Unit) -> dict:
     return {"state": unit.state, "offset": unit.offset, "base": unit.base or None,
             "since": _secs(unit.since), "grace_until": _secs(unit.grace_until),
-            "unblocked": unit.unblocked}
+            "unblocked": unit.unblocked, "forced": unit.forced}
 
 
 def _ctx(*layers: dict) -> control.Context:
@@ -406,6 +557,19 @@ def _ctx(*layers: dict) -> control.Context:
         config.update(layer.pop("control", {}))
         merged.update(layer)
     return control.Context(config=control.ControlConfig(**config), **merged)
+
+
+def _room(scenario: dict) -> dict[str, control.Unit]:
+    """The scenario's units: `u`, then its peers."""
+    return {MAIN: _unit(scenario["unit"]),
+            **{pid: _unit(d) for pid, d in scenario.get("peers", {}).items()}}
+
+
+def _ctxs(ctx: control.Context, uids) -> dict[str, control.Context]:
+    """Each unit's context: the scenario's for `u`; peers have no leak latch
+    and no forced-off section."""
+    peer = dataclasses.replace(ctx, leak_on=False, forced_off=False)
+    return {uid: ctx if uid == MAIN else peer for uid in uids}
 
 
 def _votes(st: dict, now: datetime = T0,
@@ -418,10 +582,69 @@ def _votes(st: dict, now: datetime = T0,
                                   *st.get("edges", (-1.0, 1.0)))
 
 
+def apply(st: dict, units: dict[str, control.Unit], now: datetime, ctx: control.Context
+          ) -> tuple[dict[str, control.Unit], dict[str, control.Command | None] | None,
+                     control.PersonVote | None]:
+    """One step on the room through app.control: the units after it, each
+    unit's command (None for a person's on/off/manual, which sends
+    nothing), and the vote, if the step was one."""
+    ctxs = _ctxs(ctx, units)
+    do, results, pv = st["do"], None, None
+    if do == "step":
+        v = _votes(st, now, ctx.sensor_stale_minutes)
+        results = {uid: control.step(u, v, now, ctxs[uid]) for uid, u in units.items()}
+    elif do == "section_change":
+        forced = st.get("forced_off", ctx.forced_off)
+        results = {uid: control.on_section_change(u, ctxs[uid], forced and uid == MAIN, now)
+                   for uid, u in units.items()}
+    elif do == "person":
+        new = control.on_person_change(st["kind"], units[MAIN], st.get("setpoint"), now, ctx)
+        return {**units, MAIN: new}, None, None
+    elif do == "press":
+        results, pv = control.on_button(st["direction"], units, now, ctxs)
+    elif do == "change":
+        results, pv = control.on_climate_change(units, MAIN, control.Climate(**st["before"]),
+                                                control.Climate(**st["after"]), now, ctxs)
+    else:
+        raise AssertionError(do)
+    return ({uid: r[0] for uid, r in results.items()},
+            {uid: r[1] for uid, r in results.items()}, pv)
+
+
+def _command(command: control.Command | None) -> dict | None:
+    return None if command is None else command.__dict__
+
+
+def compare(expect: dict, units: dict[str, control.Unit], commands: dict | None,
+            pv: control.PersonVote | None, view=_view) -> str | None:
+    """A step's expectations against the room after it: the unit's fields
+    and command, the peers', and the vote (accepted, or for a climate
+    change its direction and acceptance, or None for none)."""
+    checks = [("unit", MAIN, expect["unit"])] + [
+        ("peer " + pid, pid, want) for pid, want in expect.get("peers", {}).items()]
+    for what, uid, want in checks:
+        got = {k: view(units[uid])[k] for k in want}
+        if got != want:
+            return f"{what} {got}, expected {want}"
+    wanted_cmds = ([(MAIN, expect["command"])] if "command" in expect else []) + list(
+        expect.get("peer_commands", {}).items())
+    for uid, want in wanted_cmds:
+        got = _command((commands or {}).get(uid))
+        if got != want:
+            return f"{uid} command {got}, expected {want}"
+    if "accepted" in expect and (pv is None or pv.accepted != expect["accepted"]):
+        return f"vote {pv}, expected accepted={expect['accepted']}"
+    if "vote" in expect:
+        got = None if pv is None else {"direction": pv.direction, "accepted": pv.accepted}
+        if got != expect["vote"]:
+            return f"vote {got}, expected {expect['vote']}"
+    return None
+
+
 def run(scenario: dict) -> list[str]:
     """The scenario's failures (empty when it passes)."""
     try:
-        unit = _unit(scenario["unit"])
+        units = _room(scenario)
         for i, st in enumerate(scenario["steps"], 1):
             now, ctx, expect = _time(st.get("at", 0)), _ctx(scenario["ctx"], st.get("ctx")), st["expect"]
             if st["do"] == "votes":
@@ -430,27 +653,10 @@ def run(scenario: dict) -> list[str]:
                 if got != expect:
                     return [f"step {i}: votes {got}, expected {expect}"]
                 continue
-            command = "n/a"
-            if st["do"] == "step":
-                unit, command = control.step(unit, _votes(st, now, ctx.sensor_stale_minutes),
-                                             now, ctx)
-            elif st["do"] == "section_change":
-                unit, command = control.on_section_change(
-                    unit, ctx, st.get("forced_off", ctx.forced_off), now)
-            elif st["do"] == "person":
-                unit = control.on_person_change(st["kind"], unit, st.get("setpoint"),
-                                                st.get("power_after", True), now, ctx)
-            elif st["do"] == "change":
-                unit = control.on_climate_change(unit, control.Climate(**st["before"]),
-                                                 control.Climate(**st["after"]), now, ctx)
-            view = _view(unit)
-            got = {k: view[k] for k in expect["unit"]}
-            if got != expect["unit"]:
-                return [f"step {i}: unit {got}, expected {expect['unit']}"]
-            if "command" in expect:
-                got_cmd = None if command is None else command.__dict__
-                if got_cmd != expect["command"]:
-                    return [f"step {i}: command {got_cmd}, expected {expect['command']}"]
+            units, commands, pv = apply(st, units, now, ctx)
+            why = compare(expect, units, commands, pv)
+            if why:
+                return [f"step {i}: {why}"]
     except Exception as e:                       # a broken rule may crash: that's a failure too
         return [f"raised {type(e).__name__}: {e}"]
     return []
@@ -459,6 +665,11 @@ def run(scenario: dict) -> list[str]:
 # ---------------------------------------------------------------------
 # Rules removed one at a time: the named scenarios must then fail
 # ---------------------------------------------------------------------
+
+_VOTE_BASE = control.vote_base
+_SECTION_CHANGE = control.on_section_change
+_PERSON_CHANGE = control.on_person_change
+
 
 def _mutants() -> list[tuple[str, dict, list[str]]]:
     c = control
@@ -517,22 +728,59 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
         ("release counts against at least one",
          {"released": lambda side_count, required: side_count < required},
          ["no usable sensor: a rest wakes", "no usable sensor: a boost releases"]),
-        ("a setpoint change while off keeps the state",
-         {"_kept_off": lambda power_after: False},
-         ["setpoint change while resting stays rest, and wakes later at the new base",
-          "setpoint change while user_off stays user_off"]),
-        ("a setpoint change in manual keeps manual",
-         {"_kept_manual": lambda state: False},
-         ["setpoint change in manual stays manual, with no grace"]),
+        ("one correction per episode", {"in_episode": lambda units: False},
+         ["one correction per episode: a second press of either button is ignored; "
+          "one after the release counts",
+          "a forced state on another unit holds the whole room's episode",
+          "a remote setpoint change during a forced state is ignored"]),
+        ("an episode is a forced rest or boost, not a leftover marker",
+         {"forced_now": lambda unit: unit.forced},
+         ["a leftover marker on a cooling unit doesn't hold an episode"]),
+        ("a forced state releases to cool at its base",
+         {"release_offset": lambda unit, change: unit.offset + change},
+         ["too_cold while cooling: a forced rest, then cool at base+1 with no extra offset",
+          "too_hot while cooling: a forced boost, then back at comfort to cool at base-1",
+          "too_hot: the boost cap releases a forced boost to cool at base-1",
+          "too_cold during a system rest: base+1, still resting, since kept, nothing sent",
+          "a remote setpoint up is too_cold, with the chosen value as the base"]),
+        ("a vote leaves leak, config_off and manual alone",
+         {"_votes_alone": lambda unit, ctx: False},
+         ["presses with the unit in leak are taken but leave it alone",
+          "leak beats a vote: a latched unit not yet in leak is left alone",
+          "a press with the unit in config_off is taken but leaves it alone",
+          "a press with the unit in manual is taken but leaves it alone",
+          "a setpoint change on a unit in manual is a vote for the room's other units",
+          "a latched leak ignores people"]),
+        ("a unit already in the forced state keeps its since",
+         {"_keeps_since": lambda unit, state: False},
+         ["too_hot during a system boost: base-1, and the boost keeps its since",
+          "too_cold during a system rest: base+1, still resting, since kept, nothing sent"]),
+        ("the remote's chosen value as the base",
+         {"vote_base": lambda direction, unit, ctx, chosen=None:
+          _VOTE_BASE(direction, unit, ctx)},
+         ["a remote setpoint up is too_cold, with the chosen value as the base",
+          "a remote setpoint down is too_hot, with the chosen value as the base",
+          "a remote setpoint up while user_off keeps the unit off, at the chosen base"]),
+        ("a section change ends a forced state",
+         {"on_section_change": lambda unit, ctx, forced_off, now: (lambda r: (
+             dataclasses.replace(r[0], forced=unit.forced), r[1]))(
+                 _SECTION_CHANGE(unit, ctx, forced_off, now))},
+         ["a section change during a forced state ends it, and the next press counts"]),
+        ("a person's on, off or manual ends a forced state",
+         {"on_person_change": lambda kind, unit, new_setpoint, now, ctx: dataclasses.replace(
+             _PERSON_CHANGE(kind, unit, new_setpoint, now, ctx), forced=unit.forced)},
+         ["a person's on ends a forced rest, and the next press counts"]),
         ("the is-this-ours check",
          {"matches_command": lambda command, before, after, min_delta: False},
          ["a delayed echo of our own off command is ignored",
           "a delayed echo of our own cool command is ignored",
           "a delayed echo of our own boost command is ignored",
-          "a setpoint within reactive_min_delta of our command is ours"]),
+          "a setpoint within reactive_min_delta of our command is ours",
+          "a delayed echo of a forced boost is ours"]),
         ("an off command's echo keeps the setpoint (just off instead)",
          {"_off_matches": lambda before, after, min_delta: after.mode == "off"},
-         ["a setpoint change on a resting unit is a person's: rest, and a wake at the new base"]),
+         ["a setpoint change on a resting unit is a person's: a forced rest, waking at the "
+          "new base", "a remote setpoint change during a forced state is ignored"]),
         ("stale sensors taken as unavailable",
          {"is_stale": lambda last_reported, now, stale_minutes: False},
          ["votes: a stale sensor has no vote and counts toward no quorum",

@@ -154,8 +154,11 @@ CREATE TABLE reactive (
     window_seconds      INTEGER NOT NULL,
     occupied            INTEGER,
     suspended_maint     INTEGER NOT NULL DEFAULT 0,
-    kind                TEXT                 -- v2: room-level kind, derived from the units' kinds
-                        CHECK (kind IN ('setpoint','on','off','manual','knob_turn','knob_press')
+    kind                TEXT                 -- v2: room-level kind, derived from the units' kinds;
+                                             -- too_cold / too_hot: a person's vote (HA's
+                                             -- ac_person_vote event); knob_* only on older rows
+                        CHECK (kind IN ('setpoint','on','off','manual','knob_turn','knob_press',
+                                        'too_cold','too_hot')
                                OR kind IS NULL),   -- NULL (pre-v2 rows) reads as 'setpoint'
     outdoor_temp        REAL,                -- v2: outdoor value when the person reacted
     UNIQUE (room_id, ts)
@@ -172,8 +175,10 @@ CREATE TABLE reactive_unit (
     setpoint_before     REAL,
     setpoint_after      REAL,
     changed             INTEGER NOT NULL DEFAULT 0,
-    kind                TEXT                 -- v2: this unit's reaction kind
-                        CHECK (kind IN ('setpoint','on','off','manual','knob_turn','knob_press')
+    kind                TEXT                 -- v2: this unit's reaction kind (a remote's vote:
+                                             -- too_cold / too_hot, setpoint_after the value chosen)
+                        CHECK (kind IN ('setpoint','on','off','manual','knob_turn','knob_press',
+                                        'too_cold','too_hot')
                                OR kind IS NULL),
     power_before        INTEGER              -- v2: unit on (1) / off (0) at the window's start
                         CHECK (power_before IN (0,1) OR power_before IS NULL),

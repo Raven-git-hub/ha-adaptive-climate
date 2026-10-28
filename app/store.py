@@ -226,12 +226,23 @@ def _migration_2(conn: sqlite3.Connection, schema: _Schema) -> None:
                              (next_start, run_id))
 
 
+def _migration_3(conn: sqlite3.Connection, schema: _Schema) -> None:
+    """A person's vote: the reaction kinds too_cold and too_hot.
+
+    reactive and reactive_unit are rebuilt with their rows, so their kind
+    checks allow the two new kinds; reactive_sensor keeps its rows, still
+    attached by id."""
+    for name in ("reactive", "reactive_unit"):
+        _rebuild_table(conn, schema, name)
+
+
 # (label for the pre-migration backup file, migration). Migration n takes
 # storage version n-1 to n; the label names the shape it upgrades from.
 # Append only.
 MIGRATIONS: list[tuple[str, Callable[[sqlite3.Connection, _Schema], None]]] = [
     ("v1", _migration_1),
     ("phase0", _migration_2),
+    ("pre-votes", _migration_3),
 ]
 
 def _now_pair() -> tuple[str, str]:

@@ -12,8 +12,9 @@ wired on the baby room:
      the compressor), under the guard, almanac or not
   2. a crossover landing mid-leak re-asserts off instead of cooling, and
      maintenance holds leak without re-sending anything
-  3. a person's change while latched leaves the unit in leak, and the
-     unit's delayed echo of off is not taken for a person at all
+  3. a person's change while latched leaves the unit in leak (a setpoint
+     change is still reported as the room's vote), and the unit's delayed
+     echo of off is not taken for a person at all
   4. release is blocked while the sensor still reads wet, even if confirmed
   5. release once the sensor is dry and the fix confirmed: latch and
      confirmation off, and the unit treated as at a section change (cool,
@@ -33,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import control_check as table                    # noqa: E402
-from control_logic_check import HA, _sent         # noqa: E402
+from control_logic_check import HA, _sent, _trigger, fired   # noqa: E402
 from app import control                           # noqa: E402
 from app import generator as g                    # noqa: E402
 
@@ -51,7 +52,7 @@ def _world(cfg: dict, room: dict, state: str, setpoint_applied: float | None = 2
     for entity_id, value in ((g.guard_id(ROOM), "off"), (g.hold_id(ROOM), "off"),
                              (g.leak_id(ROOM, UNIT), "off"),
                              (g.leak_confirm_id(ROOM, UNIT), "off"), (SENSOR, "off"),
-                             (g.unblocked_id(ROOM, UNIT), "off")):
+                             (g.unblocked_id(ROOM, UNIT), "off"), (g.forced_id(ROOM, UNIT), "off")):
         ha.set(entity_id, value)
     ha.set(g.scene_select_id(ROOM), SECTION, options=list(g.SECTIONS))
     ha.set(g.state_id(ROOM, UNIT), state, options=list(control.STATES))
@@ -116,26 +117,26 @@ def main() -> int:
 
     # 3. people while latched, and the unit's echo of off
     before = ha.climate()
+    ran = []
     for after in (control.Climate("cool", 22.0, "low"),
                   control.Climate("off", 20.0, "low"),
                   control.Climate("dry", 20.0, None)):
-        trig = {"from_state": {"state": before.mode, "attributes": {
-                    "temperature": before.temperature, "fan_mode": before.fan},
-                    "context": {"parent_id": None}},
-                "to_state": {"state": after.mode, "attributes": {
-                    "temperature": after.temperature, "fan_mode": after.fan},
-                    "context": {"parent_id": None}}}
-        ha.run(manual, trig)
+        ha.calls, ha.events = [], []
+        triggers = fired(manual, _trigger(before, after, entity_id=ENTITY))
+        ran.append(sum(ha.run(manual, t) is not None for t in triggers))
         assert ha.states(g.state_id(ROOM, UNIT)) == "leak", after
-    echo = {"from_state": {"state": "cool", "attributes": {"temperature": went_off.temperature,
-                                                           "fan_mode": went_off.fan},
-                           "context": {"parent_id": None}},
-            "to_state": {"state": went_off.mode, "attributes": {
-                "temperature": went_off.temperature, "fan_mode": went_off.fan},
-                "context": {"parent_id": None}}}
-    assert ha.run(manual, echo) is None
-    print("people while latched: on, a new setpoint and dry all leave the unit in leak; "
-          "the unit's delayed echo of off isn't a person - OK")
+        assert _sent(ha.calls) is None, (after, ha.calls)
+        votes = [d for kind, d in ha.events if kind == g.PERSON_VOTE_EVENT]
+        assert votes == ([{"room": ROOM, "direction": "too_hot", "accepted": True,
+                           "source": "remote", "chosen": 20.0, "unit": UNIT}]
+                         if after.mode == "off" else []), votes
+    assert ran == [1, 1, 1], ran        # each change went on once, and changed nothing
+    echo = _trigger(control.Climate("cool", went_off.temperature, went_off.fan), went_off,
+                    entity_id=ENTITY)
+    assert [ha.run(manual, t) for t in fired(manual, echo)] == [None]
+    print("people while latched: on, a new setpoint and dry all leave the unit in leak (the "
+          "setpoint change still reported as the room's vote); the unit's delayed echo of off "
+          "isn't a person - OK")
 
     # 4. confirmed while still wet: release is blocked
     ha.set(g.leak_confirm_id(ROOM, UNIT), "on")

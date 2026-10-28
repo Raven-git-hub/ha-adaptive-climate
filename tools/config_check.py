@@ -68,8 +68,7 @@ def main() -> int:
     assert out["system"]["control"]["boost_max_minutes"] == 45
     assert "max_step_degrees" not in out["system"]
     assert "correction_max_minutes" not in out["system"]
-    assert out["learning"] == {"reaction_rate": 0.5, "recency_half_life_days": 7}, \
-        out["learning"]
+    assert out["learning"] == {"reaction_rate": 0.5}, out["learning"]
     print("migration: max_step_degrees/correction_max_minutes move under system.control "
           "with their values; the four v1 learning keys (window, bootstrap, delay, "
           "reactive_weight) are dropped - OK")
@@ -84,11 +83,33 @@ def main() -> int:
     assert set(out["system"]) == {"control", "sensor_stale_minutes"}, out["system"]
     assert out["system"]["sensor_stale_minutes"] == 90
     assert out["system"]["control"] == V2["system"]["control"]
-    assert set(out["learning"]) == {"reaction_rate", "recency_half_life_days"}
+    assert set(out["learning"]) == {"reaction_rate"}
+    assert out["system"]["control"]["person_step_degrees"] == 1.0
     assert out["outdoor"] == V2["outdoor"]
     assert out["rooms"][0]["scenes"]["sleep"] == {"units": {"main_room_ac": {"mode": "off"}}}, \
         "a v1 default (transition_seconds) was filled in"
     assert all(r["heat_sources"] == [] and r["knobs"] == [] for r in out["rooms"])
+    # --- a v2 config saved before the votes: recency_half_life_days goes ---
+    saved = copy.deepcopy(V2)
+    saved["learning"]["recency_half_life_days"] = 7
+    del saved["system"]["control"]["person_step_degrees"]
+    try:
+        validate(saved)                  # as saved, unmigrated
+    except ConfigError as e:
+        assert "recency_half_life_days" in str(e), e
+    else:
+        raise AssertionError("the schema still takes recency_half_life_days")
+    out = migrate(saved)
+    validate(out)
+    assert out == V2 and saved["learning"]["recency_half_life_days"] == 7, out
+    assert migrate(out) == out
+    custom = copy.deepcopy(saved)
+    custom["system"]["control"]["person_step_degrees"] = 0.5
+    assert migrate(custom)["system"]["control"]["person_step_degrees"] == 0.5
+    print("a v2 config saved before the votes: recency_half_life_days is taken out (the "
+          "schema now refuses it) and person_step_degrees defaults to 1.0, a set value kept; "
+          "the result is the v2 example - OK")
+
     print("defaults: only the keys v2 added are filled; v1 keys such as "
           "transition_seconds and heartbeat_interval_minutes are left alone - OK")
 

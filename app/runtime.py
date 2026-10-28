@@ -7,20 +7,30 @@ Observation (passive):
   * heartbeat loop - every heartbeat_interval, sample each room's sensors
     and units and record them. Defers (does not skip) while a room's guard
     is on, so it never samples a unit mid-transition.
+  * a person's votes - an ac_person_vote subscription. Home Assistant's
+    vote automation (a too_cold / too_hot button press) and manual-change
+    automation (a setpoint change on a remote) decide whether a vote is
+    accepted, one per episode, and say so in the event; the runtime judges
+    nothing itself. An accepted vote is recorded straight away as a
+    reaction of kind too_cold / too_hot with every sensor's reading, and
+    the room replayed; an ignored one is logged as an "ignored press" and
+    teaches nothing.
   * reactive detection - a state_changed subscription; a person's change
-    to a unit (NOT automation-caused) - its setpoint, turning it on or off,
-    or a mode or fan change while on - opens a consolidation window,
-    snapshots every sensor, and records one reactive event of kind on, off,
-    setpoint or manual. HA's manual-change automation applies the same
-    change to the unit's control helpers; the runtime no longer raises
-    ac_hold, which is now only a manual pause. A unit dropping out to
+    to a unit (NOT automation-caused) - turning it on or off, or a mode or
+    fan change while on - opens a consolidation window, snapshots every
+    sensor, and records one reactive event of kind on, off or manual. A
+    setpoint change alone is a vote, which only HA's event records, so one
+    physical action is one reaction. HA's manual-change automation applies
+    the same change to the unit's control helpers; the runtime never raises
+    ac_hold, which is only a manual pause. A unit dropping out to
     unavailable/unknown and back is never a reaction; if it comes back
     changed, that is logged as a control event.
 
 Learning (docs/V2_DESIGN.md, Rebuilding) - replay_room() re-runs the
 reaction replay for a room and pushes the result:
   * at startup, for every room, before any crossover (catch-up included);
-  * right after each recorded reaction;
+  * right after each recorded reaction (a vote's at once, so HA's next
+    heartbeat already sees its comfort move);
   * 65 minutes after each setpoint-moving reaction, once its comfort window
     has closed (re-armed at startup for reactions in the last 65 minutes);
   * on a heartbeat that can seed something the almanac lacks: a section
@@ -47,6 +57,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -54,8 +65,8 @@ from zoneinfo import ZoneInfo
 from app import control
 from app.analyser import LearningConfig, analyse_room, is_setpoint_moving
 from app.config import ConfigError, validate
-from app.generator import (almanac_id, base_id, guard_id, offset_id, scene_automation_id,
-                           scene_select_id, state_id)
+from app.generator import (PERSON_VOTE_EVENT, almanac_id, base_id, guard_id, offset_id,
+                           scene_automation_id, scene_select_id, state_id)
 from app.scheduler import active_section_at
 from app.store import ReactiveUnitSample, UnitSample
 
@@ -246,7 +257,7 @@ class Runtime:
         # the connection never recovers until a container restart.
         self.ws.on_reconnect(self._resubscribe)
         self.ws.on_status(self._on_ws_status)
-        await self.ws.subscribe_states(self._on_state_change)
+        await self._subscribe()
 
         # Which sensors were last logged as stale, so a restart doesn't
         # repeat the warning for one that still is.
@@ -304,11 +315,16 @@ class Runtime:
 
     # ---- state-change stream --------------------------------------
 
+    async def _subscribe(self) -> None:
+        await self.ws.subscribe_states(self._on_state_change)
+        await self.ws.subscribe_events(PERSON_VOTE_EVENT, self._on_person_vote)
+
     async def _resubscribe(self) -> None:
         """Re-run every websocket subscription after a (re)connect. HA's
         subscription ids do not survive a dropped socket, so the state
-        stream must be re-established or reactive detection stays dead."""
-        await self.ws.subscribe_states(self._on_state_change)
+        stream and the vote events must be re-established or reactive
+        detection stays dead."""
+        await self._subscribe()
 
     def _on_ws_status(self, connected: bool, reason: str) -> None:
         """Record websocket up/down transitions in the event log so a drop
@@ -370,6 +386,8 @@ class Runtime:
             return      # another attribute (current_temperature, ...) changed
         if self._is_our_command(room_id, unit_id, was, now_shows, new, min_delta):
             return      # our own command, showing up after the guard came down
+        if control.classify_change(was, now_shows, min_delta) == "setpoint":
+            return      # a vote: HA's manual-change automation reports it (_on_person_vote)
         setpoint_changed = control.setpoint_moved(before, after, min_delta)
         power_before, power_after = old_mode != "off", new_mode != "off"
 
@@ -383,12 +401,68 @@ class Runtime:
                 old.get("fan_mode"), new.get("fan_mode"), before, after)
         else:
             w.power_after, w.mode_after, w.fan_after = power_after, new_mode, new.get("fan_mode")
-            w.setpoint_after = after
+            if setpoint_changed:
+                # only a change that moved it (an on at a new setpoint): not
+                # a vote's setpoint, which HA's event has recorded already
+                w.setpoint_after = after
         w.setpoint_changed = w.setpoint_changed or setpoint_changed
         window = self._sys.get("reactive_window_seconds", 120)
         rs.reactive_deadline = datetime.now(self.tz) + timedelta(seconds=window)
         if rs.reactive_task is None or rs.reactive_task.done():
             rs.reactive_task = asyncio.create_task(self._flush_reactive_after(rs))
+
+    def _on_person_vote(self, event: dict) -> None:
+        """An ac_person_vote event from Home Assistant's vote or
+        manual-change automation."""
+        task = asyncio.create_task(self._record_vote(event))
+        self._followups.add(task)
+        task.add_done_callback(self._followups.discard)
+
+    async def _record_vote(self, event: dict) -> None:
+        """Record an accepted vote as a reaction (too_cold / too_hot, every
+        sensor's reading, a remote's unit and chosen setpoint) and replay the
+        room at once; log an ignored one. HA decided which it is."""
+        data = event.get("data") or {}
+        room_id, direction = data.get("room"), data.get("direction")
+        source, unit_id, chosen = data.get("source"), data.get("unit"), data.get("chosen")
+        accepted = data.get("accepted") is True or str(data.get("accepted")).lower() == "true"
+        ts, ts_utc, local_date, now = self._now()
+        rs = self.rooms.get(room_id)
+        if rs is None or direction not in control.PERSON_VOTES:
+            self.store.log_event(ts, ts_utc, "warning", "reactive",
+                                 f"a vote event this config can't place: room {room_id!r}, "
+                                 f"direction {direction!r}; not recorded", detail=data)
+            return
+        name = rs.room.get("name", room_id)
+        via = f"{unit_id}'s remote, to {chosen}" if source == "remote" else "the button"
+        if not accepted:
+            self.store.log_event(
+                ts, ts_utc, "info", "reactive",
+                f"{name}: ignored press: {direction} from {via}, during a forced rest or "
+                "boost (one correction per episode); nothing changed or learned",
+                room_id=room_id, detail={"vote": data, "ignored": True})
+            return
+        states = {s["entity_id"]: s for s in await self.rest.states()}
+        sensors = {s["id"]: self._sensor_reading(s, rs.room, states) for s in rs.room["sensors"]}
+        units = {}
+        if source == "remote" and unit_id in {u["id"] for u in rs.room["units"]}:
+            units[unit_id] = ReactiveUnitSample(None, _number(chosen, None), True,
+                                                kind=direction)
+        try:
+            self.store.record_reactive(room_id, ts, ts_utc, local_date, rs.section or "day",
+                                       0, units, sensors, kind=direction)
+        except sqlite3.IntegrityError as e:
+            self.store.log_event(ts, ts_utc, "warning", "reactive",
+                                 f"{name}: a {direction} vote from {via} came in the same second "
+                                 f"as another reaction and was not recorded ({e})",
+                                 room_id=room_id, detail={"vote": data})
+            return
+        self.store.log_event(ts, ts_utc, "info", "reactive",
+                             f"{name}: a person voted {direction} ({via})", room_id=room_id,
+                             detail={"kind": direction, "vote": data, "sensors": sensors})
+        log.info("vote (%s, %s) recorded for %s", direction, source, room_id)
+        await self.replay_room(room_id, "vote")
+        self._schedule_comfort_replay(room_id, now + COMFORT_REPLAY_DELAY)
 
     def _is_our_command(self, room_id: str, unit_id: str, was: control.Climate,
                         now_shows: control.Climate, attrs: dict, min_delta: float) -> bool:

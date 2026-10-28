@@ -14,17 +14,24 @@ result), conditions, choose blocks and service calls against a stubbed HA
                         release automation
   section changes       the scene automation for the section
   person steps          the manual-change automation, fed a climate change
-                        of that kind (knob steps are phase 8: not replayed)
-  climate changes       the manual-change automation, fed that change
+                        of that kind (on, off, manual)
+  button presses        the room's vote automation, fed a press of that
+                        button
+  climate changes       the manual-change automation, fed that change, once
+                        per trigger that fires (only one may go on)
 
-After every command, the unit's delayed echo of it is fed back to the
-manual-change automation, which must ignore it. Each change's kind is
-also checked against the runtime's reaction detector (UnitWindow).
+A scenario's room may have more than one unit: every unit's helpers and
+commands must be control's. A vote's ac_person_vote event must say what
+control says - accepted exactly when control.in_episode found no forced
+state in the room - and anything else must fire none. After every command,
+each unit's delayed echo of it is fed back to its manual-change automation,
+which must ignore it. Each change's kind is also checked against the
+runtime's reaction detector (UnitWindow).
 
 Then: the vote fuzz from v1's maintenance_logic_check, against
 control.evaluate_votes, and the cases the table can't express (the hold,
 an unsupported fan, the guard around commands, the blocked variable, the
-manual-change conditions).
+manual-change conditions, the vote automation's triggers).
 
 Retired from tools/maintenance_logic_check.py, whose templates no longer
 exist: the scene and correction setpoint-template cases (setpoint_applied
@@ -140,6 +147,7 @@ class HA:
         self.lag = lag
         self.pending_mode: str | None = None
         self.waits: list[bool] = []
+        self.events: list[tuple[str, dict]] = []                # event type, data
 
     def settle(self) -> None:
         """Time passes: a lagging unit now reports the mode it was sent."""
@@ -162,7 +170,10 @@ class HA:
         return (self.entities.get(entity_id) or {}).get("attributes", {}).get(attribute)
 
     def climate(self) -> control.Climate:
-        e = self.entities[self.entity]
+        return self.climate_of(self.entity)
+
+    def climate_of(self, entity_id: str) -> control.Climate:
+        e = self.entities[entity_id]
         return control.Climate(e["state"], e["attributes"].get("temperature"),
                                e["attributes"].get("fan_mode"))
 
@@ -264,6 +275,9 @@ class HA:
                         break
                 else:
                     self.execute(step.get("default", []), variables)
+            elif "event" in step:
+                self.events.append((step["event"],
+                                    self.render_complex(step.get("event_data", {}), variables)))
             elif "delay" in step:
                 pass
             elif "wait_template" in step:
@@ -280,10 +294,17 @@ class HA:
 # A scenario's room, config and world
 # ---------------------------------------------------------------------
 
-def _config(ctx: control.Context, sensors: list[str], forced_off: bool) -> tuple[dict, dict]:
+def entity_of(uid: str) -> str:
+    """The climate entity of the scenario's unit `u` or of a peer."""
+    return ENTITY if uid == UNIT else f"climate.r_{uid}"
+
+
+def _config(ctx: control.Context, sensors: list[str], forced_off: bool,
+            peers=()) -> tuple[dict, dict]:
     room = {"id": ROOM, "name": "R", "enabled": True,
             "units": [{"id": UNIT, "name": "U", "entity_id": ENTITY,
-                       "leak_detection": {"enabled": True, "sensor_entity_id": LEAK_SENSOR}}],
+                       "leak_detection": {"enabled": True, "sensor_entity_id": LEAK_SENSOR}}]
+                     + [{"id": pid, "name": pid, "entity_id": entity_of(pid)} for pid in peers],
             "sensors": [{"id": sid, "name": sid, "entity_id": f"sensor.{sid}"}
                         for sid in sensors],
             "scenes": {SECTION: {"units": {UNIT: {"mode": "off"}}}} if forced_off else {}}
@@ -299,56 +320,61 @@ def _epoch(when: datetime | None) -> float | None:
     return None if when is None else float(int(when.timestamp()))
 
 
-def _seed(ha: HA, unit: control.Unit, ctx: control.Context) -> None:
+def _seed(ha: HA, unit: control.Unit, ctx: control.Context, uid: str = UNIT) -> None:
     """The unit's helpers as the record says, and the unit itself showing
     the command its state implies."""
     cap = ctx.config.offset_cap
-    ha.set(g.state_id(ROOM, UNIT), unit.state, options=list(control.STATES))
-    ha.set(g.offset_id(ROOM, UNIT), float(unit.offset), min=-cap, max=cap)
+    ha.set(g.state_id(ROOM, uid), unit.state, options=list(control.STATES))
+    ha.set(g.offset_id(ROOM, uid), float(unit.offset), min=-cap, max=cap)
     lo, hi, _ = g.BASE_RANGE
-    ha.set(g.base_id(ROOM, UNIT), float(unit.base or 0), min=lo, max=hi)
-    for entity_id, when in ((g.since_id(ROOM, UNIT), unit.since),
-                            (g.grace_until_id(ROOM, UNIT), unit.grace_until)):
+    ha.set(g.base_id(ROOM, uid), float(unit.base or 0), min=lo, max=hi)
+    for entity_id, when in ((g.since_id(ROOM, uid), unit.since),
+                            (g.grace_until_id(ROOM, uid), unit.grace_until)):
         if when is None:
             ha.set(entity_id, "unknown")
         else:
             ha.set(entity_id, when.strftime("%Y-%m-%d %H:%M:%S"), timestamp=_epoch(when))
-    ha.set(g.unblocked_id(ROOM, UNIT), "on" if unit.unblocked else "off")
+    ha.set(g.unblocked_id(ROOM, uid), "on" if unit.unblocked else "off")
+    ha.set(g.forced_id(ROOM, uid), "on" if unit.forced else "off")
     implied = control.implied_command(unit, ctx)
     mode = "fan_only" if implied is None else implied.hvac_mode
-    ha.set(ENTITY, mode, temperature=(implied and implied.temperature) or 22.0,
+    ha.set(entity_of(uid), mode, temperature=(implied and implied.temperature) or 22.0,
            fan_mode=(implied and implied.fan_mode) or "low", fan_modes=FAN_MODES)
 
 
-def _context(ha: HA, ctx: control.Context, readings: dict, almanac: dict) -> None:
-    """Everything a step reads besides the unit's own helpers."""
+def _context(ha: HA, ctx: control.Context, readings: dict, almanac: dict,
+             uids=(UNIT,)) -> None:
+    """Everything a step reads besides the units' own helpers."""
     for name, state in ((g.guard_id(ROOM), "off"), (g.hold_id(ROOM), "off"),
                         (g.leak_id(ROOM, UNIT), "on" if ctx.leak_on else "off"),
                         (g.leak_confirm_id(ROOM, UNIT), "off"), (LEAK_SENSOR, "off")):
         ha.set(name, state)
     ha.set(g.scene_select_id(ROOM), SECTION, options=list(g.SECTIONS))
-    units = {} if ctx.setpoint_applied is None else {UNIT: {"setpoint_applied": ctx.setpoint_applied}}
+    units = {} if ctx.setpoint_applied is None else {
+        uid: {"setpoint_applied": ctx.setpoint_applied} for uid in uids}
     ha.set(g.almanac_id(ROOM), "ok",
            sections={SECTION: {"units": units, "sensors": (almanac or {}).get("sensors", {})}})
     for sid, value in readings.items():
         ha.set(f"sensor.{sid}", "unavailable" if value is None else value)
-    a = ha.entities[ENTITY]["attributes"]
-    a.update(min_temp=ctx.unit_min, max_temp=ctx.unit_max)
+    for uid in uids:
+        a = ha.entities[entity_of(uid)]["attributes"]
+        a.update(min_temp=ctx.unit_min, max_temp=ctx.unit_max)
 
 
-def _view(ha: HA, now: datetime) -> dict:
+def _view(ha: HA, now: datetime, uid: str = UNIT) -> dict:
     """The unit's helpers as control.Unit fields, in seconds from T0. A grace
     that isn't in the future is no grace; base 0 is unset."""
     def at(entity_id):
         ts = ha.state_attr(entity_id, "timestamp")
         return None if ts is None else ts - table.T0.timestamp()
-    grace = at(g.grace_until_id(ROOM, UNIT))
-    return {"state": ha.states(g.state_id(ROOM, UNIT)),
-            "offset": int(float(ha.states(g.offset_id(ROOM, UNIT)))),
-            "base": float(ha.states(g.base_id(ROOM, UNIT))) or None,
-            "since": at(g.since_id(ROOM, UNIT)),
+    grace = at(g.grace_until_id(ROOM, uid))
+    return {"state": ha.states(g.state_id(ROOM, uid)),
+            "offset": int(float(ha.states(g.offset_id(ROOM, uid)))),
+            "base": float(ha.states(g.base_id(ROOM, uid))) or None,
+            "since": at(g.since_id(ROOM, uid)),
             "grace_until": grace if grace is not None and grace > table._secs(now) else None,
-            "unblocked": ha.states(g.unblocked_id(ROOM, UNIT)) == "on"}
+            "unblocked": ha.states(g.unblocked_id(ROOM, uid)) == "on",
+            "forced": ha.states(g.forced_id(ROOM, uid)) == "on"}
 
 
 def _control_view(unit: control.Unit, now: datetime) -> dict:
@@ -358,10 +384,10 @@ def _control_view(unit: control.Unit, now: datetime) -> dict:
     return view
 
 
-def _sent(calls: list) -> dict | None:
-    """The climate command in a run's service calls, as control.Command's
-    fields; None if nothing was sent."""
-    climate = [c for c in calls if c[0].startswith("climate.")]
+def _sent(calls: list, entity: str | None = None) -> dict | None:
+    """The climate command in a run's service calls (to `entity`, if given),
+    as control.Command's fields; None if nothing was sent."""
+    climate = [c for c in calls if c[0].startswith("climate.") and entity in (None, c[1])]
     if not climate:
         return None
     sent = {"hvac_mode": None, "fan_mode": None, "temperature": None}
@@ -374,17 +400,11 @@ def _command(command: control.Command | None) -> dict | None:
     return None if command is None else dataclasses.asdict(command)
 
 
-def _person_event(kind: str, ha: HA, setpoint, power_after: bool,
-                  min_delta: float) -> tuple[control.Climate, control.Climate]:
+def _person_event(kind: str, ha: HA, setpoint) -> tuple[control.Climate, control.Climate]:
     """A climate change of this kind, starting from what the unit shows."""
     now = ha.climate()
     on_mode = now.mode if now.mode != "off" else "cool"
     t0 = now.temperature if now.temperature is not None else 22.0
-    if kind == "setpoint":
-        if setpoint is not None and abs(setpoint - t0) < min_delta:
-            t0 = setpoint - 2
-        mode = on_mode if power_after else "off"
-        return control.Climate(mode, t0, now.fan), control.Climate(mode, setpoint, now.fan)
     if kind == "on":
         return control.Climate("off", t0, now.fan), control.Climate("cool", setpoint, now.fan)
     if kind == "off":
@@ -395,41 +415,60 @@ def _person_event(kind: str, ha: HA, setpoint, power_after: bool,
     raise AssertionError(kind)
 
 
-def _trigger(before: control.Climate, after: control.Climate, parent_id=None) -> dict:
+def _trigger(before: control.Climate, after: control.Climate, parent_id=None,
+             entity_id: str = ENTITY) -> dict:
     def state(c: control.Climate) -> dict:
         return {"state": c.mode, "attributes": {"temperature": c.temperature, "fan_mode": c.fan},
                 "context": {"parent_id": parent_id}}
-    return {"from_state": state(before), "to_state": state(after)}
+    return {"entity_id": entity_id, "from_state": state(before), "to_state": state(after)}
+
+
+def _press(direction: str, before: str | None = "2026-07-31T09:00:00+00:00",
+           after: str = "2026-08-01T04:00:00+00:00") -> dict:
+    """A press of the room's button: its state, the time of its last press,
+    moves on (from unknown on a new button's first press)."""
+    def state(value):
+        return None if value is None else {"state": value, "attributes": {},
+                                           "context": {"parent_id": "an automation, say"}}
+    return {"entity_id": g.button_id(ROOM, direction), "from_state": state(before),
+            "to_state": state(after)}
 
 
 def manual_triggers(entity_id: str) -> list[dict]:
     """The manual-change automation's triggers: mode changes only (to: null
     skips attribute-only changes), and the setpoint and fan attributes - so
     a current_temperature update fires nothing."""
-    return [{"platform": "state", "entity_id": entity_id, "to": None},
-            {"platform": "state", "entity_id": entity_id, "attribute": "temperature"},
-            {"platform": "state", "entity_id": entity_id, "attribute": "fan_mode"}]
+    return [{"platform": "state", "entity_id": entity_id, "to": None, "id": "mode"},
+            {"platform": "state", "entity_id": entity_id, "attribute": "temperature",
+             "id": "temperature"},
+            {"platform": "state", "entity_id": entity_id, "attribute": "fan_mode",
+             "id": "fan_mode"}]
 
 
 def fired(automation: dict, change: dict) -> list[dict]:
-    """Home Assistant's state-trigger matching, for the forms we generate:
-    an attribute trigger fires when that attribute's value changed; `to:
-    null` when the state changed, never on an attribute-only change; a bare
-    one on any change. One trigger variable per trigger that fires: HA runs
-    the automation once for each."""
+    """Home Assistant's state-trigger matching, for the forms we generate,
+    on the change's entity: an attribute trigger fires when that
+    attribute's value changed; `to: null` when the state changed, never on
+    an attribute-only change; a bare one on any change. One trigger
+    variable per trigger that fires, with its id: HA runs the automation
+    once for each."""
     old, new = change["from_state"], change["to_state"]
     out = []
     for t in automation["trigger"]:
         assert t["platform"] == "state", t
-        if "attribute" in t:
+        if t["entity_id"] != change["entity_id"]:
+            continue
+        if old is None or new is None:
+            hit = old is not new
+        elif "attribute" in t:
             hit = old["attributes"].get(t["attribute"]) != new["attributes"].get(t["attribute"])
         elif "to" in t and t["to"] is None:
             hit = old["state"] != new["state"]
         else:
             hit = old != new
         if hit:
-            out.append({**change, "platform": "state", "entity_id": t["entity_id"],
-                        "attribute": t.get("attribute")})
+            out.append({**change, "platform": "state", "attribute": t.get("attribute"),
+                        "id": t.get("id")})
     return out
 
 
@@ -441,6 +480,17 @@ def _runtime_kind(before: control.Climate, after: control.Climate, min_delta: fl
     return w.kind
 
 
+def _event_says(pv: control.PersonVote | None) -> dict | None:
+    """The ac_person_vote event control's vote stands for."""
+    if pv is None:
+        return None
+    data = {"room": ROOM, "direction": pv.direction, "accepted": pv.accepted,
+            "source": pv.source}
+    if pv.source == "remote":
+        data.update(chosen=pv.chosen, unit=pv.unit)
+    return data
+
+
 # ---------------------------------------------------------------------
 # Replaying the table
 # ---------------------------------------------------------------------
@@ -448,43 +498,46 @@ def _runtime_kind(before: control.Climate, after: control.Climate, min_delta: fl
 class Replay:
     def __init__(self) -> None:
         self.steps = self.runs = self.echoes = self.kinds = self.ours = self.twice = 0
-        self.skipped: list[str] = []
+        self.events = self.ignored = 0
         self.last_vars: dict | None = None
         self.first_rendered: dict | None = None
 
     def scenario(self, sc: dict) -> list[str]:
-        unit = table._unit(sc["unit"])
+        units = table._room(sc)
         ha = HA()
         first = table._ctx(sc["ctx"])
-        _seed(ha, unit, first)
+        for uid, unit in units.items():
+            _seed(ha, unit, table._ctxs(first, units)[uid], uid)
         for i, st in enumerate(sc["steps"], 1):
             now = table._time(st.get("at", 0))
             ctx = table._ctx(sc["ctx"], st.get("ctx"))
             ha.now = now
             try:
-                unit, diff = self.step(ha, unit, st, now, ctx)
+                units, diff = self.step(ha, units, st, now, ctx)
             except Exception as e:                      # a template that fails is a difference
                 return [f"step {i} ({st['do']}): raised {type(e).__name__}: {e}"]
             if diff:
                 return [f"step {i} ({st['do']}): {diff}"]
         return []
 
-    def step(self, ha: HA, unit: control.Unit, st: dict, now: datetime,
-             ctx: control.Context) -> tuple[control.Unit, str | None]:
+    def step(self, ha: HA, units: dict, st: dict, now: datetime,
+             ctx: control.Context) -> tuple[dict, str | None]:
         do = st["do"]
         readings = st.get("readings")
         readings = table.READINGS.get(readings, readings) if isinstance(readings, str) \
             else (readings or table.READINGS["settled_warm"])
         almanac = st.get("almanac", table.ALMANAC)
         forced = st.get("forced_off", ctx.forced_off)
-        config, room = _config(ctx, list(readings), forced)
-        _context(ha, ctx, readings, almanac)
+        peers = [uid for uid in units if uid != UNIT]
+        config, room = _config(ctx, list(readings), forced, peers)
+        _context(ha, ctx, readings, almanac, list(units))
         for sid, ago in st.get("reported", {}).items():      # still showing a value, but stale
             ha.entities[f"sensor.{sid}"]["last_reported"] = now - timedelta(seconds=ago)
         edges = st.get("edges")
         overrides = {"blocked": True} if ctx.blocked else {}
         if edges:
             overrides.update(cold_edge=edges[0], warm_edge=edges[1])
+        self.room, self.config, self.ctxs = room, config, table._ctxs(ctx, units)
 
         if do == "votes":
             got = ha.variables(g.build_maintenance_automation(config, room), overrides,
@@ -493,17 +546,21 @@ class Replay:
             want.pop("positions")
             self.steps += 1
             self.runs += 1
-            return unit, None if got == want else f"votes {got}, control {want}"
+            return units, None if got == want else f"votes {got}, control {want}"
+
+        if do == "person":
+            before, after = _person_event(st["kind"], ha, st.get("setpoint"))
+            st = {**st, "before": dataclasses.asdict(before), "after": dataclasses.asdict(after)}
+        new, commands, pv = table.apply(st, units, now, ctx)
+        commands = commands or {}
 
         if do == "step":
-            new, command = control.step(unit, table._votes(st, now, ctx.sensor_stale_minutes),
-                                        now, ctx)
             alternatives = []
             if ctx.leak_on:
                 alternatives.append((g.build_leak_automation(config, room, room["units"][0]),
                                      {"from_state": {"state": "off"},
                                       "to_state": {"state": "on"}}))
-            elif unit.state == "leak":
+            elif units[UNIT].state == "leak":
                 alternatives.append((g.build_leak_release_automation(config, room,
                                                                      room["units"][0]),
                                      {"to_state": {"state": "on"}}))
@@ -512,123 +569,146 @@ class Replay:
                 side.entities = {k: {"state": v["state"], "attributes": dict(v["attributes"])}
                                  for k, v in ha.entities.items()}
                 side.now = now
-                diff = self.compare(side, automation, trigger, overrides, unit, new, command,
-                                    now)
+                diff = self.compare(side, automation, trigger, overrides, units, new, commands,
+                                    now, only=[UNIT])
                 if diff:
                     return new, f"{automation['id']}: {diff}"
             diff = self.compare(ha, g.build_maintenance_automation(config, room), None,
-                                overrides, unit, new, command, now)
+                                overrides, units, new, commands, now)
             return new, diff and f"maintenance: {diff}"
 
         if do == "section_change":
-            new, command = control.on_section_change(unit, ctx, forced, now)
             scene = g.build_scene_automation(config, room, {"id": SECTION, "name": SECTION})
-            diff = self.compare(ha, scene, None, overrides, unit, new, command, now)
+            diff = self.compare(ha, scene, None, overrides, units, new, commands, now)
             return new, diff and f"scene: {diff}"
 
-        if do in ("person", "change"):
-            manual = g.build_manual_change_automation(config, room, room["units"][0])
-            if do == "person":
-                new = control.on_person_change(st["kind"], unit, st.get("setpoint"),
-                                               st.get("power_after", True), now, ctx)
-                if st["kind"] not in ("setpoint", "on", "off", "manual"):
-                    self.skipped.append(st["kind"])        # knob events arrive in phase 8
-                    _seed(ha, new, ctx)
-                    return new, None
-                before, after = _person_event(st["kind"], ha, st.get("setpoint"),
-                                              st.get("power_after", True), ctx.min_delta)
-            else:
-                before, after = (control.Climate(**st["before"]), control.Climate(**st["after"]))
-                new = control.on_climate_change(unit, before, after, now, ctx)
-            kind = control.classify_change(before, after, ctx.min_delta)
-            if do == "person" and kind != st["kind"]:
-                return new, f"the event built for {st['kind']} classifies as {kind}"
-            if kind is not None and _runtime_kind(before, after, ctx.min_delta) != kind:
-                return new, f"runtime kind {_runtime_kind(before, after, ctx.min_delta)}, " \
-                            f"control {kind}"
-            self.kinds += 1
-            ha.set(ENTITY, after.mode, **{**ha.entities[ENTITY]["attributes"],
-                                          "temperature": after.temperature,
-                                          "fan_mode": after.fan})
-            if manual["trigger"] != manual_triggers(ENTITY):
-                return new, f"manual change triggers {manual['trigger']}"
-            triggers = fired(manual, _trigger(before, after))
-            self.twice += len(triggers) > 1
-            diff = self.compare(ha, manual, triggers, {}, unit, new, None, now, echo=False)
-            if diff is None and self.first_rendered is not None:
-                want_ours = control.matches_command(control.implied_command(unit, ctx),
-                                                    before, after, ctx.min_delta)
-                got = self.first_rendered[g._unit_var(room["units"][0])]
-                if got["kind"] != kind or got["ours"] != want_ours:
-                    diff = f"kind/ours {got['kind']}/{got['ours']}, control {kind}/{want_ours}"
-                self.ours += want_ours
-            elif diff is None and not triggers and new != unit:
-                diff = "no trigger fired, but control changed the unit"
-            return new, diff and f"manual change: {diff}"
+        if do == "press":
+            vote = g.build_vote_automation(config, room)
+            triggers = fired(vote, _press(st["direction"]))
+            if [t["id"] for t in triggers] != [st["direction"]]:
+                return new, f"the {st['direction']} button fired {triggers}"
+            diff = self.compare(ha, vote, triggers, {}, units, new, commands, now, pv=pv)
+            return new, diff and f"vote: {diff}"
 
-        raise AssertionError(do)
+        # a climate change (or a person's on/off/manual, made one)
+        before, after = control.Climate(**st["before"]), control.Climate(**st["after"])
+        manual = g.build_manual_change_automation(config, room, room["units"][0])
+        kind = control.classify_change(before, after, ctx.min_delta)
+        if do == "person" and kind != st["kind"]:
+            return new, f"the event built for {st['kind']} classifies as {kind}"
+        if kind is not None and _runtime_kind(before, after, ctx.min_delta) != kind:
+            return new, f"runtime kind {_runtime_kind(before, after, ctx.min_delta)}, " \
+                        f"control {kind}"
+        self.kinds += 1
+        ha.set(ENTITY, after.mode, **{**ha.entities[ENTITY]["attributes"],
+                                      "temperature": after.temperature,
+                                      "fan_mode": after.fan})
+        if manual["trigger"] != manual_triggers(ENTITY):
+            return new, f"manual change triggers {manual['trigger']}"
+        triggers = fired(manual, _trigger(before, after))
+        self.twice += len(triggers) > 1
+        diff = self.compare(ha, manual, triggers, {}, units, new, commands, now, pv=pv,
+                            echo=pv is not None)
+        if diff is None and self.first_rendered is not None:
+            want_ours = control.matches_command(control.implied_command(units[UNIT], ctx),
+                                                before, after, ctx.min_delta)
+            got = self.first_rendered["change"]
+            if got["kind"] != kind or got["ours"] != want_ours:
+                diff = f"kind/ours {got['kind']}/{got['ours']}, control {kind}/{want_ours}"
+            self.ours += want_ours
+        elif diff is None and not triggers and new != units:
+            diff = "no trigger fired, but control changed the unit"
+        return new, diff and f"manual change: {diff}"
 
-    def compare(self, ha: HA, automation: dict, trigger, overrides: dict, old: control.Unit,
-                new: control.Unit, command, now: datetime, echo: bool = True) -> str | None:
+    def compare(self, ha: HA, automation: dict, trigger, overrides: dict, olds: dict,
+                news: dict, commands: dict, now: datetime, echo: bool = True,
+                only: list[str] | None = None, pv: control.PersonVote | None = None
+                ) -> str | None:
         """Run one automation - once per trigger, if given a list of the
-        triggers that fired - and its helpers and command must be control's,
-        with nothing written or sent without a change."""
-        before = ha.climate()
-        ha.calls = []
+        triggers that fired - and every unit's helpers and command must be
+        control's, with nothing written or sent without a change, any
+        ac_person_vote event control's vote, and a run that goes on at most
+        once per change."""
+        befores = {uid: ha.climate_of(entity_of(uid)) for uid in olds}
+        ha.calls, ha.events = [], []
         self.first_rendered = None
+        went_on = 0
         for i, t in enumerate(trigger if isinstance(trigger, list) else [trigger]):
             self.last_vars = ha.run(automation, t, overrides)
+            went_on += self.last_vars is not None
             if i == 0:
                 self.first_rendered = ha.rendered
             self.runs += 1
         self.steps += 1
-        got, want = _view(ha, now), _control_view(new, now)
-        if got != want:
-            return f"helpers {got}, control {want}"
-        sent, wanted = _sent(ha.calls), _command(command)
-        if sent != wanted:
-            return f"sent {sent}, control {wanted}"
-        if sent is not None:
+        if went_on > 1:
+            return f"one change went on {went_on} times"
+        uids = only or list(olds)
+        for uid in uids:
+            got, want = _view(ha, now, uid), _control_view(news[uid], now)
+            if got != want:
+                return f"{uid} helpers {got}, control {want}"
+            sent, wanted = _sent(ha.calls, entity_of(uid)), _command(commands.get(uid))
+            if sent != wanted:
+                return f"{uid} sent {sent}, control {wanted}"
+            unit_helpers = [h(ROOM, uid) for h in (g.state_id, g.offset_id, g.base_id,
+                                                   g.since_id, g.grace_until_id,
+                                                   g.unblocked_id, g.forced_id)]
+            if news[uid] == olds[uid] and not automation["id"].startswith("ac_scene_") and any(
+                    e in unit_helpers for _, e, _, _ in ha.calls):
+                return f"{uid} helpers written without a transition"
+        if _sent(ha.calls) is not None:
             if not all(guarded for service, _, _, guarded in ha.calls
                        if service.startswith("climate.")):
                 return "a command was sent with the guard down"
             if ha.states(g.guard_id(ROOM)) != "off":
                 return "the guard was left up"
-        elif new == old and not automation["id"].startswith("ac_scene_") and any(
-                e not in (g.leak_id(ROOM, UNIT), g.leak_confirm_id(ROOM, UNIT))
-                for _, e, _, _ in ha.calls):
-            return "helpers written without a transition"
-        if echo and sent is not None:
-            return self.echo(ha, automation, before, new, now)
+        diff = self.check_event(ha, olds, pv)
+        if diff:
+            return diff
+        if echo:
+            for uid in uids:
+                if _sent(ha.calls, entity_of(uid)) is not None:
+                    diff = self.echo(ha, uid, befores[uid], news, now)
+                    if diff:
+                        return diff
         return None
 
-    def echo(self, ha: HA, automation: dict, before: control.Climate, new: control.Unit,
+    def check_event(self, ha: HA, olds: dict, pv: control.PersonVote | None) -> str | None:
+        """The run's ac_person_vote events: exactly control's vote, if any,
+        accepted exactly when control.in_episode found no forced rest or
+        boost in the room before it."""
+        events = [data for kind, data in ha.events if kind == g.PERSON_VOTE_EVENT]
+        want = _event_says(pv)
+        if want is None:
+            return None if not events else f"a vote event {events} where control has no vote"
+        if events != [want]:
+            return f"vote events {events}, control {want}"
+        if events[0]["accepted"] != (not control.in_episode(olds.values())):
+            return (f"the event says accepted={events[0]['accepted']}, but control.in_episode "
+                    f"is {control.in_episode(olds.values())}")
+        self.events += 1
+        self.ignored += not events[0]["accepted"]
+        return None
+
+    def echo(self, ha: HA, uid: str, before: control.Climate, news: dict,
              now: datetime) -> str | None:
-        """The unit reports our command late, after the guard is down: the
+        """The unit reports our command late, after the guard is down: its
         manual-change automation must ignore it, as must control."""
-        after = ha.climate()
-        room = {"id": ROOM, "units": [{"id": UNIT, "entity_id": ENTITY}], "sensors": []}
-        config = {"system": {}, "rooms": [room]}
-        ctx = _echo_ctx(ha)
-        if control.on_climate_change(new, before, after, now, ctx) != new:
-            return f"control takes the echo {before} -> {after} for a person"
-        snapshot = _view(ha, now)
-        ha.calls = []
-        manual = g.build_manual_change_automation(config, room, room["units"][0])
+        after = ha.climate_of(entity_of(uid))
+        results, pv = control.on_climate_change(news, uid, before, after, now, self.ctxs)
+        if pv is not None or any(results[u][0] != news[u] for u in news):
+            return f"control takes {uid}'s echo {before} -> {after} for a person"
+        snapshot = {u: _view(ha, now, u) for u in news}
+        ha.calls, ha.events = [], []
+        unit = next(u for u in self.room["units"] if u["id"] == uid)
+        manual = g.build_manual_change_automation(self.config, self.room, unit)
         self.echoes += 1
-        for t in fired(manual, _trigger(before, after)):
-            if ha.run(manual, t) is not None or _view(ha, now) != snapshot or not ha.rendered[
-                    g._unit_var(room["units"][0])]["ours"]:
-                return (f"the manual-change automation took the echo {before} -> {after} "
+        for t in fired(manual, _trigger(before, after, entity_id=entity_of(uid))):
+            if ha.run(manual, t) is not None or {u: _view(ha, now, u) for u in news} != snapshot \
+                    or not ha.rendered["change"]["ours"]:
+                return (f"{uid}'s manual-change automation took the echo {before} -> {after} "
                         "for a person")
         return None
-
-
-def _echo_ctx(ha: HA) -> control.Context:
-    units = (ha.state_attr(g.almanac_id(ROOM), "sections") or {}).get(SECTION, {}).get("units", {})
-    a = ha.entities[ENTITY]["attributes"]
-    return control.Context(setpoint_applied=(units.get(UNIT) or {}).get("setpoint_applied"),
-                           unit_min=a.get("min_temp") or 16.0, unit_max=a.get("max_temp") or 30.0)
 
 
 # ---------------------------------------------------------------------
@@ -843,6 +923,84 @@ def _extra_cases() -> int:
     expect(len(triggers) == 1 and ha.run(manual, triggers[0]) is not None
            and ha.states(g.state_id(ROOM, UNIT)) == "user_off",
            "manual change takes a person's off (one trigger: the mode)")
+
+    # A person's vote: the buttons, the hold, one run per change.
+    def vote_events(h: HA) -> list[dict]:
+        return [d for kind, d in h.events if kind == g.PERSON_VOTE_EVENT]
+
+    ha, config, room = world(cool)
+    vote = g.build_vote_automation(config, room)
+    expect([(t["entity_id"], t.get("to", "x"), t["id"]) for t in vote["trigger"]]
+           == [(g.button_id(ROOM, d), None, d) for d in control.PERSON_VOTES],
+           "the vote automation triggers on each button's state (to: null), the trigger id "
+           "naming the direction")
+    snapshot = _view(ha, table.T0)
+    ha.set(g.hold_id(ROOM), "on")
+    ha.run(vote, fired(vote, _press("too_cold"))[0])
+    expect(vote_events(ha) == [{"room": ROOM, "direction": "too_cold", "accepted": True,
+                                "source": "button"}]
+           and not ha.calls and _view(ha, table.T0) == snapshot,
+           "hold on: a press is reported (accepted, so it is learned) but changes and sends "
+           "nothing")
+    ha, config, room = world(cool)
+    ha.set(g.hold_id(ROOM), "on")
+    manual = g.build_manual_change_automation(config, room, room["units"][0])
+    up = (control.Climate("cool", 22.0, "low"), control.Climate("cool", 24.0, "low"))
+    ha.set(ENTITY, "cool", **{**ha.entities[ENTITY]["attributes"], "temperature": 24.0})
+    for t in fired(manual, _trigger(*up)):
+        ha.run(manual, t)
+    expect([(d["direction"], d["accepted"], d["source"]) for d in vote_events(ha)]
+           == [("too_cold", True, "remote")] and not ha.calls
+           and ha.states(g.state_id(ROOM, UNIT)) == "cool",
+           "hold on: a remote setpoint change is reported but changes and sends nothing")
+
+    for what, change, runs in (
+            ("a new button's first press (from unknown)", _press("too_hot", before="unknown"), 1),
+            ("a button coming back from unavailable", _press("too_hot", before="unavailable"), 0),
+            ("a button going unavailable", _press("too_hot", after="unavailable"), 0),
+            ("a restart restoring the button (no old state)", _press("too_hot", before=None), 0)):
+        ha, config, room = world(cool)
+        vote = g.build_vote_automation(config, room)
+        went = [ha.run(vote, t) is not None for t in fired(vote, change)]
+        expect(sum(went) == runs and len(vote_events(ha)) == runs,
+               f"{what}: {'a vote' if runs else 'no vote'}")
+    rename = _press("too_hot", before="2026-08-01T04:00:00+00:00")
+    rename["from_state"]["attributes"] = {"friendly_name": "old"}
+    expect(fired(g.build_vote_automation(config, room), rename) == [],
+           "a button's rename (attribute only) fires nothing")
+
+    ha, config, room = world(cool)
+    manual = g.build_manual_change_automation(config, room, room["units"][0])
+    both = (control.Climate("cool", 22.0, "low"), control.Climate("dry", 24.0, "low"))
+    ha.set(ENTITY, "dry", **{**ha.entities[ENTITY]["attributes"], "temperature": 24.0})
+    triggers = fired(manual, _trigger(*both))
+    went = [ha.run(manual, t) is not None for t in triggers]
+    expect([t["id"] for t in triggers] == ["mode", "temperature"] and went == [True, False]
+           and len(vote_events(ha)) == 1 and ha.states(g.state_id(ROOM, UNIT)) == "rest",
+           "a mode and a setpoint changed at once fire two triggers, but only the first goes "
+           "on: one vote, not two")
+
+    ha, config, room = world(cool)
+    order: list[str] = []
+    call = ha.call
+
+    def traced_call(service, entity_id, data):
+        order.append(service)
+        call(service, entity_id, data)
+
+    class Traced(list):
+        def append(self, item):
+            order.append(item[0])
+            super().append(item)
+    ha.call, ha.events = traced_call, Traced()
+    vote = g.build_vote_automation(config, room)
+    ha.run(vote, fired(vote, _press("too_hot"))[0])
+    climate = [i for i, sv in enumerate(order) if sv.startswith("climate.")]
+    helpers = [i for i, sv in enumerate(order) if sv.startswith("input_select.")]
+    expect(order[:2] == [g.PERSON_VOTE_EVENT, "input_boolean.turn_on"] and climate and helpers
+           and helpers[0] < climate[0] and order[-1] == "input_boolean.turn_off",
+           "a press: the event first, then the guard up, the helpers, the commands, the guard "
+           "down")
     return fails
 
 
@@ -856,8 +1014,9 @@ def main() -> int:
     print(f"{passed}/{len(table.SCENARIOS)} scenarios: the generated automations match "
           f"app.control ({replay.steps} template runs, {replay.echoes} echoes ignored, "
           f"{replay.kinds} changes' kind and is-this-ours checked, {replay.ours} of them ours, "
-          f"{replay.twice} firing two triggers; "
-          f"{len(replay.skipped)} knob steps not replayed: {sorted(set(replay.skipped))})")
+          f"{replay.twice} firing two triggers, run once; {replay.events} vote events, "
+          f"{replay.ignored} of them ignored, each accepted exactly when control.in_episode "
+          f"found no forced state)")
     fuzz = _fuzz_votes(40)
     print("other cases:")
     extra = _extra_cases()

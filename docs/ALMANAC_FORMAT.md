@@ -39,7 +39,8 @@ for display and tie-breaking; the quorum count itself is unweighted.
 ## Field notes
 
 - **status** — `provisional` until the section's first setpoint-moving
-  reaction (a setpoint change or knob turn), then `learned`.
+  reaction (a person's vote, or a setpoint change or knob turn recorded before
+  the votes), then `learned`.
 - **valid_from** — the local date of the replay that built this row. There is
   no validity delay: the replay runs right after a reaction, 65 minutes later
   for the comfort window, on a heartbeat that can seed something new, and
@@ -49,8 +50,8 @@ for display and tie-breaking; the quorum count itself is unweighted.
   section's next run: until phase 3b the hold stops maintenance after a
   reaction, and from then the scene's per-unit base helper does.
 - **confidence** — `1 − 0.5^(quiet/3)`, quiet being the completed runs since
-  the section's last reaction that had a heartbeat and no reaction. For the UI
-  (and later the knob's LED), never for control.
+  the section's last reaction that had a heartbeat and no reaction. For the UI,
+  never for control.
 - **sections** — a section appears once anything in it is seeded. A section
   with no heartbeats yet has no entry.
 - **units** — only seeded units appear: a unit needs a heartbeat in that
@@ -73,7 +74,8 @@ for display and tie-breaking; the quorum count itself is unweighted.
 - **sensors** — only seeded sensors appear (a reading in that section).
 - **sensors[].comfort** — the reading this sensor shows while you are content.
   Not shared between sensors and not equal to the setpoint.
-- **sensors[].band** — comfort half-width in degrees. The HA template votes when
+- **sensors[].band** — comfort half-width in degrees, nudged by each reaction
+  (docs/TRUST_MODEL.md). The HA template votes when
   `abs(reading - comfort) >= band`. Tight = trusted.
 - **sensors[].trust** — normalised inverse of band, 0..1. Display and
   tie-breaking only.

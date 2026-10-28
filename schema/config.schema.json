@@ -85,11 +85,15 @@
             },
             "person_grace_minutes": {
               "type": "integer", "minimum": 0, "maximum": 240, "default": 30,
-              "description": "After a person's setpoint change or turn-on, no transition into boost or rest for this long."
+              "description": "After a person turns a unit on, no transition into boost or rest for this long. (A setpoint change is a vote, which forces a rest or boost instead.)"
             },
             "offset_cap": {
               "type": "integer", "minimum": 0, "maximum": 10, "default": 3,
               "description": "The section offset is capped at plus or minus this many whole steps; the boost step goes on top."
+            },
+            "person_step_degrees": {
+              "type": "number", "minimum": 0, "maximum": 5, "default": 1.0,
+              "description": "A person's vote moves each sensor's comfort reading toward its reading plus this (too cold) or minus it (too hot), at learning.reaction_rate."
             }
           }
         },
@@ -136,11 +140,7 @@
       "properties": {
         "reaction_rate": {
           "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.5,
-          "description": "Each setpoint-moving reaction moves the learned setpoint (and a comfort reading, from an accepted window) this fraction of the way toward what the person chose."
-        },
-        "recency_half_life_days": {
-          "type": "number", "exclusiveMinimum": 0, "default": 7,
-          "description": "Half-life of a reaction's weight in band learning, over all history."
+          "description": "Each setpoint-moving reaction moves the learned setpoint (and a comfort reading, from a vote or an accepted window) this fraction of the way toward what the person chose, and each reaction nudges each sensor's band this fraction of the way. (recency_half_life_days is gone: bands now move by reaction, not by a recency-weighted mean.)"
         }
       }
     },
