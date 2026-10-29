@@ -6,10 +6,11 @@
 // Home Assistant templates are rendered from; this file only lays it out:
 //
 //   donut       fixed arcs, blue (rest) / green (comfortable) / amber (cool),
-//               one numbered pointer per sensor outside the ring, the fan in
-//               the centre and the state in the label strip at the bottom
-//   scale       the applied setpoint, the section offset as chevrons, what
-//               the unit is driven to now, and the forecast (magenta)
+//               one numbered pointer per sensor outside the ring (close ones
+//               fanned out, with leaders to their places), the fan in the
+//               centre and the state in the label strip at the bottom
+//   scale       what the unit is set to now, the correction from the
+//               learned setpoint as chevrons, and the forecast (magenta)
 //   table       the sensors, warmest first, numbered as on the donut
 //   buttons     Too cold / Too hot (the room's vote buttons in HA), and
 //               Leak fixed while a leak is latched
@@ -22,7 +23,12 @@ const NowView = (() => {
   // the leaned edges land on +-EDGE, and a marker pins at +-SWEEP, PAST band
   // widths beyond its edge. The bottom (SWEEP..360-SWEEP) is the label strip.
   const SWEEP = 135, EDGE = 45, PAST = 2;
-  const R = 86, ORBIT = 108, LEVEL = 17;     // ring radius; marker orbits (up to 3)
+  const R = 86, ORBIT = 108;                 // ring radius; a marker's orbit
+  // Markers whose centres would be closer than a marker's width (plus a
+  // hair) fan out along the arc to SPACING apart, on an orbit a little
+  // further out, FAN_ORBIT, so each one's leader to its place shows.
+  const MARK_R = 9.5, SPACING = 25, FAN_ORBIT = 122;
+  const FAN_SEP = (SPACING / ORBIT) * (180 / Math.PI);       // degrees apart
   const SCALE_RANGE = 5, SCALE_PX = 21;     // correction scale: +-5 degC
 
   let timer = null;
@@ -132,6 +138,26 @@ const NowView = (() => {
     </g>`;
   }
 
+  // Where each marker goes, from their true angles in ascending order:
+  // [{at, fanned}]. Markers closer than FAN_SEP form a group, laid out
+  // FAN_SEP apart round the mean of its members' angles and kept within
+  // the scale's ends; groups that then come closer than FAN_SEP merge,
+  // until none do. Order round the arc is kept.
+  function spread(angles) {
+    const span = (g) => FAN_SEP * (g.n - 1);
+    const start = (g) => Math.max(-SWEEP, Math.min(g.mean - span(g) / 2, SWEEP - span(g)));
+    const groups = angles.map((a) => ({ n: 1, mean: a }));
+    for (let k = 0; k + 1 < groups.length;) {
+      const a = groups[k], b = groups[k + 1];
+      if (start(b) - (start(a) + span(a)) < FAN_SEP - 1e-6) {
+        groups.splice(k, 2, { n: a.n + b.n, mean: (a.mean * a.n + b.mean * b.n) / (a.n + b.n) });
+        k = Math.max(k - 1, 0);          // the merged group may now reach the one before
+      } else k++;
+    }
+    return groups.flatMap((g) => Array.from({ length: g.n },
+      (_, i) => ({ at: start(g) + i * FAN_SEP, fanned: g.n > 1 })));
+  }
+
   function markers(room) {
     const cold = room.conditions.cold_edge, warm = room.conditions.warm_edge;
     const placed = [], hollow = [];
@@ -139,20 +165,32 @@ const NowView = (() => {
       if (s.position === null || s.position === undefined) hollow.push(s);
       else placed.push({ s, ...markerAngle(s.position, cold, warm) });
     });
-    // Close markers step outward to a second or third orbit.
-    placed.sort((a, b) => a.angle - b.angle);
-    const lastAt = [];
-    placed.forEach((m) => {
-      let level = 0;
-      while (level < 2 && lastAt[level] !== undefined && Math.abs(m.angle - lastAt[level]) < 15) level++;
-      lastAt[level] = m.angle;
-      m.level = level;
-    });
-    const out = placed.map(({ s, angle, overflow, level }) => {
-      const orbit = ORBIT + level * LEVEL;
-      const [x, y] = polar(orbit, angle);
-      const [tx, ty] = polar(R + 12, angle);
-      const [b1x, b1y] = polar(orbit - 9, angle - 3.2), [b2x, b2y] = polar(orbit - 9, angle + 3.2);
+    // Round the arc; two pinned at one end go furthest out nearest the end.
+    placed.sort((a, b) => a.angle - b.angle || a.s.position - b.s.position);
+    const where = spread(placed.map((m) => m.angle));
+    placed.forEach((m, i) => Object.assign(m, where[i]));
+    // A fanned group's leaders go under every marker.
+    const leaders = placed.filter((m) => m.fanned).map(({ s, angle, at }) => {
+      // From an arrowhead on the ring at the sensor's own place, out to its
+      // marker, wherever the fan put it.
+      const [tx, ty] = polar(R + 11, angle);
+      const [h1x, h1y] = polar(R + 18, angle - 2.6), [h2x, h2y] = polar(R + 18, angle + 2.6);
+      const [hx, hy] = polar(R + 17, angle), [mx, my] = polar(FAN_ORBIT, at);
+      return `<g class="leader" data-sensor="${esc(s.id)}">
+        <path class="leader-line" d="M${hx.toFixed(1)},${hy.toFixed(1)} L${mx.toFixed(1)},${my.toFixed(1)}"/>
+        <path class="pointer" d="M${tx.toFixed(1)},${ty.toFixed(1)} L${h1x.toFixed(1)},${h1y.toFixed(1)} L${h2x.toFixed(1)},${h2y.toFixed(1)} Z"/>
+      </g>`;
+    }).join("");
+    const out = placed.map(({ s, angle, overflow, at, fanned }) => {
+      const orbit = fanned ? FAN_ORBIT : ORBIT;
+      const [x, y] = polar(orbit, at);
+      // A lone marker points at the ring itself; a fanned one has its leader.
+      let pointer = "";
+      if (!fanned) {
+        const [tx, ty] = polar(R + 12, angle);
+        const [b1x, b1y] = polar(orbit - 9, angle - 3.2), [b2x, b2y] = polar(orbit - 9, angle + 3.2);
+        pointer = `<path class="pointer" d="M${tx.toFixed(1)},${ty.toFixed(1)} L${b1x.toFixed(1)},${b1y.toFixed(1)} L${b2x.toFixed(1)},${b2y.toFixed(1)} Z"/>`;
+      }
       let tick = "";
       if (overflow) {
         // A double chevron just past the pinned marker, pointing on round
@@ -166,10 +204,11 @@ const NowView = (() => {
         tick = `<path class="overflow-tick" d="${chev(angle + dir * 8)} ${chev(angle + dir * 13)}"/>`;
       }
       return `<g class="marker zone-${s.zone}" data-sensor="${esc(s.id)}" data-n="${s.n}"
-          data-angle="${angle.toFixed(2)}" data-overflow="${overflow ? 1 : 0}">
+          data-angle="${angle.toFixed(2)}" data-at="${at.toFixed(2)}" data-fanned="${fanned ? 1 : 0}"
+          data-overflow="${overflow ? 1 : 0}">
         <title>${s.n}. ${esc(s.name)}: ${deg(s.reading)} (${signed(s.position, 2)} band)</title>
-        <path class="pointer" d="M${tx.toFixed(1)},${ty.toFixed(1)} L${b1x.toFixed(1)},${b1y.toFixed(1)} L${b2x.toFixed(1)},${b2y.toFixed(1)} Z"/>
-        <circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="9.5"/>
+        ${pointer}
+        <circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${MARK_R}"/>
         <text x="${x.toFixed(1)}" y="${(y + 3.6).toFixed(1)}">${s.n}</text>${tick}
       </g>`;
     }).join("");
@@ -178,7 +217,7 @@ const NowView = (() => {
         <title>${s.n}. ${esc(s.name)}: ${s.stale ? `stale since ${esc(s.stale_since)}` : esc(s.status)}</title>
         <circle cx="${x0 + i * gap}" cy="124" r="8.5"/>
         <text x="${x0 + i * gap}" y="127.5">${s.n}</text></g>`).join("");
-    return out + hol;
+    return leaders + out + hol;
   }
 
   function donut(room) {
@@ -505,7 +544,8 @@ const NowView = (() => {
     timer = setInterval(load, POLL_MS);
   }
 
-  return { render, stop, markerAngle, stateLabel, reply, EDGE, SWEEP, PAST };
+  return { render, stop, markerAngle, spread, stateLabel, reply, EDGE, SWEEP, PAST,
+           R, FAN_SEP };
 })();
 
 function renderNow() { NowView.render(); }

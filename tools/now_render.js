@@ -99,6 +99,24 @@ function facts() {
     notes: Object.fromEntries(rows.map((r) => [r.dataset.sensor,
       (r.querySelector(".note") || { textContent: "" }).textContent.trim()])),
     angles: Object.fromEntries(placed.map((m) => [m.dataset.sensor, parseFloat(m.dataset.angle)])),
+    ats: Object.fromEntries(placed.map((m) => [m.dataset.sensor, parseFloat(m.dataset.at)])),
+    fanned: room.querySelectorAll('.marker[data-fanned="1"]').length,
+    ring: NowView.R + 11,           // where a leader's arrowhead touches the ring
+    // Each placed marker as drawn: its true angle, where the fan put it, its
+    // circle, whether its number is on top at its own place, and its leader.
+    markers: placed.map((m) => {
+      const c = m.querySelector("circle"), txt = m.querySelector("text").getBoundingClientRect();
+      const top = document.elementFromPoint(txt.x + txt.width / 2, txt.y + txt.height / 2);
+      const leader = room.querySelector(`.leader[data-sensor="${m.dataset.sensor}"]`);
+      const pts = (d) => (d.match(/-?[\d.]+,-?[\d.]+/g) || []).map((xy) => xy.split(",").map(Number));
+      return { sensor: m.dataset.sensor, angle: parseFloat(m.dataset.angle),
+               at: parseFloat(m.dataset.at), fanned: m.dataset.fanned === "1",
+               cx: Number(c.getAttribute("cx")), cy: Number(c.getAttribute("cy")),
+               r: Number(c.getAttribute("r")),
+               on_top: !!top && !!top.closest(".marker") && top.closest(".marker") === m,
+               tip: leader ? pts(leader.querySelector(".pointer").getAttribute("d"))[0] : null,
+               line: leader ? pts(leader.querySelector(".leader-line").getAttribute("d")) : null };
+    }),
     centre: t(".setpoint text"),
     steps: Number((room.querySelector(".chevrons") || { dataset: {} }).dataset.steps),
     chevrons: room.querySelectorAll(".chevron").length,
@@ -127,6 +145,17 @@ function compare(c, got) {
       for (const [sid, a] of Object.entries(value)) {
         if (!(Math.abs(got.angles[sid] - a) < 0.01)) fail(c.name, `${sid} at ${got.angles[sid]}°, expected ${a}°`);
       }
+    } else if (key === "ats") {
+      for (const [sid, a] of Object.entries(value)) {
+        if (!(Math.abs(got.ats[sid] - a) < 0.01)) fail(c.name, `${sid} drawn at ${got.ats[sid]}°, expected ${a}°`);
+      }
+    } else if (key === "centred") {
+      // the fanned group sits round the mean of its members' own angles
+      const mean = (xs) => xs.reduce((t, x) => t + x, 0) / xs.length;
+      const fanned = got.markers.filter((m) => m.fanned);
+      if (!(Math.abs(mean(fanned.map((m) => m.at)) - mean(fanned.map((m) => m.angle))) < 0.01)) {
+        fail(c.name, `the fan isn't centred on its markers' mean angle: ${JSON.stringify(fanned)}`);
+      }
     } else if (key === "edges") {
       // checked in the page below
     } else if (JSON.stringify(got[key]) !== JSON.stringify(value)) {
@@ -142,6 +171,35 @@ function compare(c, got) {
     fail(c.name, `markers numbered ${got.marker_numbers}, rows ${got.row_numbers}`);
   }
   if (got.ticks !== got.overflow) fail(c.name, `${got.ticks} overflow ticks for ${got.overflow} pinned markers`);
+  // Always: markers never cover one another, every number is on top at its
+  // own place, order round the arc is kept, nothing goes past the ends of
+  // the scale, and a fanned marker's leader runs from an arrowhead on the
+  // ring at its own place to the marker; a lone one is at its own place.
+  const ms = got.markers;
+  ms.forEach((a, i) => ms.slice(i + 1).forEach((b) => {
+    const d = Math.hypot(a.cx - b.cx, a.cy - b.cy);
+    if (d < a.r + b.r + 2) fail(c.name, `markers ${a.sensor} and ${b.sensor} overlap (${d.toFixed(1)} px apart)`);
+  }));
+  ms.forEach((m) => {
+    if (!m.on_top) fail(c.name, `marker ${m.sensor}'s number is covered`);
+    if (m.at < -135.001 || m.at > 135.001) fail(c.name, `marker ${m.sensor} drawn at ${m.at}°, past the scale`);
+    const rad = (m.angle * Math.PI) / 180, ring = [got.ring * Math.sin(rad), -got.ring * Math.cos(rad)];
+    if (m.fanned) {
+      const end = m.line && m.line[m.line.length - 1];
+      if (!m.tip || Math.hypot(m.tip[0] - ring[0], m.tip[1] - ring[1]) > 0.15
+          || !end || Math.hypot(end[0] - m.cx, end[1] - m.cy) > 0.15) {
+        fail(c.name, `marker ${m.sensor}'s leader ${JSON.stringify([m.tip, m.line])} doesn't run from ` +
+          `its place on the ring ${ring.map((v) => v.toFixed(1))} to its marker`);
+      }
+    } else if (Math.abs(m.at - m.angle) > 0.005 || m.tip) {
+      fail(c.name, `lone marker ${m.sensor} drawn at ${m.at}°, its place ${m.angle}°`);
+    }
+  });
+  const byPlace = [...ms].sort((a, b) => a.angle - b.angle || a.at - b.at).map((m) => m.sensor);
+  const byDrawn = [...ms].sort((a, b) => a.at - b.at).map((m) => m.sensor);
+  if (JSON.stringify(byPlace) !== JSON.stringify(byDrawn)) {
+    fail(c.name, `drawn round the arc as ${byDrawn}, but placed as ${byPlace}`);
+  }
   if (got.overflowing) fail(c.name, "the page scrolls sideways");
 }
 
@@ -265,6 +323,37 @@ async function fanCheck(browser, c) {
       "Already correcting, ignored", "Sent", "Not sent: no enabled room 'x'"];
     if (JSON.stringify(got) !== JSON.stringify(want)) fail("replies", `${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
     console.log(`${failures.some((f) => f.startsWith("replies")) ? "FAIL" : "ok  "} replies: accepted too hot -> cooling harder, accepted too cold -> resting, ignored -> ignored, no report -> sent`);
+    await context.close();
+  }
+
+  // The fan layout on its own: a group centred on its members' mean, FAN_SEP
+  // apart; a merge that reaches back into the group before it; a group kept
+  // within the end of the scale; markers far enough apart left alone.
+  {
+    const c = cases.find((x) => x.name === "cool");
+    const context = await browser.newContext({ viewport: c.viewport });
+    await serve(context, c, []);
+    const page = await context.newPage();
+    await page.goto("http://ac.test/");
+    await page.waitForSelector(".now-room");
+    const got = await page.evaluate(() => {
+      const ats = (angles) => NowView.spread(angles).map((m) => [Number(m.at.toFixed(2)), m.fanned]);
+      return { sep: NowView.FAN_SEP, three: ats([10, 11, 12]), cascade: ats([-20, -5, 4, 5]),
+               end: ats([120, 135, 135]), apart: ats([-30, 0, 30]) };
+    });
+    const s = got.sep, r = (x) => Number(x.toFixed(2));
+    const want = {
+      three: [[r(11 - s), true], [11, true], [r(11 + s), true]],
+      // -5 and 4 merge, the pair then reaches back to -20, and 5 joins them
+      cascade: [-1.5, -0.5, 0.5, 1.5].map((k) => [r(-4 + k * s), true]),
+      end: [[r(135 - 2 * s), true], [r(135 - s), true], [135, true]],
+      apart: [[-30, false], [0, false], [30, false]] };
+    for (const [k, w] of Object.entries(want)) {
+      if (JSON.stringify(got[k]) !== JSON.stringify(w)) fail("fan layout", `${k}: ${JSON.stringify(got[k])}, expected ${JSON.stringify(w)}`);
+    }
+    console.log(`${failures.some((f) => f.startsWith("fan layout")) ? "FAIL" : "ok  "} fan layout: ` +
+      `close markers ${s.toFixed(2)}° apart round their mean, merging groups, kept within the scale; ` +
+      `markers far enough apart stay at their own places`);
     await context.close();
   }
 

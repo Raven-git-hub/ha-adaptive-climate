@@ -5,8 +5,10 @@ Builds /api/now's payload for each case through the real app.nowview (via
 tools/now_cases.py), then loads the real UI (app/static) in headless
 Chromium with that payload stubbed in (tools/now_render.js, Playwright), and
 checks what is drawn: the label strip, the lock, the fan, the markers
-(placed, hollow, pinned with an overflow tick, and where the leaned edges
-land), the table's order and notes, the buttons and the status strip. It
+(placed, hollow, pinned with an overflow tick, where the leaned edges land,
+and in every case never covering one another: close ones fan out along the
+arc, each with a leader to its own place), the table's order and notes, the
+buttons and the status strip. It
 also presses the vote buttons against a stubbed API (each reply must follow
 Home Assistant's report and the direction pressed, and the card the state
 that follows), checks the fan spins about its own centre, and saves a
@@ -117,6 +119,19 @@ def cases() -> list[dict]:
                              "edges": [-0.4, 1.6], "forecast_pinned": True,
                              "centre": "19\u00b0", "steps": -3, "correction": "\u22124\u00b0"},
              state="boost", offset=-2, readings=(25.6, 23.6, 24.6), forecast=(18.0, 20.0)),
+        # Three sensors within a fifth of a degree of each other: their
+        # markers (at 19.3, 21.2 and 23.1 degrees) would land on one
+        # another, so they fan out round 21.2, each with a leader to its
+        # own place.
+        case("crowded", {"placed": 3, "fanned": 3, "centred": True,
+                         "rows": ["living3", "living2", "living1"],
+                         "ats": {"living1": 7.95, "living2": 21.21, "living3": 34.48}},
+             readings=(24.30, 24.33, 24.36)),
+        # Two pinned at the warm end: the fan stops at the end of the scale,
+        # the one furthest out nearest it.
+        case("crowded-end", {"placed": 3, "fanned": 2, "overflow": 2,
+                             "ats": {"living1": 135.0, "living2": 121.74}},
+             readings=(30.0, 29.0, 24.6)),
         case("two-units", {"label": "Cool \u00b7 Low", "unit_chips": 1},
              readings=COOL, second_unit="rest"),
         # Offset +1: set to 24, a chevron up.
