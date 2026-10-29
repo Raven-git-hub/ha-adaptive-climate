@@ -46,7 +46,7 @@ ROOM_KEYS = {"id", "name", "section", "section_name", "hold", "guard", "comfort_
              "conditions", "block", "heat_sources", "votes", "units", "sensors", "last_vote"}
 UNIT_KEYS = {"id", "name", "entity_id", "available", "hvac_mode", "fan_mode",
              "current_temperature", "setpoint", "fan_speed", "control", "setpoint_applied",
-             "target", "driving", "leak"}
+             "target", "set_to", "off", "correction", "leak"}
 CONTROL_KEYS = {"state", "base", "offset", "forced", "unblocked", "since", "in_grace"}
 SENSOR_KEYS = {"id", "name", "entity_id", "virtual", "reading", "last_reported", "stale",
                "stale_since", "status", "comfort", "band", "trust", "position", "zone"}
@@ -129,12 +129,12 @@ def main_() -> int:
     check((room["id"], room["section"], room["section_name"], room["hold"]) ==
           (ROOM, "night", "Night", False)
           and (unit["id"], unit["control"]["state"], unit["control"]["offset"],
-               unit["setpoint_applied"], unit["driving"], unit["fan_speed"]) ==
-          (UNIT, "boost", -1, 23.0, 20.0, "fast")
+               unit["setpoint_applied"], unit["set_to"], unit["off"], unit["correction"],
+               unit["fan_speed"]) == (UNIT, "boost", -1, 23.0, 20.0, False, -3.0, "fast")
           and unit["leak"] == {"enabled": True, "latched": True, "confirming": False}
           and any(w["kind"] == "leak" and w["level"] == "error" for w in j["warnings"]),
-          "the unit: boost at offset -1, applied 23, driven to 23 - 1 - 2 = 20, fan fast; its "
-          "leak latch on, and at the top of the warnings")
+          "the unit: boost at offset -1, applied 23, set to 23 - 1 - 2 = 20 (a correction of "
+          "-3), fan fast; its leak latch on, and at the top of the warnings")
     cond = room["conditions"]
     check(cond["live"] and (cond["cold_edge"], cond["warm_edge"], cond["block_mode"],
                             cond["outdoor_mean"], cond["outdoor_max"]) ==
@@ -151,6 +151,18 @@ def main_() -> int:
           and room["comfort_point"] == 24.0 and room["margin"] == -1.0,
           "the sensors: readings, place in band and zone against the leaned edges; the quorum "
           "met too warm; comfort point 24, margin -1 (the config's start, nothing learned)")
+
+    # --- what a unit is set to: off while resting, its own setpoint in manual ---
+    for st, extra, want in (("rest", {}, (None, True, None)),
+                            ("manual", {"unit_setpoint": 25.0}, (25.0, False, 2.0)),
+                            ("boost", {"forced": True, "base": 22.0}, (20.0, False, -3.0))):
+        cfg_u, states_u, almanacs_u, _ = world(st, now=now, **extra)
+        client = setup(StubRest(states_u), cfg_u)
+        main.state.store.current_almanac = lambda room_id, as_of=None: almanacs_u.get(room_id)
+        u = client.get("/api/now").json()["rooms"][0]["units"][0]
+        check((u["set_to"], u["off"], u["correction"]) == want,
+              f"{st}{' ' + str(extra) if extra else ''}: set to {u['set_to']}, off "
+              f"{u['off']}, correction {u['correction']}")
 
     # --- warnings: a stale sensor and a hold ---
     cfg, states, almanacs, _ = world(readings=(24.3, 23.8, 24.6), stale={"living2": 180},
@@ -222,6 +234,15 @@ def main_() -> int:
           "ignored: one correction per episode), not the earlier one")
     saved_wait = main.VOTE_WAIT_SECONDS
     main.VOTE_WAIT_SECONDS = 0.3
+    runtime = SimpleNamespace(last_votes={}, tz=HK)
+
+    def other(domain, service, data):          # someone presses the other button meanwhile
+        runtime.last_votes[ROOM] = {"seq": 1, "direction": "too_cold", "accepted": True,
+                                    "source": "button"}
+    client = setup(StubRest(states, on_call=other), cfg, runtime)
+    j = client.post(f"/api/rooms/{ROOM}/vote", json={"direction": "too_hot"}).json()
+    check(j["outcome"] is None, "a report in the other direction isn't this press's: no "
+                                "outcome, rather than another vote's")
     rest = StubRest(states)                      # HA never reports it
     client = setup(rest, cfg, SimpleNamespace(last_votes={}, tz=HK))
     j = client.post(f"/api/rooms/{ROOM}/vote", json={"direction": "too_cold"}).json()

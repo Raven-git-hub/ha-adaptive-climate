@@ -38,6 +38,8 @@ const NowView = (() => {
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const deg = (x, d = 1) => (x === null || x === undefined ? "—" : `${Number(x).toFixed(d)}°`);
   const signed = (x, d = 1) => `${x > 0 ? "+" : x < 0 ? "−" : "±"}${Math.abs(x).toFixed(d)}`;
+  // A setpoint: whole degrees as such, a half as one decimal.
+  const temp = (x) => `${Number.isInteger(x) ? x : Number(x).toFixed(1)}°`;
 
   function polar(r, a) {
     const t = (a * Math.PI) / 180;
@@ -222,10 +224,18 @@ const NowView = (() => {
     for (let d = -SCALE_RANGE; d <= SCALE_RANGE; d++) {
       ticks.push(`<line class="tick${d === 0 ? " zero" : ""}" x1="${x - (d % 5 ? 4 : 7)}" x2="${x + (d % 5 ? 4 : 7)}" y1="${y(d)}" y2="${y(d)}"/>`);
     }
-    const offset = c ? c.offset : 0;
+    // Chevrons: what the unit is set to against the learned setpoint, one
+    // per degree up to three, up for warmer (the offset, a vote's moved
+    // base, a boost all count).
+    const corr = unit ? unit.correction : null;
+    const steps = corr === null || corr === undefined ? 0
+      : Math.sign(corr) * Math.min(3, Math.round(Math.abs(corr)));
+    // Stacked out from the centre box, 14 px apart: they count degrees,
+    // they don't sit on the ticks.
+    const chevronY = (k) => cy + Math.sign(-steps) * (21 + (k - 1) * 14);
     const chevrons = [];
-    for (let k = 1; k <= Math.min(Math.abs(offset), 3); k++) {
-      const up = offset > 0, yy = up ? y(k) + 6 : y(-k) - 6;
+    for (let k = 1; k <= Math.abs(steps); k++) {
+      const up = steps > 0, yy = chevronY(k);
       chevrons.push(`<path class="chevron" d="M${x - 9},${yy + (up ? 4 : -4)} L${x},${yy + (up ? -4 : 4)} L${x + 9},${yy + (up ? 4 : -4)}"/>`);
     }
     const applied = unit ? unit.setpoint_applied : null;
@@ -246,22 +256,28 @@ const NowView = (() => {
         <text class="small" x="${x + 25}" y="${ly + 11}">max ${deg(cond.outdoor_max)}</text>
       </g>`;
     }
-    const driving = unit && unit.driving !== null && unit.driving !== undefined
-      ? `driving ${deg(unit.driving, 0)}` : unit && unit.control ? "not cooling" : "";
+    // The centre: what the unit is set to now, or Off. The learned value
+    // goes underneath.
+    const centre = !unit || !unit.available ? "\u2014" : unit.off ? "Off"
+      : unit.set_to === null || unit.set_to === undefined ? "\u2014" : temp(unit.set_to);
+    const learned = applied === null || applied === undefined ? "not learned yet"
+      : `learned ${temp(applied)}`;
+    const corrText = steps ? `${corr > 0 ? "+" : "\u2212"}${temp(Math.abs(corr))}` : "";
+    const corrY = (chevronY(1) + chevronY(Math.abs(steps))) / 2 + 3.5;   // beside them
     return `<svg class="scale" viewBox="0 0 120 270" role="img"
-        aria-label="Applied setpoint ${deg(applied, 0)}, offset ${offset}, ${driving}">
+        aria-label="Set to ${centre}${steps ? `, ${corrText} from the learned setpoint` : ""}; ${learned}">
       <text class="scale-cap" x="${x}" y="10">warmer</text>
       <line class="axis" x1="${x}" x2="${x}" y1="${y(SCALE_RANGE)}" y2="${y(-SCALE_RANGE)}"/>
       ${ticks.join("")}
-      ${chevrons.join("")}
-      <g class="setpoint">
+      <g class="chevrons" data-steps="${steps}">${chevrons.join("")}</g>
+      <g class="setpoint${unit && unit.off ? " off" : ""}">
         <rect x="${x - 26}" y="${cy - 14}" width="52" height="28" rx="7"/>
-        <text x="${x}" y="${cy + 6}">${applied === null || applied === undefined ? "—" : deg(applied, 0)}</text>
+        <text x="${x}" y="${cy + 6}">${centre}</text>
       </g>
-      ${offset ? `<text class="offset" x="${x}" y="${offset > 0 ? y(Math.min(offset, 3)) - 14 : y(-Math.min(-offset, 3)) + 22}">offset ${offset > 0 ? "+" : "−"}${Math.abs(offset)}</text>` : ""}
+      ${steps ? `<text class="correction" x="${x - 13}" y="${corrY}">${corrText}</text>` : ""}
       ${forecast}
       <text class="scale-cap" x="${x}" y="246">cooler</text>
-      <text class="driving" x="${x}" y="264">${esc(driving)}</text>
+      <text class="learned" x="${x}" y="264">${esc(learned)}</text>
     </svg>`;
   }
 
@@ -340,7 +356,7 @@ const NowView = (() => {
   function otherUnits(room) {
     return room.units.slice(1).map((u) => {
       const [label, sub] = stateLabel(u, room);
-      return `<span class="unit-chip fan-${u.fan_speed}" data-unit="${esc(u.id)}">${esc(u.name)}: ${esc(label)}${sub ? ` · ${esc(sub)}` : ""}${u.driving ? ` · ${deg(u.driving, 0)}` : ""}</span>`;
+      return `<span class="unit-chip fan-${u.fan_speed}" data-unit="${esc(u.id)}">${esc(u.name)}: ${esc(label)}${sub ? ` · ${esc(sub)}` : ""}${u.off ? "" : u.set_to !== null && u.set_to !== undefined ? ` · set to ${temp(u.set_to)}` : ""}</span>`;
     }).join("");
   }
 
@@ -420,6 +436,18 @@ const NowView = (() => {
     messages[room] = { text, kind, until: Date.now() + seconds * 1000 };
   }
 
+  // What the card says after a press: from Home Assistant's own report of
+  // it (accepted or ignored, and the direction it took), "Sent" when none
+  // came back in time.
+  function reply(ok, j, pressed) {
+    if (!ok) return [`Not sent: ${j.detail || "error"}`, "err"];
+    const o = j.outcome;
+    if (!o) return ["Sent", "info"];
+    if (!o.accepted) return ["Already correcting, ignored", "warn"];
+    return (o.direction || pressed) === "too_cold"
+      ? ["Got it, resting", "ok"] : ["Got it, cooling harder", "ok"];
+  }
+
   async function vote(room, direction) {
     pending.add(room);
     draw();
@@ -428,10 +456,7 @@ const NowView = (() => {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ direction }) });
       const j = await r.json();
-      if (!r.ok) say(room, `Not sent: ${j.detail || r.status}`, "err");
-      else if (!j.outcome) say(room, "Sent", "info");
-      else if (!j.outcome.accepted) say(room, "Already correcting, ignored", "warn");
-      else say(room, direction === "too_cold" ? "Got it, resting" : "Got it, cooling harder", "ok");
+      say(room, ...reply(r.ok, j, direction));
     } catch {
       say(room, "Not sent: the API can't be reached", "err");
     }
@@ -480,7 +505,7 @@ const NowView = (() => {
     timer = setInterval(load, POLL_MS);
   }
 
-  return { render, stop, markerAngle, stateLabel, EDGE, SWEEP, PAST };
+  return { render, stop, markerAngle, stateLabel, reply, EDGE, SWEEP, PAST };
 })();
 
 function renderNow() { NowView.render(); }

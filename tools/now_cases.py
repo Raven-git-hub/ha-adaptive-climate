@@ -47,7 +47,8 @@ def world(state: str = "cool", *, offset: int = 0, base: float = 0.0, forced: bo
           was_blocked: bool = False, margin: float = -1.0, stale: dict | None = None,
           heat_on: bool | None = None, leak: bool = False, hold: bool = False,
           second_unit: str | None = None, applied: float = 23.0, rooms: str = "one",
-          unit_available: bool = True, now: datetime = NOW) -> tuple[dict, dict, dict, dict]:
+          unit_available: bool = True, unit_setpoint: float | None = None,
+          now: datetime = NOW) -> tuple[dict, dict, dict, dict]:
     """(config, states, almanacs, margins) for one Main Room situation.
     forecast: (mean, max) for the conditions entity, None for no entity.
     stale: {sensor_id: minutes since last reported}. rooms "all" keeps the
@@ -98,8 +99,10 @@ def world(state: str = "cool", *, offset: int = 0, base: float = 0.0, forced: bo
         ctx = control.Context(setpoint_applied=applied)
         cmd = control.command_for(st, control.target_base(control.Unit(base=base or None), ctx),
                                   offset, ctx)
+        shown = unit_setpoint if unit_setpoint is not None and unit["id"] == UNIT else \
+            cmd.temperature if cmd and cmd.temperature else applied
         put(unit["entity_id"], mode if unit_available else "unavailable",
-            temperature=(cmd.temperature if cmd and cmd.temperature else applied),
+            temperature=shown,
             current_temperature=24.9, fan_mode=fan or "low", min_temp=16, max_temp=30,
             fan_modes=["low", "medium", "high", "auto"])
         if unit.get("leak_detection", {}).get("enabled"):

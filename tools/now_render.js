@@ -23,7 +23,12 @@ function fail(name, what) {
 
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
 
+// The stubbed API. /api/now answers with the case's payload until a vote
+// step says what comes next; each vote press answers with its step's
+// outcome, as Home Assistant's ac_person_vote would report it.
 async function serve(context, c, posts) {
+  let current = c.data;
+  let presses = 0;
   await context.route("**/*", async (route) => {
     const req = route.request();
     const url = new URL(req.url());
@@ -35,7 +40,7 @@ async function serve(context, c, posts) {
       const file = path.join(staticDir, p.slice("/static/".length));
       return route.fulfill({ path: file, contentType: TYPES[path.extname(file)] });
     }
-    if (p === "/api/now") return route.fulfill({ json: c.data });
+    if (p === "/api/now") return route.fulfill({ json: current });
     if (p === "/api/events") return route.fulfill({ json: { events: [] } });
     if (p === "/api/rooms") {
       return route.fulfill({ json: { rooms: c.data.rooms.map((r) => ({ id: r.id, name: r.name,
@@ -49,10 +54,15 @@ async function serve(context, c, posts) {
       const body = req.postData() ? JSON.parse(req.postData()) : null;
       posts.push({ path: p, body });
       if (p.endsWith("/vote")) {
-        const accepted = body.direction === "too_cold";
+        const st = c.steps[presses++];
+        if (!st || st.press !== body.direction) {
+          fail(c.name, `press ${presses} posted ${body.direction}, the step expects ${st && st.press}`);
+          return route.fulfill({ status: 500, json: { detail: "unexpected press" } });
+        }
+        if (st.after) current = st.after;
         return route.fulfill({ json: { pressed: `input_button.ac_${body.direction}_main_room`,
-          direction: body.direction, outcome: { seq: posts.length, direction: body.direction,
-            accepted, source: "button" } } });
+          direction: body.direction, outcome: st.outcome === null ? null : { seq: presses,
+            direction: body.direction, accepted: st.outcome.accepted, source: "button" } } });
       }
       if (p.endsWith("/leak-fixed")) {
         return route.fulfill({ json: { confirmed: "input_boolean.ac_leak_confirmed_main_room_main_room_ac" } });
@@ -89,8 +99,12 @@ function facts() {
     notes: Object.fromEntries(rows.map((r) => [r.dataset.sensor,
       (r.querySelector(".note") || { textContent: "" }).textContent.trim()])),
     angles: Object.fromEntries(placed.map((m) => [m.dataset.sensor, parseFloat(m.dataset.angle)])),
-    setpoint: t(".setpoint text"), driving: t(".driving"),
-    chevrons: room.querySelectorAll(".chevron").length, offset: t(".offset"),
+    centre: t(".setpoint text"),
+    steps: Number((room.querySelector(".chevrons") || { dataset: {} }).dataset.steps),
+    chevrons: room.querySelectorAll(".chevron").length,
+    chevrons_up: room.querySelector(".chevrons").dataset.steps > 0,
+    correction: t(".correction"), learned: t(".learned"),
+    reply: (document.querySelector(".vote-msg") || { textContent: "" }).textContent.trim(),
     forecast: !!room.querySelector(".forecast"),
     quorum: t(".quorum"),
     leak_button: !!room.querySelector('button[data-action="leak"]'),
@@ -132,17 +146,28 @@ function compare(c, got) {
 }
 
 async function interact(c, page, posts) {
-  if (c.interact === "vote") {
-    await page.click('button[data-direction="too_hot"]');
-    await page.waitForFunction(() => document.querySelector(".vote-msg").textContent.includes("ignored"));
-    const hot = posts.find((p) => p.path === "/api/rooms/main_room/vote");
-    if (!hot || hot.body.direction !== "too_hot") fail(c.name, `too hot posted ${JSON.stringify(posts)}`);
-    const msg = await page.textContent(".vote-msg");
-    if (msg !== "Already correcting, ignored") fail(c.name, `after an ignored press: "${msg}"`);
-    await page.click('button[data-direction="too_cold"]');
-    await page.waitForFunction(() => document.querySelector(".vote-msg").textContent.includes("Got it"));
-    const msg2 = await page.textContent(".vote-msg");
-    if (msg2 !== "Got it, resting") fail(c.name, `after an accepted too cold: "${msg2}"`);
+  if (c.steps.length) {
+    for (let i = 0; i < c.steps.length; i++) {
+      const st = c.steps[i];
+      await page.click(`button[data-direction="${st.press}"]`);
+      try {
+        await page.waitForFunction((want) => document.querySelector(".vote-msg").textContent.trim() === want
+          && !document.querySelector('button[data-action="vote"][disabled]'), st.reply, { timeout: 5000 });
+      } catch {
+        fail(c.name, `press ${i + 1} (${st.press}) replied "${await page.textContent(".vote-msg")}", expected "${st.reply}"`);
+      }
+      const got = await page.evaluate(facts);
+      for (const [key, value] of Object.entries(st.expect)) {
+        if (JSON.stringify(got[key]) !== JSON.stringify(value)) {
+          fail(c.name, `after press ${i + 1} (${st.press}): ${key} ${JSON.stringify(got[key])}, expected ${JSON.stringify(value)}`);
+        }
+      }
+      if (i === c.shot_step) await shot(c, page);
+    }
+    const votes = posts.filter((p) => p.path === "/api/rooms/main_room/vote").map((p) => p.body.direction);
+    if (JSON.stringify(votes) !== JSON.stringify(c.steps.map((st) => st.press))) {
+      fail(c.name, `posted ${votes}, pressed ${c.steps.map((st) => st.press)}`);
+    }
   } else if (c.interact === "leak") {
     await page.click('button[data-action="leak"]');
     const confirm = await page.textContent(".actions .confirm");
@@ -209,18 +234,40 @@ async function fanCheck(browser, c) {
         fail(c.name, `edges ${cold}/${warm} map to ${angles}, expected ${want}`);
       }
     }
-    if (c.interact === "leak") {
+    if (c.steps.length) await interact(c, page, posts);       // screenshots at its shot_step
+    else if (c.interact === "leak") {
       await shot(c, page);
       await interact(c, page, posts);
-    } else {
-      await interact(c, page, posts);
-      await shot(c, page);
-    }
+    } else await shot(c, page);
     console.log(`${failures.some((f) => f.startsWith(c.name + ":")) ? "FAIL" : "ok  "} ${c.name}: ` +
       `${got.label}${got.sub ? " / " + got.sub : ""}${got.lock ? ", lock: " + got.lock : ""}, fan ${got.fan}, ` +
       `${got.placed} placed + ${got.hollow} hollow (${got.overflow} pinned), rows ${got.rows.join(" > ")}`);
     await context.close();
   }
+  // The reply mapping on its own: Home Assistant's report decides, by the
+  // direction it took.
+  {
+    const c = cases.find((x) => x.name === "cool");
+    const context = await browser.newContext({ viewport: c.viewport });
+    await serve(context, c, []);
+    const page = await context.newPage();
+    await page.goto("http://ac.test/");
+    await page.waitForSelector(".now-room");
+    const got = await page.evaluate(() => [
+      NowView.reply(true, { outcome: { accepted: true, direction: "too_hot" } }, "too_hot"),
+      NowView.reply(true, { outcome: { accepted: true, direction: "too_cold" } }, "too_cold"),
+      NowView.reply(true, { outcome: { accepted: false, direction: "too_hot" } }, "too_hot"),
+      NowView.reply(true, { outcome: { accepted: false, direction: "too_cold" } }, "too_cold"),
+      NowView.reply(true, { outcome: null }, "too_hot"),
+      NowView.reply(false, { detail: "no enabled room 'x'" }, "too_cold"),
+    ].map((r) => r[0]));
+    const want = ["Got it, cooling harder", "Got it, resting", "Already correcting, ignored",
+      "Already correcting, ignored", "Sent", "Not sent: no enabled room 'x'"];
+    if (JSON.stringify(got) !== JSON.stringify(want)) fail("replies", `${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
+    console.log(`${failures.some((f) => f.startsWith("replies")) ? "FAIL" : "ok  "} replies: accepted too hot -> cooling harder, accepted too cold -> resting, ignored -> ignored, no report -> sent`);
+    await context.close();
+  }
+
   // Switching tabs: the Log view replaces the Now view, and Now comes back.
   {
     const c = cases.find((x) => x.name === "cool");

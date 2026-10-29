@@ -417,8 +417,9 @@ async def api_vote(room_id: str, body: dict) -> dict:
     dashboard would. Home Assistant's vote automation decides whether the
     vote is accepted (one correction per episode) and reports it in
     ac_person_vote; with the runtime live, this waits up to
-    VOTE_WAIT_SECONDS for that report and returns it as `outcome` (None:
-    not heard in time, which the UI shows as "sent")."""
+    VOTE_WAIT_SECONDS for that report (the next one for the room in the
+    direction pressed) and returns it as `outcome` (None: not heard in time,
+    which the UI shows as "sent")."""
     import asyncio
     from app import control
     from app.generator import button_id
@@ -443,7 +444,9 @@ async def api_vote(room_id: str, body: dict) -> dict:
         deadline = loop.time() + VOTE_WAIT_SECONDS
         while loop.time() < deadline:
             latest = votes.get(room_id)
-            if latest and latest["seq"] > seq:
+            # this press's report: newer than the press, and in its direction
+            # (a press of the other button meanwhile is someone else's)
+            if latest and latest["seq"] > seq and latest.get("direction") == direction:
                 outcome = latest
                 break
             await asyncio.sleep(0.1)

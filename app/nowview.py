@@ -13,7 +13,9 @@ the view shows what Home Assistant is acting on, through app.control:
   * positions and the quorum are control.evaluate_votes against those edges;
   * the block is the conditions' own, or a heat source that is on (shadow
     and active modes), as control.room_blocked;
-  * the temperature a unit is driven to now is control.command_for.
+  * what a unit is set to now is control.command_for's target (base +
+    offset, minus boost_degrees in boost), and its correction the distance
+    from the learned setpoint_applied.
 
 The JS (app/static/now.js) only draws: no control rule is computed there.
 """
@@ -28,6 +30,7 @@ from app.generator import (SECTIONS, base_id, conditions_id, forced_id, grace_un
                            scene_select_id, since_id, state_id, unblocked_id)
 
 NO_STATE = ("unavailable", "unknown", None)
+OFF_STATES = ("rest", "user_off", "config_off", "leak")   # control states that leave the unit off
 SLOW_FANS = ("low", "quiet", "auto", "silent")     # anything else on is "fast"
 FAIL_OPEN_TEXT = {
     "missing": "no conditions published yet",
@@ -167,6 +170,18 @@ def _unit(config: dict, room: dict, unit: dict, states: dict, section_units: dic
     target = control.target_base(control.Unit(base=base), ctx)
     command = control.command_for(helper, target, offset, ctx) \
         if helper in ("cool", "boost") else None
+    # What the unit is set to now: our command's target in cool or boost
+    # (base + offset, minus boost_degrees in boost), the person's own setpoint
+    # in manual, nothing while it is off. The correction is its distance from
+    # the learned setpoint_applied: the offset, a vote's moved base, a boost.
+    off = helper in OFF_STATES or (helper not in ("cool", "boost") and hvac == "off")
+    if command is not None:
+        set_to = command.temperature
+    elif helper == "manual" and not off and hvac not in NO_STATE:
+        set_to = _num(a.get("temperature"))
+    else:
+        set_to = None
+    correction = None if set_to is None or applied is None else round(set_to - applied, 1) + 0.0
     leak_on = bool(unit.get("leak_detection", {}).get("enabled"))
     return {
         "id": u, "name": unit.get("name", u), "entity_id": unit["entity_id"],
@@ -182,7 +197,7 @@ def _unit(config: dict, room: dict, unit: dict, states: dict, section_units: dic
             "in_grace": grace is not None and now < grace,
         },
         "setpoint_applied": applied, "target": target,
-        "driving": None if command is None else command.temperature,
+        "set_to": set_to, "off": off, "correction": correction,
         "leak": {"enabled": leak_on, "latched": leak_on and on(leak_id(r, u)),
                  "confirming": leak_on and on(leak_confirm_id(r, u))},
     }
