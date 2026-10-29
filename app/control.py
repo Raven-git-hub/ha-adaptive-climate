@@ -21,6 +21,10 @@ rule is a small named function, written the way a template can say it.
                       ignored when it is our own command showing up
                       (matches_command); a setpoint change is a vote
                       (on_room_vote), anything else goes to on_person_change
+  section_conditions  the outdoor conditions the container decides once per
+                      section (phase 5): the room comfort point, the lean of
+                      the trigger edges and the cooling block, published to
+                      sensor.ac_conditions_<room> for the templates to read
 
 A unit's state lives in its helpers (phase 3b): ac_state, ac_base,
 ac_offset, ac_since, ac_grace_until, ac_unblocked and ac_forced.
@@ -28,6 +32,7 @@ ac_offset, ac_since, ac_grace_until, ac_unblocked and ac_forced.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -55,6 +60,16 @@ VOTE_HANDS_OFF = ("leak", "config_off", "manual")   # a vote leaves these alone
 DEFAULT_MIN_TEMP, DEFAULT_MAX_TEMP = 16.0, 30.0
 DEFAULT_BAND = 5.0      # a sensor with no band yet votes like a low-trust one (v1 template)
 DEFAULT_STALE_MINUTES = 90      # system.sensor_stale_minutes
+
+# Outdoor conditions (phase 5). outdoor.block_mode: off never blocks; shadow
+# decides and logs, but control sees no block; active applies it. A heat
+# source blocks in shadow and active alike.
+BLOCK_MODES = ("off", "shadow", "active")
+HEAT_BLOCK_MODES = ("shadow", "active")
+DEFAULT_BLOCK_MODE = "shadow"
+LEAN_CAP = 0.6          # each edge stays this far on its own side of comfort
+BLOCK_RELEASE = 1.0     # a block lifts only once delta_max <= margin - this
+MARGIN_MIN, MARGIN_MAX = 2.0, 10.0
 
 
 # ---------------------------------------------------------------------
@@ -104,7 +119,9 @@ class Context:
     unit_min: float = DEFAULT_MIN_TEMP
     unit_max: float = DEFAULT_MAX_TEMP
     heartbeat_interval: int = 10        # minutes (system.heartbeat_interval_minutes)
-    blocked: bool = False               # the section's cooling block (or a heat source)
+    blocked: bool = False               # the section's cooling block, as control sees it
+    heat_source_on: bool = False        # one of the room's heat_sources is on
+    block_mode: str = DEFAULT_BLOCK_MODE    # outdoor.block_mode (heat sources block unless off)
     leak_on: bool = False               # the unit's leak latch
     forced_off: bool = False            # the section's scene forces this unit off
     min_delta: float = 0.5              # system.reactive_min_delta
@@ -208,8 +225,20 @@ def in_grace(unit: Unit, now: datetime) -> bool:
     return unit.grace_until is not None and now < unit.grace_until
 
 
+def heat_blocks(ctx: Context) -> bool:
+    """A heat source that is on blocks cooling at once, whatever the
+    forecast, in shadow and active modes."""
+    return ctx.heat_source_on and ctx.block_mode in HEAT_BLOCK_MODES
+
+
+def room_blocked(ctx: Context) -> bool:
+    """The room's cooling block as control sees it: the section's (active
+    mode only, already folded into ctx.blocked) or a heat source's."""
+    return ctx.blocked or heat_blocks(ctx)
+
+
 def effective_blocked(unit: Unit, ctx: Context) -> bool:
-    return ctx.blocked and not unit.unblocked
+    return room_blocked(ctx) and not unit.unblocked
 
 
 def boost_capped(unit: Unit, now: datetime, config: ControlConfig) -> bool:
@@ -388,7 +417,8 @@ def on_person_vote(direction: str, unit: Unit, now: datetime, ctx: Context,
     """One unit's part in an accepted vote. too_cold: a cooling or boosting
     unit rests (off), a resting one stays resting, both forced; user_off
     stays off with the new base. too_hot: a unit cooling, resting, boosting
-    or in user_off boosts, forced. Base = vote_base, offset 0, no grace."""
+    or in user_off boosts, forced, and is unblocked if cooling is blocked.
+    Base = vote_base, offset 0, no grace."""
     if _votes_alone(unit, ctx):
         return _stay(unit, ctx)
     base = vote_base(direction, unit, ctx, chosen)
@@ -399,7 +429,14 @@ def on_person_vote(direction: str, unit: Unit, now: datetime, ctx: Context,
         if unit.state == "user_off":
             return voted, None               # the person's off stands
         return _force(voted, "rest", now, ctx)
-    return _force(voted, "boost", now, ctx)
+    return _force(unblock_for_vote(voted, ctx), "boost", now, ctx)
+
+
+def unblock_for_vote(unit: Unit, ctx: Context) -> Unit:
+    """A too_hot vote while cooling is blocked unblocks the unit for the
+    rest of the section, as a person's on does, so its forced boost isn't
+    sent straight back to rest by the block."""
+    return replace(unit, unblocked=True) if room_blocked(ctx) else unit
 
 
 def on_room_vote(direction: str, units: dict[str, Unit], now: datetime,
@@ -419,6 +456,103 @@ def on_room_vote(direction: str, units: dict[str, Unit], now: datetime,
 def setpoint_direction(before: Climate, after: Climate) -> str:
     """A setpoint raised on a remote says too cold; lowered, too hot."""
     return TOO_COLD if after.temperature > before.temperature else TOO_HOT
+
+
+# ---------------------------------------------------------------------
+# Outdoor conditions (phase 5) - decided by the container once per section
+# and published to sensor.ac_conditions_<room>; the templates read them
+# ---------------------------------------------------------------------
+
+NO_OUTDOOR, NO_COMFORT_POINT = "no_outdoor", "no_comfort_point"    # why it fails open
+
+
+@dataclass(frozen=True)
+class Conditions:
+    """A room's conditions for one section: how far every sensor's trigger
+    edges lean (in band widths) and the cooling block. Locked for the
+    section. delta = comfort point - outdoor: positive is colder outside."""
+    section: str
+    block_mode: str = DEFAULT_BLOCK_MODE
+    margin: float | None = None
+    comfort_point: float | None = None
+    outdoor_mean: float | None = None
+    outdoor_max: float | None = None
+    delta_mean: float | None = None
+    delta_max: float | None = None
+    lean: float | None = None           # k x delta_mean, before the per-edge caps
+    cold_edge: float = -1.0
+    warm_edge: float = 1.0
+    would_block: bool = False           # the decision, shadow mode's "would block" included
+    fail_open: str | None = None        # NO_OUTDOOR or NO_COMFORT_POINT: no lean, no block
+
+    @property
+    def blocked(self) -> bool:
+        """The block as control sees it: the decision, in active mode only."""
+        return self.would_block and self.block_mode == "active"
+
+
+def comfort_point(section_almanac: dict | None,
+                  readings: dict[str, float | None]) -> float | None:
+    """The room comfort point: the trust-weighted mean of the comfort
+    readings of the usable sensors (a comfort reading, and a reading now:
+    neither unavailable nor stale), or their plain mean while none has any
+    trust. None with no usable sensor. To 2 decimals."""
+    learned = (section_almanac or {}).get("sensors") or {}
+    pairs = []
+    for sid, reading in readings.items():
+        entry = learned.get(sid) or {}
+        if reading is not None and entry.get("comfort") is not None:
+            pairs.append((entry["comfort"], entry.get("trust") or 0.0))
+    if not pairs:
+        return None
+    weight = math.fsum(t for _, t in pairs)
+    if weight > 0:
+        return round(math.fsum(c * t for c, t in pairs) / weight, 2)
+    return round(math.fsum(c for c, _ in pairs) / len(pairs), 2)
+
+
+def lean_edges(lean: float | None) -> tuple[float, float]:
+    """(cold_edge, warm_edge) in band widths for a lean of k x delta_mean:
+    the cold edge -1 + lean, capped at +-0.6; the warm edge +1 + lean,
+    capped at -0.6 on the hot side and uncapped on the cold. The caps keep
+    each edge on its own side of the comfort reading, where boosts and
+    rests release. No lean: -1, +1."""
+    if lean is None:
+        return -1.0, 1.0
+    return (round(-1.0 + max(-LEAN_CAP, min(LEAN_CAP, lean)), 3),
+            round(1.0 + max(lean, -LEAN_CAP), 3))
+
+
+def decide_block(delta_max: float | None, margin: float, was_blocked: bool) -> bool:
+    """Block cooling when the section's warmest forecast hour is at least
+    the margin below the comfort point (delta_max >= margin). A room blocked
+    last section stays blocked until delta_max <= margin - 1."""
+    if delta_max is None:
+        return False
+    if was_blocked:
+        return delta_max > margin - BLOCK_RELEASE
+    return delta_max >= margin
+
+
+def section_conditions(section: str, comfort: float | None, outdoor_mean: float | None,
+                       outdoor_max: float | None, margin: float, was_blocked: bool,
+                       block_mode: str, k: float) -> Conditions:
+    """A section's conditions from the room comfort point and the forecast's
+    mean (which leans the edges) and max (which blocks). No outdoor value or
+    no comfort point fails open: edges -1/+1 and no block. block_mode off
+    never blocks; shadow decides (would_block) but control sees no block."""
+    base = Conditions(section, block_mode, margin, comfort, outdoor_mean, outdoor_max)
+    if outdoor_mean is None:
+        return replace(base, fail_open=NO_OUTDOOR)
+    if comfort is None:
+        return replace(base, fail_open=NO_COMFORT_POINT)
+    delta_mean = round(comfort - outdoor_mean, 2)
+    delta_max = None if outdoor_max is None else round(comfort - outdoor_max, 2)
+    lean = round(k * delta_mean, 3)
+    cold, warm = lean_edges(lean)
+    would = block_mode != "off" and decide_block(delta_max, margin, was_blocked)
+    return replace(base, delta_mean=delta_mean, delta_max=delta_max, lean=lean,
+                   cold_edge=cold, warm_edge=warm, would_block=would)
 
 
 # ---------------------------------------------------------------------
@@ -474,8 +608,9 @@ def on_section_change(unit: Unit, ctx: Context, forced_off: bool,
     """The scene at a crossover (and a confirmed leak release). Resets the
     section-scoped fields, then: leak if the latch is on (off is re-sent),
     else config_off if the scene forces the unit off, else rest if cooling
-    is blocked, else cool. user_off, manual and a forced state end here.
-    Minimum times don't apply."""
+    is blocked (room_blocked: the section's block or a heat source), else
+    cool. user_off, manual and a forced state end here. Minimum times don't
+    apply."""
     reset = replace(unit, offset=0, base=ctx.setpoint_applied, unblocked=False,
                     grace_until=None, since=now, forced=False)
     if ctx.leak_on:
@@ -489,7 +624,7 @@ def on_section_change(unit: Unit, ctx: Context, forced_off: bool,
         # leaves it off, and wakes it once there is a setpoint to cool to.
         return replace(reset, state="rest"), None
     else:
-        state = "rest" if ctx.blocked else "cool"
+        state = "rest" if room_blocked(ctx) else "cool"
     new = replace(reset, state=state)
     return new, command_for(state, target_base(new, ctx), 0, ctx)
 

@@ -113,7 +113,20 @@ the current section's scene automation in HA to start a room at once).
   `outdoor.source: forecast`, a configured entity that is missing, has no
   hourly forecast or returns an empty one fails the doctor; with another
   source it is a warning. The outdoor input adds no helper or automation:
-  changing `outdoor.*` needs a restart, not a deploy.
+  changing `outdoor.*` (`block_mode` included) needs a restart, not a deploy,
+  and a `block_mode` change applies from each room's next section. Changing a
+  room's `heat_sources` needs a deploy: the templates read them.
+- **Phase 5 (the lean and the block) needs a deploy.** The scene, maintenance,
+  leak release, vote and manual-change automations now read
+  `sensor.ac_conditions_<room>` and the room's heat sources; no helper
+  changes. The conditions entity is not a helper and not in deploy's
+  reconciliation: the container pushes it (like `sensor.ac_almanac_<room>`)
+  at each crossover, every 5 minutes and after Home Assistant restarts, so
+  there is nothing to create, prune or roll back. While it is missing (before
+  the new container's first crossover, or after an HA restart until the next
+  push) the templates fail open: edges ±1, not blocked. The check lists a heat
+  source Home Assistant doesn't have as a missing entity, and the deploy then
+  aborts.
 - **Run `/api/deploy/check` (or the Config page's "Check deploy" button)
   first.** It is the dry run: it verifies entity existence, names any hold
   that is on, and lists exactly what Deploy would create, reuse, update,
@@ -126,6 +139,11 @@ the current section's scene automation in HA to start a room at once).
   A room with no almanac yet is still left alone: the scene sends nothing
   without a `setpoint_applied`, and maintenance never acts without a base.
 - Never deploy a v2 build that has phase 0 but not phase 1 (see CLAUDE.md).
+- **The block ships in shadow.** With `outdoor.block_mode: shadow` (the
+  default) the container decides and logs each section's block ("would block
+  Night: ...") and learns the margin from it, but tells control `blocked` false;
+  only heat sources block. Turning it `active` (Gate B) is a config change and a
+  restart, not a deploy.
 - **The vote buttons are ours, the things that press them aren't.** Deploy
   creates each room's `input_button.ac_too_cold_<room>` and
   `ac_too_hot_<room>` and the `ac_vote_<room>` automation that acts on them. A

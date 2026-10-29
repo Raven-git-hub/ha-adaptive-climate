@@ -53,6 +53,22 @@ A setpoint-moving reaction is a vote, a setpoint change or knob turn (rows
 recorded before the votes), or a reaction of any kind in which a unit's
 setpoint changed (an `on` with a new setpoint).
 
+Per room, learn_margin replays the cooling block's margin M (phase 5) from
+outdoor.initial_margin, against the decisions stored on each section run
+(shadow ones included; a run in block_mode off, or with no comfort point or
+forecast max, teaches nothing), moving M at reaction_rate, within 2 to 10:
+
+  blocked    a too_hot vote, or a person turning a unit on: toward
+             delta_max + 0.5, so that run would not have been blocked
+  unblocked  a too_cold vote, or a person turning a unit off, within 30
+             minutes of the system starting to cool: toward delta_max
+
+The system started cooling a unit at the run's planned start (the scene)
+if every heartbeat since showed it cooling (cool or boost), or when
+maintenance woke it from rest, dated by the last heartbeat that showed it
+resting: the earliest the wake can have been, so a reaction counted is
+always within 30 minutes of it.
+
 Pure over a sqlite connection, a room dict and an as_of datetime. Nothing
 after as_of is read, so the same database and as_of give the same almanac.
 Run tools/analyser_demo.py for the worked examples.
@@ -65,7 +81,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
-from app.control import SETPOINT_STEP
+from app.control import MARGIN_MAX, MARGIN_MIN, SETPOINT_STEP
 from app.trust import trust_from_band
 
 SECTIONS = ("sunrise", "day", "afternoon", "sunset", "night", "sleep")
@@ -442,3 +458,160 @@ def analyse_room(conn, room: dict, cfg: LearningConfig, as_of: datetime) -> list
         if units or sensors:
             out.append(_replay_section(conn, room_id, sec, units, sensors, reactions, cfg, as_of))
     return out
+
+
+# ---------------------------------------------------------------------
+# The cooling block's margin (phase 5)
+# ---------------------------------------------------------------------
+
+MARGIN_COOLING_WINDOW = timedelta(minutes=30)   # an off this soon after cooling starts
+MARGIN_UNBLOCK = 0.5                            # blocked: toward delta_max + this
+DECIDING_MODES = ("shadow", "active")           # a run in these has a block decision
+COOLING_STATES = ("cool", "boost")
+
+
+@dataclass(frozen=True)
+class MarginConfig:
+    initial: float = 6.0
+    rate: float = 0.5
+
+    @classmethod
+    def from_config(cls, config: dict) -> MarginConfig:
+        """outdoor.initial_margin and learning.reaction_rate."""
+        base = cls()
+        return cls(initial=(config.get("outdoor") or {}).get("initial_margin", base.initial),
+                   rate=config.get("learning", {}).get("reaction_rate", base.rate))
+
+
+@dataclass(frozen=True)
+class MarginStep:
+    """One reaction that moved the margin, for the log and the UI."""
+    at: datetime                    # UTC
+    kind: str                       # too_hot | on (blocked), too_cold | off (unblocked)
+    section: str
+    local_date: str                 # the run's
+    blocked: bool                   # the run's decision (shadow's included)
+    block_mode: str
+    delta_max: float
+    target: float
+    before: float
+    after: float
+    cooling_since: datetime | None = None   # unblocked: when the system started cooling
+
+
+@dataclass(frozen=True)
+class _Run:
+    start: datetime                 # planned start, UTC
+    local_date: str
+    section: str
+    delta_max: float | None         # None: nothing to learn from
+    blocked: bool
+    block_mode: str | None
+
+
+def margin_step(margin: float, target: float, rate: float) -> float:
+    """M halfway (at reaction_rate) toward the target, within 2 to 10."""
+    return min(MARGIN_MAX, max(MARGIN_MIN, margin + rate * (target - margin)))
+
+
+def _runs(conn, room_id: str, until: str) -> list[_Run]:
+    runs = []
+    for d, sec, planned, actual, cp, mx, blocked, mode in conn.execute(
+            "SELECT local_date, section, planned_start, actual_start, comfort_point, "
+            "outdoor_max, blocked, block_mode FROM section_run WHERE room_id = ?", (room_id,)):
+        start = planned or actual
+        if not start or datetime.fromisoformat(start).tzinfo is None:
+            continue
+        at = _at(start)
+        if _utc(at) > until:
+            continue
+        decided = mode in DECIDING_MODES and cp is not None and mx is not None
+        runs.append(_Run(at, d, sec, round(cp - mx, 2) if decided else None,
+                         bool(blocked), mode))
+    return sorted(runs, key=lambda r: r.start)
+
+
+def _margin_reactions(conn, room_id: str, until: str) -> list[tuple]:
+    """(at, room kind, {unit_id: (kind, power_before)}) in time order."""
+    units: dict[int, dict] = {}
+    for rid, uid, kind, power in conn.execute(
+            "SELECT ru.reactive_id, ru.unit_id, ru.kind, ru.power_before FROM reactive_unit ru "
+            "JOIN reactive r ON r.id = ru.reactive_id WHERE r.room_id = ? AND r.ts_utc <= ?",
+            (room_id, until)):
+        units.setdefault(rid, {})[uid] = (kind, power)
+    return [(_at(ts), kind, units.get(rid, {})) for rid, ts, kind in conn.execute(
+        "SELECT id, ts_utc, kind FROM reactive WHERE room_id = ? AND ts_utc <= ? "
+        "ORDER BY ts_utc, id", (room_id, until))]
+
+
+def cooling_since(conn, room_id: str, unit_id: str, run_start: datetime, at: datetime,
+                  power_before: int | None) -> datetime | None:
+    """When the system started cooling the unit, as of `at` in a run that
+    started (its scene) at run_start, from the control state its
+    heartbeats recorded; None if it isn't cooling, or a person started it.
+    Cooling at every heartbeat since the run started: the scene. Cooling
+    since a heartbeat that showed rest: maintenance woke it, dated by that
+    heartbeat. Resting at the last heartbeat but on when a person turned it
+    off (power_before 1): woken since then. No heartbeat yet: the scene,
+    unless the unit was off."""
+    beats = conn.execute(
+        "SELECT h.ts_utc, hu.control_state FROM heartbeat h "
+        "JOIN heartbeat_unit hu ON hu.heartbeat_id = h.id "
+        "WHERE h.room_id = ? AND hu.unit_id = ? AND h.ts_utc >= ? AND h.ts_utc <= ? "
+        "ORDER BY h.ts_utc, h.id", (room_id, unit_id, _utc(run_start), _utc(at))).fetchall()
+    if not beats:
+        return None if power_before == 0 else run_start
+    if beats[-1][1] not in COOLING_STATES:
+        return _at(beats[-1][0]) if beats[-1][1] == "rest" and power_before == 1 else None
+    i = len(beats) - 1
+    while i > 0 and beats[i - 1][1] in COOLING_STATES:
+        i -= 1
+    if i == 0:
+        return run_start
+    return _at(beats[i - 1][0]) if beats[i - 1][1] == "rest" else None
+
+
+def _config_off(room: dict, section: str) -> set[str]:
+    scenes = room.get("scenes", {})
+    return {u["id"] for u in room["units"]
+            if scenes.get(section, {}).get("units", {}).get(u["id"], {}).get("mode") == "off"}
+
+
+def learn_margin(conn, room: dict, cfg: MarginConfig,
+                 as_of: datetime) -> tuple[float, list[MarginStep]]:
+    """Replay the room's block margin as of `as_of`: (M, the steps that
+    moved it). A deterministic replay of the stored section runs, reactions
+    and heartbeats, so it rebuilds from CSV alone."""
+    room_id = room["id"]
+    until = _utc(as_of)
+    runs = _runs(conn, room_id, until)
+    starts = [r.start for r in runs]
+    margin, steps = float(cfg.initial), []
+    for at, kind, units in _margin_reactions(conn, room_id, until):
+        i = bisect.bisect_right(starts, at) - 1
+        if i < 0 or runs[i].delta_max is None:
+            continue
+        run = runs[i]
+        unit_kinds = {k for k, _ in units.values()}
+        since = None
+        if run.blocked and (kind == "too_hot" or "on" in unit_kinds):
+            target, what = run.delta_max + MARGIN_UNBLOCK, "too_hot" if kind == "too_hot" else "on"
+        elif not run.blocked and (kind == "too_cold" or "off" in unit_kinds):
+            what = "too_cold" if kind == "too_cold" else "off"
+            if what == "off":
+                candidates = {uid: p for uid, (k, p) in units.items() if k == "off"}
+            else:
+                candidates = {u["id"]: None for u in room["units"]
+                              if u["id"] not in _config_off(room, run.section)}
+            starts_cooling = [s for uid, p in candidates.items()
+                              if (s := cooling_since(conn, room_id, uid, run.start, at, p))
+                              is not None and timedelta(0) <= at - s <= MARGIN_COOLING_WINDOW]
+            if not starts_cooling:
+                continue
+            target, since = run.delta_max, max(starts_cooling)
+        else:
+            continue
+        before, margin = margin, margin_step(margin, target, cfg.rate)
+        steps.append(MarginStep(at, what, run.section, run.local_date, run.blocked,
+                                run.block_mode, run.delta_max, target, before, margin, since))
+    return margin, steps

@@ -42,25 +42,35 @@ Control (active):
     section should be active per room and fire the crossover (automation
     .trigger on the room's scene automation) when the answer changes.
   * almanac push - the almanac lives on sensor.ac_almanac_<room> as state
-    attributes; API-set states do not survive an HA restart, so re-push on
-    a timer and on homeassistant_start.
+    attributes, with the room's learned block margin; API-set states do not
+    survive an HA restart, so re-push on a timer, on every websocket
+    (re)connect and on homeassistant_start. The conditions entity likewise.
 
-Outdoor input (docs/V2_DESIGN.md, Outdoor temperature; phase 4 records it,
-nothing in control reads it until phase 5):
+Outdoor input and conditions (docs/V2_DESIGN.md, Outdoor temperature):
   * with outdoor.source 'forecast', weather.get_forecasts (hourly) for
     outdoor.weather_entity is fetched at startup and then hourly, and the
     latest result cached with its fetch time;
-  * after each crossover has fired, a follow-up task takes the forecast
-    (the cache if under 2 hours old, else a fetch first), records the
-    section run's mean and max over [planned start, next section's planned
-    start) and logs them, so a slow or failed fetch never holds up a
-    crossover;
+  * at each crossover the room's conditions are decided once for the
+    section (phase 5): the room comfort point, the forecast's mean and max
+    over [planned start, next section's planned start), the lean of the
+    vote edges and the cooling block (with hysteresis on the run before),
+    published to sensor.ac_conditions_<room> - before the scene fires
+    whenever the forecast cache is under 2 hours old (or there is no
+    forecast to fetch), so the scene starts from them. Otherwise the scene
+    fires on fail-open conditions and a follow-up task fetches the forecast
+    and publishes the real ones, which the next heartbeat's maintenance
+    reads; a slow or failed fetch never holds up a crossover. The run
+    records the mean and max, the comfort point, the lean, the decision and
+    the block_mode, with one `outdoor` and one `block` event. A restart
+    inside a run keeps what it decided;
   * every heartbeat and reaction records the weather entity's current
     temperature as outdoor_temp (None if unavailable or not updated for 3
     hours);
-  * a failure fails open, with no value: one `outdoor` warning per failure
-    streak and one info event when the forecast works again.
-  The probe source isn't read yet.
+  * no outdoor value fails open (no lean, no block): one `outdoor` warning
+    per failure streak (or for outdoor.source none or probe) and one info
+    event when the forecast works again.
+  The probe source isn't read yet. The margin is learned by the replay
+  (app.analyser.learn_margin) and logged as a `block` event when it moves.
 
 Automation-caused changes are told apart from user ones primarily by
 context.parent_id (our service calls carry it), backed by the guard boolean,
@@ -80,10 +90,11 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app import control, outdoor
-from app.analyser import LearningConfig, analyse_room, is_setpoint_moving
+from app.analyser import (LearningConfig, MarginConfig, MarginStep, analyse_room,
+                          is_setpoint_moving, learn_margin)
 from app.config import ConfigError, validate
-from app.generator import (PERSON_VOTE_EVENT, almanac_id, base_id, guard_id, offset_id,
-                           scene_automation_id, scene_select_id, state_id)
+from app.generator import (PERSON_VOTE_EVENT, almanac_id, base_id, conditions_id, guard_id,
+                           offset_id, scene_automation_id, scene_select_id, state_id)
 from app.ha import HATimeoutError
 from app.scheduler import active_section_at, section_window
 from app.store import ReactiveUnitSample, UnitSample
@@ -104,6 +115,7 @@ FORECAST_TIMEOUT_SECONDS = 20
 FORECAST_SHARED = timedelta(seconds=60)
 OFFISH = ("off", "unavailable", "unknown", None)
 NO_STATE = ("unavailable", "unknown", None)     # the unit isn't reporting at all
+HA_START_EVENT = "homeassistant_start"
 
 
 def _profiles(config: dict) -> dict:
@@ -124,6 +136,13 @@ def _ago(delta: timedelta) -> str:
         return f"{minutes} min"
     hours = minutes // 60
     return f"{hours} h" if hours < 48 else f"{hours // 24} d {hours % 24} h"
+
+
+def _deg(value: float) -> str:
+    """A margin for the log: to 2 decimals, trailing zeros dropped down to
+    one (6.0, 6.55, 6.06)."""
+    text = f"{value:.2f}".rstrip("0")
+    return text + "0" if text.endswith(".") else text
 
 
 def _number(state: str | None, default: float | None = 0.0) -> float | None:
@@ -200,6 +219,20 @@ class RoomState:
     reactive_units: dict[str, UnitWindow] = field(default_factory=dict)
     reactive_deadline: datetime | None = None
     reactive_task: object | None = None
+    conditions: control.Conditions | None = None    # as published for the section
+    conditions_at: str | None = None                 # when they were computed (or re-read)
+
+
+@dataclass(frozen=True)
+class SectionOutdoor:
+    """A section run's forecast values, and what to record and say about
+    them once the run's row exists."""
+    mean: float | None = None
+    max: float | None = None
+    record: bool = False            # new values for the run (not kept from its start)
+    severity: str | None = None     # the `outdoor` event, if any
+    message: str | None = None
+    detail: dict = field(default_factory=dict)
 
 
 class Runtime:
@@ -222,6 +255,7 @@ class Runtime:
         self._forecast_lock = asyncio.Lock()                 # one fetch at a time
         self._forecast_failed_at: datetime | None = None     # the last failed attempt
         self._forecast_failing = False                       # in a failure streak, as last logged
+        self._margins: dict[str, float] = {}                 # room -> the replay's block margin
         self._stopping = False
 
     # ---- config helpers -------------------------------------------
@@ -239,6 +273,14 @@ class Runtime:
         else None (no forecast is read)."""
         out = self.config.get("outdoor") or {}
         return out.get("weather_entity") if out.get("source") == "forecast" else None
+
+    @property
+    def _outdoor(self) -> dict:
+        return self.config.get("outdoor") or {}
+
+    def margin(self, room_id: str) -> float:
+        """The room's block margin as the latest replay learned it."""
+        return self._margins.get(room_id, MarginConfig.from_config(self.config).initial)
 
     # ---- time -----------------------------------------------------
 
@@ -305,12 +347,11 @@ class Runtime:
             d = e.get("detail") or {}
             if "failing" in d:
                 self._forecast_failing = bool(d["failing"])
-        if (self.config.get("outdoor") or {}).get("source") == "probe":
-            ts, ts_utc, _, _ = self._now()
-            self.store.log_event(ts, ts_utc, "warning", "outdoor",
-                                 "outdoor.source is 'probe', which this build doesn't read yet "
-                                 "(only the forecast is): no outdoor value is recorded",
-                                 detail={"source": "probe"})
+        source = self._outdoor.get("source", "none")
+        if source in ("probe", "none"):
+            # No outdoor value at all: every section fails open. One warning
+            # per streak, as for a failing forecast.
+            self._note_forecast(source, None)
 
         # Replay every room and push its almanac before any crossover can
         # fire, catch-up included: after a migration the almanac is empty,
@@ -368,13 +409,32 @@ class Runtime:
     async def _subscribe(self) -> None:
         await self.ws.subscribe_states(self._on_state_change)
         await self.ws.subscribe_events(PERSON_VOTE_EVENT, self._on_person_vote)
+        await self.ws.subscribe_events(HA_START_EVENT, self._on_ha_start)
 
     async def _resubscribe(self) -> None:
         """Re-run every websocket subscription after a (re)connect. HA's
         subscription ids do not survive a dropped socket, so the state
         stream and the vote events must be re-established or reactive
-        detection stays dead."""
+        detection stays dead. A drop is usually Home Assistant restarting,
+        which loses the states we set, so the almanac and the conditions are
+        pushed again too."""
         await self._subscribe()
+        await self._republish()
+
+    def _on_ha_start(self, event: dict) -> None:
+        """homeassistant_start: re-push what an HA restart loses."""
+        task = asyncio.create_task(self._republish(), name="ac-republish")
+        self._followups.add(task)
+        task.add_done_callback(self._followups.discard)
+
+    async def _republish(self) -> None:
+        """Push every room's almanac and conditions again."""
+        for room_id in list(self.rooms):
+            try:
+                await self._push_almanac(room_id)
+                await self._push_conditions(room_id)
+            except Exception as e:
+                log.warning("republish for %s failed: %s", room_id, e)
 
     def _on_ws_status(self, connected: bool, reason: str) -> None:
         """Record websocket up/down transitions in the event log so a drop
@@ -792,6 +852,30 @@ class Runtime:
         already_here = self._cache.get(scene_select_id(room_id)) == section
         refire = not (catch_up and already_here)
 
+        # The section's conditions go out before its scene whenever they need
+        # no forecast fetch (the cache is under 2 hours old, there is no
+        # forecast to read, or a restart keeps what the run already has), so
+        # the scene starts from them. A fetch never holds a crossover up: the
+        # scene then starts on fail-open conditions, and a follow-up
+        # publishes the real ones for the next heartbeat's maintenance.
+        kept = self.store.section_run_conditions(room_id, run_date, section) if catch_up \
+            else None
+        decided = kept is not None and kept["block_mode"] is not None
+        ov = self._kept_outdoor(kept)
+        pending = False
+        if decided:
+            cond = self._kept_conditions(rs, section, started, kept)
+        elif ov is None and self._weather_entity and started is not None \
+                and not self._forecast_fresh():
+            pending = True
+            cond = control.Conditions(section, self._block_mode, self.margin(room_id),
+                                      fail_open=control.NO_OUTDOOR)
+        else:
+            if ov is None:
+                ov = self._section_outdoor(rs, section, started, self._forecast)
+            cond = await self._decide(rs, run_date, section, started, ov)
+        await self._publish_conditions(rs, cond)
+
         if refire:
             entity = self._automation_entity.get(scene_automation_id(room_id, section))
             if entity:
@@ -812,15 +896,27 @@ class Runtime:
                              f"{rs.room['name']} -> {section}{note}", room_id=room_id)
         rs.section, rs.section_started = section, started
         log.info("crossover %s -> %s%s", room_id, section, note)
-        if self._weather_entity and started is not None:
+        if pending:
             # After the scene has fired, so the forecast never holds it up.
             task = asyncio.create_task(
-                self._section_outdoor(rs, run_date, section, started, catch_up),
+                self._conditions_later(rs, run_date, section, started),
                 name=f"ac-outdoor-{room_id}")
             self._followups.add(task)
             task.add_done_callback(self._followups.discard)
+        else:
+            self._settle_section(rs, run_date, ov, cond, kept=decided)
 
-    # ---- outdoor --------------------------------------------------
+    # ---- outdoor and conditions -----------------------------------
+
+    @property
+    def _block_mode(self) -> str:
+        return self._outdoor.get("block_mode", control.DEFAULT_BLOCK_MODE)
+
+    def _forecast_fresh(self) -> bool:
+        """Is the cached forecast young enough for a crossover to use
+        without fetching (under 2 hours)?"""
+        return self._forecast is not None and \
+            self._now()[3] - self._forecast.fetched_at < outdoor.CACHE_MAX_AGE
 
     def _outdoor_temp(self, states: dict) -> float | None:
         """The outdoor value a heartbeat or reaction records: the weather
@@ -829,42 +925,42 @@ class Runtime:
         entity = self._weather_entity
         return outdoor.current_temperature(states.get(entity), self._now()[3]) if entity else None
 
-    async def _section_outdoor(self, rs: RoomState, run_date: str, section: str,
-                               started: datetime, catch_up: bool) -> None:
-        """Record a section run's forecast mean and max over its window,
-        [planned start, next section's planned start), and log them. A
+    @staticmethod
+    def _kept_outdoor(kept: dict | None) -> SectionOutdoor | None:
+        """A catch-up inside a run that already has its outdoor values keeps
+        them: they were decided at its start, and the forecast no longer
+        holds the hours already past."""
+        if kept is None or (kept["outdoor_mean"] is None and kept["outdoor_max"] is None):
+            return None
+        return SectionOutdoor(kept["outdoor_mean"], kept["outdoor_max"])
+
+    def _section_outdoor(self, rs: RoomState, section: str, started: datetime | None,
+                         forecast: outdoor.Forecast | None) -> SectionOutdoor:
+        """A section run's forecast mean and max over its window, [planned
+        start, next section's planned start), and the event saying so. A
         window the forecast covers only part of uses what is covered and
-        says so; with no forecast, or none of the window, the run keeps no
-        outdoor value. A catch-up inside a run that already has its values
-        keeps them: they were decided at its start, and the forecast no
-        longer holds the hours already past."""
-        room_id, entity = rs.room["id"], self._weather_entity
-        if catch_up and any(v is not None for v in
-                            self.store.section_run_outdoor(room_id, run_date, section) or ()):
-            return
+        says so; with no forecast, or none of the window, the run gets no
+        outdoor value. Nothing without a forecast source."""
+        entity = self._weather_entity
+        if entity is None or started is None:
+            return SectionOutdoor()
         start, end = section_window(rs.profile, section, started, self.tz)
         window = outdoor.span_text(start, end, self.tz)
         head = f"{rs.room['name']} -> {section}"
-        forecast = await self._forecast_for(outdoor.CACHE_MAX_AGE)
-        ts, ts_utc, _, _ = self._now()
         detail = {"section": section, "entity_id": entity,
                   "window": [start.isoformat(), end.isoformat()]}
         if forecast is None:
-            self.store.log_event(ts, ts_utc, "info", "outdoor",
-                                 f"{head}: no forecast from {entity}, so no outdoor value for "
-                                 f"{window}", room_id=room_id,
-                                 detail={**detail, "mean": None, "max": None})
-            return
+            return SectionOutdoor(severity="info", detail={**detail, "mean": None, "max": None},
+                                  message=f"{head}: no forecast from {entity}, so no outdoor "
+                                          f"value for {window}")
         stats = outdoor.window_stats(forecast.hours, start, end)
         detail.update(mean=stats.mean, max=stats.max, hours=stats.hours,
                       expected=stats.expected, partial=stats.partial,
                       fetched_at=forecast.fetched_at.isoformat(timespec="seconds"))
         if stats.hours == 0:
-            self.store.log_event(ts, ts_utc, "warning", "outdoor",
-                                 f"{head}: the forecast from {entity} has no hours in {window}, "
-                                 "so no outdoor value", room_id=room_id, detail=detail)
-            return
-        self.store.record_section_outdoor(room_id, run_date, section, stats.mean, stats.max)
+            return SectionOutdoor(severity="warning", detail=detail,
+                                  message=f"{head}: the forecast from {entity} has no hours in "
+                                          f"{window}, so no outdoor value")
         values = f"forecast mean {stats.mean:.1f}, max {stats.max:.1f}"
         if stats.partial:
             covered = outdoor.span_text(stats.first, min(stats.last + outdoor.HOUR, end), self.tz)
@@ -872,8 +968,153 @@ class Runtime:
                        f"{stats.hours} of the {stats.expected} hours in {window}")
         else:
             message = f"{head}: {values} over {window} ({entity})"
-        self.store.log_event(ts, ts_utc, "info", "outdoor", message, room_id=room_id,
-                             detail=detail)
+        return SectionOutdoor(stats.mean, stats.max, True, "info", message, detail)
+
+    async def _decide(self, rs: RoomState, run_date: str, section: str,
+                      started: datetime | None, ov: SectionOutdoor) -> control.Conditions:
+        """The section's conditions: the room comfort point from the
+        section's almanac and the sensors usable now (reporting, not
+        stale), the lean from the forecast mean, and the block from its max
+        with hysteresis on the room's run before (shadow decisions count)."""
+        room_id = rs.room["id"]
+        try:
+            states = {s["entity_id"]: s for s in await self.rest.states()}
+        except Exception as e:
+            log.warning("conditions for %s: states fetch failed (%s); using the cache",
+                        room_id, e)
+            states = {}
+        for eid, s in states.items():
+            self._cache[eid] = s.get("state")
+        readings = {s["id"]: self._sensor_reading(s, rs.room, states) for s in rs.room["sensors"]}
+        alm = self.store.current_almanac(room_id, as_of=self._today())["sections"].get(section)
+        was = started is not None and self.store.previous_blocked(room_id, run_date, section,
+                                                                  started)
+        return control.section_conditions(
+            section, control.comfort_point(alm, readings), ov.mean, ov.max,
+            self.margin(room_id), was, self._block_mode,
+            self._outdoor.get("lean_per_degree", 0.1))
+
+    def _kept_conditions(self, rs: RoomState, section: str, started: datetime | None,
+                         kept: dict) -> control.Conditions:
+        """A restart inside a run that already decided its conditions keeps
+        them (locked for the section), block_mode included, rebuilt from
+        what the run stored, with the margin as it stood at the run's start."""
+        cp, mean, mx, lean = (kept["comfort_point"], kept["outdoor_mean"], kept["outdoor_max"],
+                              kept["lean"])
+        margin = self.margin(rs.room["id"]) if started is None else learn_margin(
+            self.store._conn, rs.room, MarginConfig.from_config(self.config), started)[0]
+        cold, warm = control.lean_edges(lean)
+        fail_open = None if lean is not None else \
+            control.NO_OUTDOOR if mean is None else control.NO_COMFORT_POINT
+        return control.Conditions(
+            section, kept["block_mode"], margin, cp, mean, mx,
+            None if lean is None else round(cp - mean, 2),
+            None if lean is None or mx is None else round(cp - mx, 2),
+            lean, cold, warm, bool(kept["blocked"]), fail_open)
+
+    async def _conditions_later(self, rs: RoomState, run_date: str, section: str,
+                                started: datetime) -> None:
+        """The follow-up to a crossover that fired on fail-open conditions:
+        fetch the forecast, decide and publish the real conditions."""
+        forecast = await self._forecast_for(outdoor.CACHE_MAX_AGE)
+        ov = self._section_outdoor(rs, section, started, forecast)
+        cond = await self._decide(rs, run_date, section, started, ov)
+        if rs.section == section:                    # not overtaken by the next crossover
+            await self._publish_conditions(rs, cond)
+        self._settle_section(rs, run_date, ov, cond, kept=False)
+
+    def _settle_section(self, rs: RoomState, run_date: str, ov: SectionOutdoor | None,
+                        cond: control.Conditions, kept: bool) -> None:
+        """Once the run's row exists: record its outdoor values and
+        conditions, with one `outdoor` event (when there is something to say)
+        and one `block` event."""
+        room_id, section = rs.room["id"], cond.section
+        ts, ts_utc, _, _ = self._now()
+        if ov is not None and ov.record:
+            self.store.record_section_outdoor(room_id, run_date, section, ov.mean, ov.max)
+        if ov is not None and ov.message:
+            self.store.log_event(ts, ts_utc, ov.severity, "outdoor", ov.message,
+                                 room_id=room_id, detail=ov.detail)
+        if not kept:
+            self.store.record_section_conditions(room_id, run_date, section, cond.comfort_point,
+                                                 cond.lean, cond.would_block, cond.block_mode)
+        self.store.log_event(ts, ts_utc, "info", "block", self._block_message(rs, cond, kept),
+                             room_id=room_id,
+                             detail={**self._conditions_detail(cond), "run_date": run_date,
+                                     "kept": kept})
+
+    def _section_name(self, rs: RoomState, section: str) -> str:
+        return next((s.get("name") for s in rs.profile.get("sections", [])
+                     if s["id"] == section and s.get("name")), section.title())
+
+    def _block_message(self, rs: RoomState, cond: control.Conditions, kept: bool) -> str:
+        """One line for the Log: the decision, the values it came from, and
+        the lean. "would block Night: forecast max 17.0, comfort 23.9,
+        margin 6.0" in shadow mode."""
+        name, sec = rs.room.get("name", rs.room["id"]), self._section_name(rs, cond.section)
+        tail = " (kept from the run's start)" if kept else ""
+        if cond.fail_open == control.NO_COMFORT_POINT:
+            return (f"{name}: no comfort point for {sec} (no reporting sensor has a comfort "
+                    f"reading yet), so no lean and no block: fail open{tail}")
+        if cond.fail_open is not None:
+            why = ("no forecast for the section" if self._weather_entity
+                   else f"outdoor.source is {self._outdoor.get('source', 'none')}")
+            return f"{name}: no outdoor value for {sec} ({why}), so no lean and no block: " \
+                   f"fail open{tail}"
+        values = (f"forecast max {cond.outdoor_max:.1f}, " if cond.outdoor_max is not None
+                  else "") + f"comfort {cond.comfort_point:.1f}, margin {_deg(cond.margin)}"
+        if cond.would_block and cond.delta_max is not None and cond.delta_max < cond.margin:
+            values += (f", held from the last section until delta {cond.delta_max:.1f} is "
+                       f"{_deg(cond.margin - control.BLOCK_RELEASE)} or less")
+        lean = (f"lean {cond.lean:+.2f} from the forecast mean {cond.outdoor_mean:.1f}: edges "
+                f"{cond.cold_edge:+.2f} / {cond.warm_edge:+.2f}")
+        if cond.blocked:
+            what = f"blocking {sec}"
+        elif cond.would_block:
+            what = f"would block {sec}"
+            values += " (shadow mode: not applied)"
+        elif cond.block_mode == "off":
+            what = f"{sec} not blocked (block_mode off)"
+        else:
+            what = f"not blocking {sec}"
+        return f"{name}: {what}: {values}; {lean}{tail}"
+
+    @staticmethod
+    def _conditions_detail(cond: control.Conditions) -> dict:
+        return {"section": cond.section, "block_mode": cond.block_mode,
+                "would_block": cond.would_block, "blocked": cond.blocked,
+                "margin": None if cond.margin is None else round(cond.margin, 2),
+                "comfort_point": cond.comfort_point, "outdoor_mean": cond.outdoor_mean,
+                "outdoor_max": cond.outdoor_max, "delta_mean": cond.delta_mean,
+                "delta_max": cond.delta_max, "lean": cond.lean, "cold_edge": cond.cold_edge,
+                "warm_edge": cond.warm_edge, "fail_open": cond.fail_open}
+
+    async def _publish_conditions(self, rs: RoomState, cond: control.Conditions) -> None:
+        rs.conditions, rs.conditions_at = cond, self._now()[0]
+        await self._push_conditions(rs.room["id"])
+
+    async def _push_conditions(self, room_id: str) -> None:
+        """sensor.ac_conditions_<room>: state the section, attributes the
+        conditions as the templates read them (cold_edge, warm_edge, and
+        blocked as control should see it: active mode only), what they came
+        from, and each sensor's trigger edges in degrees against the
+        section's almanac now."""
+        rs = self.rooms.get(room_id)
+        cond = rs.conditions if rs else None
+        if cond is None:
+            return
+        learned = (self.store.current_almanac(room_id, as_of=self._today())["sections"]
+                   .get(cond.section) or {}).get("sensors") or {}
+        edges = {}
+        for sid, e in learned.items():
+            if e.get("comfort") is not None:
+                band = e.get("band") or control.DEFAULT_BAND
+                edges[sid] = {"cold": round(e["comfort"] + cond.cold_edge * band, 2),
+                              "warm": round(e["comfort"] + cond.warm_edge * band, 2)}
+        await self._safe_set_state(
+            conditions_id(room_id), state=cond.section,
+            attributes={"room_id": room_id, **self._conditions_detail(cond), "edges": edges,
+                        "computed_at": rs.conditions_at})
 
     async def _forecast_for(self, max_age: timedelta) -> outdoor.Forecast | None:
         """The cached forecast if it is younger than max_age, else a fresh
@@ -933,19 +1174,29 @@ class Runtime:
         """One warning when the forecast starts failing (kind says how), one
         info event when it works again. What was last logged survives a
         restart (start() reads it back), so a restart inside a failure
-        streak doesn't repeat the warning."""
+        streak doesn't repeat the warning. outdoor.source none or probe (not
+        read yet) is a streak of its own kind: no outdoor value at all."""
         failing = kind is not None
         if failing == self._forecast_failing:
             return
         self._forecast_failing = failing
         entity = self._weather_entity
         ts, ts_utc, _, _ = self._now()
-        if failing:
+        if kind in ("none", "probe"):
+            unread = ", which this build doesn't read yet (only the forecast is)" \
+                if kind == "probe" else ""
+            self.store.log_event(
+                ts, ts_utc, "warning", "outdoor",
+                f"outdoor.source is '{kind}'{unread}: no outdoor value is recorded, and every "
+                "section fails open - no lean and no cooling block (heat sources still block)",
+                detail={"failing": True, "kind": kind, "source": kind})
+        elif failing:
             self.store.log_event(
                 ts, ts_utc, "warning", "outdoor",
                 f"Outdoor forecast from {entity} failed: {reason}. Section runs get no "
                 "forecast values until it works again (a cached one under 2 hours old is still "
-                "used); it is retried hourly and at each section change",
+                "used), so their conditions fail open - no lean and no cooling block; it is "
+                "retried hourly and at each section change",
                 detail={"failing": True, "kind": kind, "reason": reason, "entity_id": entity})
         else:
             self.store.log_event(
@@ -966,6 +1217,7 @@ class Runtime:
             almanac_id(room_id),
             state=str(len(sections)),
             attributes={"sections": sections, "room_id": room_id,
+                        "margin": round(self.margin(room_id), 2),
                         "updated": self._now()[0]})
 
     # ---- learning -------------------------------------------------
@@ -977,7 +1229,11 @@ class Runtime:
         ts, ts_utc, _, now = self._now()
         try:
             sections = analyse_room(self.store._conn, rs.room, self._learning_config(), now)
+            margin, steps = learn_margin(self.store._conn, rs.room,
+                                         MarginConfig.from_config(self.config), now)
             self.store.publish_almanac(room_id, sections)
+            previous = self._margins.get(room_id)
+            self._margins[room_id] = margin
             await self._push_almanac(room_id)
         except Exception as e:
             log.warning("replay for %s (%s) failed: %s", room_id, reason, e)
@@ -990,6 +1246,34 @@ class Runtime:
                              f"{len(sections)} section(s)", room_id=room_id,
                              detail={"reason": reason,
                                      "sections": [s.section for s in sections]})
+        if previous is not None and steps and abs(margin - previous) > 1e-9:
+            self._note_margin(rs, steps[-1])
+
+    def _note_margin(self, rs: RoomState, step: MarginStep) -> None:
+        """A `block` event when a reaction moves the room's margin."""
+        name = rs.room.get("name", rs.room["id"])
+        sec = self._section_name(rs, step.section)
+        if step.blocked:
+            was = "blocked" if step.block_mode == "active" else "would have been blocked (shadow)"
+            why = (f"a {'too_hot vote' if step.kind == 'too_hot' else 'unit turned on'} in "
+                   f"{sec} {step.local_date}, which {was}")
+        else:
+            minutes = int((step.at - step.cooling_since).total_seconds() // 60)
+            why = (f"a {'too_cold vote' if step.kind == 'too_cold' else 'unit turned off'} "
+                   f"{minutes} min after cooling started in {sec} {step.local_date}, unblocked")
+        ts, ts_utc, _, _ = self._now()
+        self.store.log_event(
+            ts, ts_utc, "info", "block",
+            f"{name}: block margin {_deg(step.before)} -> {_deg(step.after)}: {why} "
+            f"(delta max {step.delta_max:.1f}, so toward {step.target:.1f})",
+            room_id=rs.room["id"],
+            detail={"margin": {"before": step.before, "after": step.after,
+                               "target": step.target},
+                    "kind": step.kind, "section": step.section, "run_date": step.local_date,
+                    "blocked": step.blocked, "block_mode": step.block_mode,
+                    "delta_max": step.delta_max,
+                    "cooling_since": step.cooling_since.isoformat()
+                    if step.cooling_since else None})
 
     def _schedule_comfort_replay(self, room_id: str, due: datetime) -> None:
         """Replay the room at `due`, once a reaction's comfort window has
@@ -1033,11 +1317,7 @@ class Runtime:
 
     async def _almanac_push_loop(self) -> None:
         while not self._stopping:
-            for room_id in list(self.rooms):
-                try:
-                    await self._push_almanac(room_id)
-                except Exception as e:
-                    log.warning("almanac push error for %s: %s", room_id, e)
+            await self._republish()
             await asyncio.sleep(ALMANAC_PUSH_SECONDS)
 
     async def _forecast_loop(self) -> None:

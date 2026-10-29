@@ -249,6 +249,8 @@ deploy code against a stub holding a v2 deployment:
   `input_datetime.ac_grace_until_*`. It also re-creates
   `input_datetime.ac_correction_started_<room>`.
 - v1's deploy **also** removes the `input_boolean.ac_forced_*` markers.
+- `sensor.ac_conditions_<room>` (phase 5) is no helper: v2's container pushed it,
+  and it goes at Home Assistant's next restart. v1 never reads it.
 - It **does not** remove:
   - the `input_number` and `input_button` helpers, domains v1 never lists;
   - the `ac_manual_*` and `ac_vote_*` automations, because the restored v1

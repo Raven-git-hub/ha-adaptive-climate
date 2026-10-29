@@ -55,7 +55,9 @@ REACTIVE_CSV = ["ts", "ts_utc", "section", "window_seconds", "occupied",
                 "suspended_maint", "units", "sensors",
                 "kind", "outdoor_temp"]                             # v2
 # One row when a section run starts, one when its forecast has been read
-# (outdoor_mean and outdoor_max only) and one when it closes. Re-ingest
+# (outdoor_mean and outdoor_max only), one when its conditions are decided
+# (comfort_point, lean, blocked and block_mode only) and one when it
+# closes. Re-ingest
 # merges a day file's rows per section in order; a blank field leaves the
 # earlier value, matching record_section_run's upsert.
 SECTION_RUN_CSV = ["section", "planned_start", "actual_start", "ended_at",
@@ -539,6 +541,24 @@ class Store:
                 (outdoor_mean, outdoor_max, room_id, local_date, section))
             self._conn.commit()
 
+    def record_section_conditions(self, room_id: str, local_date: str, section: str,
+                                  comfort_point: float | None, lean: float | None,
+                                  blocked: bool, block_mode: str) -> None:
+        """Set a section run's conditions (phase 5): the room comfort point,
+        the lean (k x delta_mean, before the edge caps), the block decision
+        as computed (shadow's "would block" included) and the block_mode in
+        force. Its CSV row carries only those four, as the outdoor row does."""
+        self._append_csv(room_id, local_date, "section_run", SECTION_RUN_CSV,
+                         [section] + [None] * 7 + [comfort_point, lean, _int_or_none(blocked),
+                                                   block_mode])
+        with self._lock:
+            self._conn.execute(
+                "UPDATE section_run SET comfort_point=?, lean=?, blocked=?, block_mode=? "
+                "WHERE room_id=? AND local_date=? AND section=?",
+                (comfort_point, lean, _int_or_none(blocked), block_mode,
+                 room_id, local_date, section))
+            self._conn.commit()
+
     def log_event(self, ts: str, ts_utc: str, severity: str, category: str,
                   message: str, room_id: str | None = None,
                   detail: dict | None = None) -> int:
@@ -582,6 +602,39 @@ class Store:
                 "WHERE room_id=? AND local_date=? AND section=?",
                 (room_id, local_date, section)).fetchone()
         return None if row is None else (row["outdoor_mean"], row["outdoor_max"])
+
+    def section_run_conditions(self, room_id: str, local_date: str,
+                               section: str) -> dict | None:
+        """One section run's outdoor values and conditions (outdoor_mean,
+        outdoor_max, comfort_point, lean, blocked, block_mode), or None if
+        there is no such run. block_mode is NULL until it was decided."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT outdoor_mean, outdoor_max, comfort_point, lean, blocked, block_mode "
+                "FROM section_run WHERE room_id=? AND local_date=? AND section=?",
+                (room_id, local_date, section)).fetchone()
+        return None if row is None else dict(row)
+
+    def previous_blocked(self, room_id: str, local_date: str, section: str,
+                         before: datetime) -> bool:
+        """Was the room's run before this one blocked, as decided (shadow's
+        "would block" included)? The latest run, other than this one, that
+        started before `before` (its planned start); no run, or one with no
+        decision, reads as not blocked."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT local_date, section, planned_start, actual_start, blocked "
+                "FROM section_run WHERE room_id=? ORDER BY id DESC LIMIT 50",
+                (room_id,)).fetchall()
+        runs = []
+        for r in rows:
+            start = r["planned_start"] or r["actual_start"]
+            if (r["local_date"], r["section"]) == (local_date, section) or not start:
+                continue
+            at = datetime.fromisoformat(start)
+            if at.tzinfo is not None and at < before:
+                runs.append((at, r["blocked"]))
+        return bool(max(runs, key=lambda x: x[0])[1]) if runs else False
 
     def reactions_since(self, room_id: str, since_utc: str) -> list[tuple[str, str | None, dict]]:
         """(ts_utc, kind, {unit_id: (setpoint_before, setpoint_after)}) of the

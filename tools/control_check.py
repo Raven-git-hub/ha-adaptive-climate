@@ -6,12 +6,16 @@ machine, in plain JSON-compatible values: times are seconds from T0,
 readings are named sets (or dicts) against an almanac-shaped section,
 expectations are partial unit records and exact commands. Steps are votes,
 a heartbeat (step), a section change, a person's change of a given kind
-(on, off, manual), a press of the room's too_cold or too_hot button, or one
+(on, off, manual), a press of the room's too_cold or too_hot button, one
 climate state change (before and after, as HA's manual-change automation
-sees it; a setpoint change is a vote). A scenario's room has the unit `u`
-and, where it is about the whole room, peers: every step runs on all of
-them. tools/control_logic_check.py imports SCENARIOS and replays the same
-table through the generated automations.
+sees it; a setpoint change is a vote), or the section's outdoor conditions
+as the container decides them (phase 5: the comfort point, the lean of the
+vote edges and the cooling block), which the steps after it then run under.
+A scenario's room has the unit `u` and, where it is about the whole room,
+peers: every step runs on all of them. tools/control_logic_check.py imports
+SCENARIOS and replays the same table through the generated automations,
+publishing each step's conditions to sensor.ac_conditions_<room> for them
+to read.
 
 After the table passes, each rule is removed in turn (MUTANTS) and the
 scenarios that guard it must fail - proof the table actually pins every
@@ -52,16 +56,21 @@ ALMANAC = {"sensors": {"s1": {"comfort": 24.0, "band": 1.0, "trust": 0.9},
                        "s3": {"comfort": 24.0, "band": 1.0, "trust": 0.1}}}
 READINGS = {
     "hot":          {"s1": 25.5, "s2": 25.2, "s3": 24.3},  # 2 past +1: too_warm; 3 warm side
+    "very_hot":     {"s1": 26.5, "s2": 26.2, "s3": 24.3},  # 2 past +1.7, a leaned warm edge
     "cold":         {"s1": 22.5, "s2": 22.8, "s3": 24.1},  # 2 past -1: too_cold; 2 cold side
     "settled_warm": {"s1": 24.3, "s2": 24.2, "s3": 23.8},  # no votes; warm 2, cold 1
     "settled_cool": {"s1": 23.7, "s2": 23.8, "s3": 24.2},  # no votes; warm 1, cold 2
     "mixed":        {"s1": 25.5, "s2": 22.5, "s3": 22.6},  # 1 warm (trust .9) vs 2 cold (.6)
     "near":         {"s1": 24.5, "s2": 24.5, "s3": 24.0},  # +0.5: votes only past a leaned edge
+    "near_cold":    {"s1": 23.5, "s2": 23.5, "s3": 24.0},  # -0.5: likewise, on the cold side
     "dead":         {"s1": None, "s2": None, "s3": None},  # no usable sensor
 }
 CTX_DEFAULTS = {"setpoint_applied": 22.0, "unit_min": 16.0, "unit_max": 30.0,
                 "heartbeat_interval": 10, "blocked": False, "leak_on": False,
-                "forced_off": False, "sensor_stale_minutes": 90}
+                "forced_off": False, "sensor_stale_minutes": 90,
+                "heat_source_on": False, "block_mode": "shadow"}
+SECTION = "day"                 # the section a scenario's conditions are for
+COND_DEFAULTS = {"margin": 6.0, "was_blocked": False, "block_mode": "shadow", "k": 0.1}
 DAYS_3 = 3 * 24 * 60 * 60       # a sensor put away three days ago
 BABY = {"unit_min": 18.0}
 MAIN = "u"                      # the scenario's unit; peers are the room's others
@@ -117,6 +126,18 @@ def change(before: tuple, after: tuple, expect_unit: dict, at: int = 0, **expect
 
 def vote(direction: str, accepted: bool = True) -> dict:
     return {"direction": direction, "accepted": accepted}
+
+
+def conditions(expect: dict, **inputs) -> dict:
+    """The section's conditions as the container decides them at a
+    crossover (control.section_conditions). inputs: mean and max, the
+    forecast's (None: no outdoor value); comfort, the room comfort point
+    (default: control.comfort_point over `almanac` and `readings`, with
+    `reported` ages); margin (6), was_blocked, block_mode (shadow), k (0.1).
+    expect: a partial Conditions, `blocked` being control's view. The steps
+    after it run under them: their vote edges, and the block and block_mode
+    as control sees them."""
+    return {"do": "conditions", "inputs": inputs, "expect": expect}
 
 
 def climate(mode: str, temperature: float | None = None, fan: str | None = None) -> dict:
@@ -229,6 +250,131 @@ SCENARIOS = [
     s("clamp: a wake at 29 + 3 tops out at 30", [
         step("settled_warm", {"state": "cool", "offset": 3}, cmd("cool", "low", 30.0))],
       unit={"state": "rest", "base": 29.0, "offset": 3, "since": -m(20)}, ctx=BABY),
+
+    # --- outdoor conditions (phase 5): the comfort point, lean and block --
+    s("comfort point: the trust-weighted mean of the usable sensors' comfort readings", [
+        conditions({"comfort_point": 24.47}, mean=24.47, max=24.47,
+                   almanac={"sensors": {"s1": {"comfort": 24.0, "band": 1.0, "trust": 0.9},
+                                        "s2": {"comfort": 25.0, "band": 1.0, "trust": 0.5},
+                                        "s3": {"comfort": 26.0, "band": 1.0, "trust": 0.1}}})]),
+    s("comfort point: a plain mean while no sensor has trust", [
+        conditions({"comfort_point": 25.0},
+                   mean=25.0, max=25.0,
+                   almanac={"sensors": {sid: {"comfort": c, "band": 5.0, "trust": 0.0}
+                                        for sid, c in (("s1", 24.0), ("s2", 25.0),
+                                                       ("s3", 26.0))}})]),
+    s("comfort point: an unavailable or stale sensor, or one with no comfort, is left out", [
+        conditions({"comfort_point": 26.0}, mean=26.0, max=26.0,
+                   readings={"s1": None, "s2": 25.0, "s3": 24.0}, reported={"s2": m(91)},
+                   almanac={"sensors": {"s1": {"comfort": 24.0, "trust": 0.9},
+                                        "s2": {"comfort": 25.0, "trust": 0.5},
+                                        "s3": {"comfort": 26.0, "trust": 0.1},
+                                        "s4": {"comfort": 30.0, "trust": 1.0}}})]),
+    s("lean table: delta -6 (hot outside) cools early, rests late", [
+        conditions({"delta_mean": -6.0, "lean": -0.6, "cold_edge": -1.6, "warm_edge": 0.4},
+                   comfort=24.0, mean=30.0, max=31.0)]),
+    s("lean table: delta 0 leans nothing", [
+        conditions({"delta_mean": 0.0, "lean": 0.0, "cold_edge": -1.0, "warm_edge": 1.0},
+                   comfort=24.0, mean=24.0, max=26.0)]),
+    s("lean table: delta +6 (cool outside) rests early, cools late", [
+        conditions({"delta_mean": 6.0, "lean": 0.6, "cold_edge": -0.4, "warm_edge": 1.6},
+                   comfort=24.0, mean=18.0, max=19.0)]),
+    s("lean table: delta +12 (cold) caps the cold edge, not the warm", [
+        conditions({"delta_mean": 12.0, "lean": 1.2, "cold_edge": -0.4, "warm_edge": 2.2},
+                   comfort=24.0, mean=12.0, max=13.0)]),
+    s("lean caps: the hot side stops at -0.6 on both edges", [
+        conditions({"lean": -1.0, "cold_edge": -1.6, "warm_edge": 0.4},
+                   comfort=24.0, mean=34.0, max=35.0)]),
+    s("lean caps: the cold edge stops at -0.4; the warm edge is uncapped", [
+        conditions({"lean": 0.9, "cold_edge": -0.4, "warm_edge": 1.9},
+                   comfort=24.0, mean=15.0, max=17.5)]),
+    s("lean: k is outdoor.lean_per_degree", [
+        conditions({"lean": 0.4, "cold_edge": -0.6, "warm_edge": 1.4},
+                   comfort=24.0, mean=22.0, max=23.0, k=0.2)]),
+    s("lean: delta +6 rests on readings half a band cold", [
+        votes("near_cold", {"met": False}),
+        conditions({"cold_edge": -0.4}, comfort=24.0, mean=18.0, max=20.0),
+        votes("near_cold", {"met": True, "tally": 2, "direction": "too_cold"}),
+        step("near_cold", {"state": "rest"}, OFF)],
+      unit={"since": -m(10)}),
+    s("lean: delta -6 boosts on readings half a band warm", [
+        conditions({"warm_edge": 0.4}, comfort=24.0, mean=30.0, max=31.0),
+        step("near", {"state": "boost"}, cmd("cool", "medium", 20.0))],
+      unit={"since": -m(10)}),
+    s("block: delta max at the margin blocks; just under it doesn't", [
+        conditions({"delta_max": 6.0, "would_block": True, "blocked": True},
+                   comfort=24.0, mean=19.0, max=18.0, block_mode="active"),
+        conditions({"delta_max": 5.9, "would_block": False, "blocked": False},
+                   comfort=24.0, mean=19.0, max=18.1, block_mode="active")]),
+    s("block: the margin is the room's", [
+        conditions({"would_block": False}, comfort=24.0, mean=19.0, max=18.0, margin=6.5),
+        conditions({"would_block": True}, comfort=24.0, mean=19.0, max=18.0, margin=5.5)]),
+    s("block hysteresis: blocked last section, it holds until delta max <= margin - 1", [
+        conditions({"would_block": True}, comfort=24.0, mean=20.0, max=18.5, was_blocked=True),
+        conditions({"would_block": True}, comfort=24.0, mean=20.0, max=18.99, was_blocked=True),
+        conditions({"would_block": False}, comfort=24.0, mean=20.0, max=19.0, was_blocked=True),
+        conditions({"would_block": False}, comfort=24.0, mean=20.0, max=18.5)]),
+    s("block active: the scene rests, a too-warm vote is ignored", [
+        conditions({"blocked": True}, comfort=24.0, mean=17.0, max=17.0, block_mode="active"),
+        section({"state": "rest"}, OFF),
+        step("hot", {"state": "rest"}, None, at=m(20))]),
+    s("block shadow: decided and kept, but control cools as if unblocked", [
+        conditions({"would_block": True, "blocked": False}, comfort=24.0, mean=17.0,
+                   max=17.0),
+        section({"state": "cool"}, cmd("cool", "low", 22.0)),
+        step("very_hot", {"state": "boost"}, cmd("cool", "medium", 20.0), at=m(10))]),
+    s("block off: never blocked, whatever the forecast", [
+        conditions({"would_block": False, "blocked": False, "cold_edge": -0.4},
+                   comfort=24.0, mean=10.0, max=10.0, block_mode="off", was_blocked=True),
+        section({"state": "cool"}, cmd("cool", "low", 22.0))]),
+    s("block active: a too_hot vote unblocks the unit, so its boost isn't rested", [
+        conditions({"blocked": True}, comfort=24.0, mean=17.0, max=17.0, block_mode="active"),
+        section({"state": "rest", "unblocked": False}, OFF),
+        press("too_hot", {"state": "boost", "forced": True, "unblocked": True, "base": 21.0},
+              cmd("cool", "medium", 19.0), at=m(5)),
+        step("hot", {"state": "boost", "unblocked": True}, None, at=m(15)),
+        step("settled_cool", {"state": "cool", "offset": 0, "unblocked": True},
+             cmd("cool", "low", 21.0), at=m(25)),
+        step("very_hot", {"state": "boost"}, cmd("cool", "medium", 19.0), at=m(35))]),
+    s("block active: a too_cold vote leaves the block as it is", [
+        conditions({"blocked": True}, comfort=24.0, mean=17.0, max=17.0, block_mode="active"),
+        press("too_cold", {"state": "rest", "forced": True, "unblocked": False}, OFF)],
+      unit={"since": -m(10)}),
+    s("block shadow: a too_hot vote doesn't unblock (nothing is blocked)", [
+        conditions({"would_block": True, "blocked": False}, comfort=24.0, mean=17.0,
+                   max=17.0),
+        press("too_hot", {"state": "boost", "forced": True, "unblocked": False},
+              cmd("cool", "medium", 19.0))],
+      unit={"since": -m(10)}),
+    s("heat source: on, it blocks in shadow mode, whatever the forecast", [
+        conditions({"blocked": False}, comfort=24.0, mean=30.0, max=31.0),
+        section({"state": "rest"}, OFF),
+        step("hot", {"state": "rest"}, None, at=m(20))],
+      ctx={"heat_source_on": True}),
+    s("heat source: on, it blocks in active mode too", [
+        step("settled_warm", {"state": "rest"}, OFF)],
+      unit={"since": -m(10)}, ctx={"heat_source_on": True, "block_mode": "active"}),
+    s("heat source: block_mode off ignores it", [
+        conditions({"blocked": False}, comfort=24.0, mean=30.0, max=31.0, block_mode="off"),
+        section({"state": "cool"}, cmd("cool", "low", 22.0)),
+        step("hot", {"state": "boost"}, cmd("cool", "medium", 20.0), at=m(10))],
+      ctx={"heat_source_on": True}),
+    s("heat source: a too_hot vote unblocks against it", [
+        press("too_hot", {"state": "boost", "forced": True, "unblocked": True},
+              cmd("cool", "medium", 19.0)),
+        step("hot", {"state": "boost"}, None, at=m(10))],
+      unit={"state": "rest", "since": -m(20)}, ctx={"heat_source_on": True}),
+    s("fail open: no outdoor value leans nothing and blocks nothing", [
+        conditions({"fail_open": "no_outdoor", "cold_edge": -1.0, "warm_edge": 1.0,
+                    "would_block": False, "blocked": False, "lean": None},
+                   comfort=24.0, mean=None, max=None, block_mode="active", was_blocked=True),
+        section({"state": "cool"}, cmd("cool", "low", 22.0)),
+        step("near", {"state": "cool"}, None, at=m(10))]),
+    s("fail open: no comfort point leans nothing and blocks nothing", [
+        conditions({"fail_open": "no_comfort_point", "comfort_point": None, "cold_edge": -1.0,
+                    "warm_edge": 1.0, "blocked": False},
+                   readings="dead", mean=10.0, max=10.0, block_mode="active"),
+        section({"state": "cool"}, cmd("cool", "low", 22.0))]),
 
     # --- the cooling block -------------------------------------------------
     s("blocked: cool rests with no votes at all", [step("settled_warm", {"state": "rest"}, OFF)],
@@ -572,14 +718,46 @@ def _ctxs(ctx: control.Context, uids) -> dict[str, control.Context]:
     return {uid: ctx if uid == MAIN else peer for uid in uids}
 
 
-def _votes(st: dict, now: datetime = T0,
-           stale_minutes: int = control.DEFAULT_STALE_MINUTES) -> control.Votes:
-    readings = st["readings"]
+def _fresh(st: dict, now: datetime, stale_minutes: int) -> dict:
+    readings = st.get("readings", "settled_warm")
     readings = READINGS[readings] if isinstance(readings, str) else readings
     reported = {sid: now - timedelta(seconds=ago) for sid, ago in st.get("reported", {}).items()}
-    readings = control.fresh_readings(readings, reported, now, stale_minutes)
-    return control.evaluate_votes(readings, st.get("almanac", ALMANAC),
+    return control.fresh_readings(readings, reported, now, stale_minutes)
+
+
+def _votes(st: dict, now: datetime = T0,
+           stale_minutes: int = control.DEFAULT_STALE_MINUTES) -> control.Votes:
+    return control.evaluate_votes(_fresh(st, now, stale_minutes), st.get("almanac", ALMANAC),
                                   *st.get("edges", (-1.0, 1.0)))
+
+
+def _conditions(st: dict, now: datetime = T0,
+                stale_minutes: int = control.DEFAULT_STALE_MINUTES) -> control.Conditions:
+    """A conditions step's control.Conditions."""
+    i = {**COND_DEFAULTS, **st["inputs"]}
+    comfort = i["comfort"] if "comfort" in i else control.comfort_point(
+        i.get("almanac", ALMANAC), _fresh(i, now, stale_minutes))
+    return control.section_conditions(SECTION, comfort, i.get("mean"), i.get("max"),
+                                      i["margin"], i["was_blocked"], i["block_mode"], i["k"])
+
+
+def under(cond: control.Conditions | None) -> dict:
+    """The context the steps after a conditions step run under: the block
+    and block_mode as control sees them."""
+    return {} if cond is None else {"blocked": cond.blocked, "block_mode": cond.block_mode}
+
+
+def with_edges(st: dict, cond: control.Conditions | None) -> dict:
+    """A step voting against the conditions' leaned edges, unless it gives
+    its own."""
+    if cond is None or "edges" in st:
+        return st
+    return {**st, "edges": [cond.cold_edge, cond.warm_edge]}
+
+
+def conditions_differ(st: dict, cond: control.Conditions) -> str | None:
+    got = {k: getattr(cond, k) for k in st["expect"]}
+    return None if got == st["expect"] else f"conditions {got}, expected {st['expect']}"
 
 
 def apply(st: dict, units: dict[str, control.Unit], now: datetime, ctx: control.Context
@@ -644,9 +822,17 @@ def compare(expect: dict, units: dict[str, control.Unit], commands: dict | None,
 def run(scenario: dict) -> list[str]:
     """The scenario's failures (empty when it passes)."""
     try:
-        units = _room(scenario)
+        units, cond = _room(scenario), None
         for i, st in enumerate(scenario["steps"], 1):
-            now, ctx, expect = _time(st.get("at", 0)), _ctx(scenario["ctx"], st.get("ctx")), st["expect"]
+            now, expect = _time(st.get("at", 0)), st["expect"]
+            if st["do"] == "conditions":
+                cond = _conditions(st, now, _ctx(scenario["ctx"]).sensor_stale_minutes)
+                why = conditions_differ(st, cond)
+                if why:
+                    return [f"step {i}: {why}"]
+                continue
+            ctx = _ctx(scenario["ctx"], under(cond), st.get("ctx"))
+            st = with_edges(st, cond)
             if st["do"] == "votes":
                 v = _votes(st, now, ctx.sensor_stale_minutes)
                 got = {k: getattr(v, k) for k in expect}
@@ -669,6 +855,8 @@ def run(scenario: dict) -> list[str]:
 _VOTE_BASE = control.vote_base
 _SECTION_CHANGE = control.on_section_change
 _PERSON_CHANGE = control.on_person_change
+_COMFORT_POINT = control.comfort_point
+_SECTION_CONDITIONS = control.section_conditions
 
 
 def _mutants() -> list[tuple[str, dict, list[str]]]:
@@ -703,8 +891,60 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
          ["blocked: cool rests with no votes at all",
           "blocked: too-warm votes are ignored (rest, not boost)",
           "blocked: a rest doesn't wake", "blocked: a boost goes to rest"]),
-        ("per-unit unblock", {"effective_blocked": lambda unit, ctx: ctx.blocked},
-         ["unblocked by a person's on, for that unit"]),
+        ("per-unit unblock", {"effective_blocked": lambda unit, ctx: c.room_blocked(ctx)},
+         ["unblocked by a person's on, for that unit",
+          "block active: a too_hot vote unblocks the unit, so its boost isn't rested",
+          "heat source: a too_hot vote unblocks against it"]),
+        ("the lean caps", {"lean_edges": lambda lean: (-1.0, 1.0) if lean is None
+                           else (round(-1.0 + lean, 3), round(1.0 + lean, 3))},
+         ["lean caps: the hot side stops at -0.6 on both edges",
+          "lean caps: the cold edge stops at -0.4; the warm edge is uncapped",
+          "lean table: delta +12 (cold) caps the cold edge, not the warm"]),
+        ("the lean (edges always -1, +1)", {"lean_edges": lambda lean: (-1.0, 1.0)},
+         ["lean table: delta -6 (hot outside) cools early, rests late",
+          "lean table: delta +6 (cool outside) rests early, cools late",
+          "lean: delta +6 rests on readings half a band cold",
+          "lean: delta -6 boosts on readings half a band warm"]),
+        ("the block's hysteresis",
+         {"decide_block": lambda delta_max, margin, was_blocked:
+          delta_max is not None and delta_max >= margin},
+         ["block hysteresis: blocked last section, it holds until delta max <= margin - 1"]),
+        ("the block at the margin itself (> instead of >=)",
+         {"decide_block": lambda delta_max, margin, was_blocked:
+          delta_max is not None and (delta_max > margin - 1 if was_blocked
+                                     else delta_max > margin)},
+         ["block: delta max at the margin blocks; just under it doesn't"]),
+        ("shadow mode doesn't apply the block",
+         {"Conditions": type("ShadowApplied", (c.Conditions,), {
+             "blocked": property(lambda self: self.would_block)})},
+         ["block shadow: decided and kept, but control cools as if unblocked",
+          "block shadow: a too_hot vote doesn't unblock (nothing is blocked)"]),
+        ("heat sources block", {"heat_blocks": lambda ctx: False},
+         ["heat source: on, it blocks in shadow mode, whatever the forecast",
+          "heat source: on, it blocks in active mode too",
+          "heat source: a too_hot vote unblocks against it"]),
+        ("block_mode off ignores heat sources", {"heat_blocks": lambda ctx: ctx.heat_source_on},
+         ["heat source: block_mode off ignores it"]),
+        ("a too_hot vote unblocks while blocked", {"unblock_for_vote": lambda unit, ctx: unit},
+         ["block active: a too_hot vote unblocks the unit, so its boost isn't rested",
+          "heat source: a too_hot vote unblocks against it"]),
+        ("the trust-weighted comfort point (plain mean instead)",
+         {"comfort_point": lambda alm, readings: (lambda cs: round(sum(cs) / len(cs), 2) if cs
+                                                  else None)(
+             [e["comfort"] for sid, e in ((alm or {}).get("sensors") or {}).items()
+              if readings.get(sid) is not None and e.get("comfort") is not None])},
+         ["comfort point: the trust-weighted mean of the usable sensors' comfort readings"]),
+        ("only usable sensors make the comfort point",
+         {"comfort_point": lambda alm, readings: _COMFORT_POINT(
+             alm, {sid: 0.0 for sid in (alm or {}).get("sensors") or {}})},
+         ["comfort point: an unavailable or stale sensor, or one with no comfort, is left out",
+          "fail open: no comfort point leans nothing and blocks nothing"]),
+        ("fail open with no outdoor value (the last section's block carried over instead)",
+         {"section_conditions": lambda section, comfort, mean, mx, margin, was, mode, k: (
+             lambda cond: dataclasses.replace(cond, would_block=was and mode != "off")
+             if mean is None else cond)(
+                 _SECTION_CONDITIONS(section, comfort, mean, mx, margin, was, mode, k))},
+         ["fail open: no outdoor value leans nothing and blocks nothing"]),
         ("boost cap", {"boost_capped": lambda unit, now, config: False},
          ["boost cap steps down twice"]),
         ("offset cap", {"capped_offset": lambda offset, cap: offset},

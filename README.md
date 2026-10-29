@@ -196,6 +196,8 @@ foreign automation:
   `ac_grace_until_…`, `input_boolean.ac_unblocked_…`
 - `input_boolean.ac_leak_<room>_<unit>` / `_confirmed_...` — leak latch (per leak unit)
 - `sensor.ac_almanac_<room>` — the learned model, pushed over REST
+- `sensor.ac_conditions_<room>` — the section's outdoor conditions (the lean of
+  the vote edges and the cooling block), pushed over REST at each crossover
 - automations: `ac_scene_<room>_<section>` ×6, `ac_maintenance_<room>`,
   `ac_manual_<room>_<unit>` per unit (a person's change, applied straight away),
   `ac_watchdog_<room>`, and leak automations for leak-enabled units

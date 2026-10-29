@@ -115,8 +115,9 @@ current_temp, plus the state and offset helpers).
 
 Light nudged whenever measured lux left a simple margin around the target.
 Climate tallies per-sensor votes: a sensor votes when it is past either of its
-trigger edges (one band width from its comfort reading until phase 5 leans
-them), all votes count toward one pooled quorum, and the trust-weighted
+trigger edges (one band width from its comfort reading, leaned by the outdoor
+temperature through `sensor.ac_conditions_<room>`; docs/V2_DESIGN.md), all
+votes count toward one pooled quorum, and the trust-weighted
 majority picks the direction, too warm or too cold. See `docs/TRUST_MODEL.md`
 for the voting rules. Too warm boosts a cooling unit; too cold rests it; a boost
 or rest ends when the sensors still on its side fall below the quorum (a boost

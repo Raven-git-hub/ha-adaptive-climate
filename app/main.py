@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.analyser import LearningConfig, analyse_room
+from app.analyser import LearningConfig, MarginConfig, analyse_room, learn_margin
 from app.config import ConfigError, blank, migrate, save, validate
 from app.store import Store, StoreError
 
@@ -184,9 +184,21 @@ def api_rooms() -> dict:
 
 @app.get("/api/almanac/{room_id}")
 def api_almanac(room_id: str) -> dict:
+    """The almanac in force, with the room's learned block margin (the
+    runtime's, else replayed from the store)."""
     if not state.store:
         raise HTTPException(503, "store not ready")
-    return state.store.current_almanac(room_id)
+    alm = state.store.current_almanac(room_id)
+    if state.runtime is not None and room_id in state.runtime.rooms:  # type: ignore[attr-defined]
+        alm["margin"] = round(state.runtime.margin(room_id), 2)        # type: ignore[attr-defined]
+    else:
+        cfg = _raw_config()
+        room = next((r for r in cfg.get("rooms", []) if r.get("id") == room_id), None)
+        if room is not None:
+            alm["margin"] = round(learn_margin(state.store._conn, room,
+                                               MarginConfig.from_config(cfg),
+                                               datetime.now().astimezone())[0], 2)
+    return alm
 
 
 @app.get("/api/events")

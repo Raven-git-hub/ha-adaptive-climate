@@ -9,6 +9,10 @@ result), conditions, choose blocks and service calls against a stubbed HA
 - and compares the unit's helpers and the commands sent with app/control.py:
 
   votes steps           the maintenance automation's `votes` variable
+  conditions steps      what the container publishes to
+                        sensor.ac_conditions_<room>, read back through the
+                        maintenance and scene automations' `blocked`,
+                        `cold_edge` and `warm_edge`
   heartbeat steps       the maintenance automation; with the leak latch on,
                         the leak automation too, and on a release the leak
                         release automation
@@ -20,6 +24,12 @@ result), conditions, choose blocks and service calls against a stubbed HA
   climate changes       the manual-change automation, fed that change, once
                         per trigger that fires (only one may go on)
 
+Every step publishes the scenario's conditions (phase 5) as the runtime
+does, attributes from app.runtime's own _conditions_detail, or ones made up
+from the step's block and edges; a step with neither has no conditions
+entity at all, so most of the table runs on the templates' fail-open
+fallback. The room's heat source is a switch, on when the scenario says.
+
 A scenario's room may have more than one unit: every unit's helpers and
 commands must be control's. A vote's ac_person_vote event must say what
 control says - accepted exactly when control.in_episode found no forced
@@ -30,8 +40,10 @@ runtime's reaction detector (UnitWindow).
 
 Then: the vote fuzz from v1's maintenance_logic_check, against
 control.evaluate_votes, and the cases the table can't express (the hold,
-an unsupported fan, the guard around commands, the blocked variable, the
-manual-change conditions, the vote automation's triggers).
+an unsupported fan, the guard around commands, the conditions entity
+missing, unknown, unavailable or another section's, the heat sources'
+block_mode, `blocked` coming from one place, the manual-change conditions,
+the vote automation's triggers).
 
 Retired from tools/maintenance_logic_check.py, whose templates no longer
 exist: the scene and correction setpoint-template cases (setpoint_applied
@@ -65,10 +77,10 @@ from jinja2.utils import Namespace               # noqa: E402
 import control_check as table                    # noqa: E402
 from app import control                          # noqa: E402
 from app import generator as g                   # noqa: E402
-from app.runtime import UnitWindow               # noqa: E402
+from app.runtime import Runtime, UnitWindow      # noqa: E402
 
-ROOM, UNIT, SECTION = "r", "u", "day"
-ENTITY, LEAK_SENSOR = "climate.r_u", "binary_sensor.r_leak"
+ROOM, UNIT, SECTION = "r", "u", table.SECTION
+ENTITY, LEAK_SENSOR, HEATER = "climate.r_u", "binary_sensor.r_leak", "switch.r_heater"
 FAN_MODES = ["quiet", "low", "medium", "high", "auto"]
 
 
@@ -307,11 +319,13 @@ def _config(ctx: control.Context, sensors: list[str], forced_off: bool,
                      + [{"id": pid, "name": pid, "entity_id": entity_of(pid)} for pid in peers],
             "sensors": [{"id": sid, "name": sid, "entity_id": f"sensor.{sid}"}
                         for sid in sensors],
+            "heat_sources": [HEATER],
             "scenes": {SECTION: {"units": {UNIT: {"mode": "off"}}}} if forced_off else {}}
     config = {"system": {"heartbeat_interval_minutes": ctx.heartbeat_interval,
                          "reactive_min_delta": ctx.min_delta,
                          "sensor_stale_minutes": ctx.sensor_stale_minutes,
                          "control": dataclasses.asdict(ctx.config)},
+              "outdoor": {"block_mode": ctx.block_mode},
               "rooms": [room]}
     return config, room
 
@@ -359,6 +373,35 @@ def _context(ha: HA, ctx: control.Context, readings: dict, almanac: dict,
     for uid in uids:
         a = ha.entities[entity_of(uid)]["attributes"]
         a.update(min_temp=ctx.unit_min, max_temp=ctx.unit_max)
+    ha.set(HEATER, "on" if ctx.heat_source_on else "off")
+
+
+def conditions_for(ctx: control.Context, edges, cond: control.Conditions | None
+                   ) -> control.Conditions | None:
+    """What the container has published for a step: the scenario's
+    conditions (with the step's own edges, if it gives some), or ones made
+    up from the step's block and edges, or none at all (no entity)."""
+    if cond is not None:
+        return cond if edges is None else dataclasses.replace(
+            cond, cold_edge=edges[0], warm_edge=edges[1])
+    if not ctx.blocked and edges is None:
+        return None
+    cold, warm = edges or (-1.0, 1.0)
+    return control.Conditions(SECTION, "active" if ctx.blocked else ctx.block_mode,
+                              cold_edge=cold, warm_edge=warm, would_block=ctx.blocked)
+
+
+def publish(ha: HA, cond: control.Conditions | None, state: str | None = None,
+            **attributes) -> None:
+    """sensor.ac_conditions_r as the runtime pushes it (state the section,
+    attributes from Runtime._conditions_detail), or no entity for None."""
+    entity = g.conditions_id(ROOM)
+    if cond is None:
+        ha.entities.pop(entity, None)
+        return
+    ha.set(entity, state or cond.section, room_id=ROOM,
+           **{**Runtime._conditions_detail(cond), "edges": {},
+              "computed_at": "2026-08-01T12:00:00+08:00", **attributes})
 
 
 def _view(ha: HA, now: datetime, uid: str = UNIT) -> dict:
@@ -508,17 +551,43 @@ class Replay:
         first = table._ctx(sc["ctx"])
         for uid, unit in units.items():
             _seed(ha, unit, table._ctxs(first, units)[uid], uid)
+        self.cond = None
         for i, st in enumerate(sc["steps"], 1):
             now = table._time(st.get("at", 0))
-            ctx = table._ctx(sc["ctx"], st.get("ctx"))
             ha.now = now
             try:
-                units, diff = self.step(ha, units, st, now, ctx)
+                if st["do"] == "conditions":
+                    self.cond = table._conditions(st, now, first.sensor_stale_minutes)
+                    diff = table.conditions_differ(st, self.cond) or self.read_back(
+                        ha, units, table._ctx(sc["ctx"], table.under(self.cond)))
+                else:
+                    ctx = table._ctx(sc["ctx"], table.under(self.cond), st.get("ctx"))
+                    units, diff = self.step(ha, units, table.with_edges(st, self.cond),
+                                            now, ctx)
             except Exception as e:                      # a template that fails is a difference
                 return [f"step {i} ({st['do']}): raised {type(e).__name__}: {e}"]
             if diff:
                 return [f"step {i} ({st['do']}): {diff}"]
         return []
+
+    def read_back(self, ha: HA, units: dict, ctx: control.Context) -> str | None:
+        """The conditions just decided, published as the runtime does, must
+        read back through the templates as control sees them: maintenance's
+        edges and `blocked` (heat sources included), and the scene's."""
+        readings = table.READINGS["settled_warm"]
+        config, room = _config(ctx, list(readings), False, [u for u in units if u != UNIT])
+        _context(ha, ctx, readings, table.ALMANAC, list(units))
+        publish(ha, self.cond)
+        want = {"blocked": control.room_blocked(ctx), "cold_edge": self.cond.cold_edge,
+                "warm_edge": self.cond.warm_edge}
+        got = ha.variables(g.build_maintenance_automation(config, room), until="warm_edge")
+        got = {k: got[k] for k in want}
+        scene = ha.variables(g.build_scene_automation(config, room, {"id": SECTION}),
+                             until="blocked")["blocked"]
+        self.steps += 1
+        if got != want or scene != want["blocked"]:
+            return f"the templates read {got} (scene blocked {scene}), control {want}"
+        return None
 
     def step(self, ha: HA, units: dict, st: dict, now: datetime,
              ctx: control.Context) -> tuple[dict, str | None]:
@@ -531,12 +600,10 @@ class Replay:
         peers = [uid for uid in units if uid != UNIT]
         config, room = _config(ctx, list(readings), forced, peers)
         _context(ha, ctx, readings, almanac, list(units))
+        publish(ha, conditions_for(ctx, st.get("edges"), self.cond))
         for sid, ago in st.get("reported", {}).items():      # still showing a value, but stale
             ha.entities[f"sensor.{sid}"]["last_reported"] = now - timedelta(seconds=ago)
-        edges = st.get("edges")
-        overrides = {"blocked": True} if ctx.blocked else {}
-        if edges:
-            overrides.update(cold_edge=edges[0], warm_edge=edges[1])
+        overrides: dict = {}                    # the templates read everything from HA
         self.room, self.config, self.ctxs = room, config, table._ctxs(ctx, units)
 
         if do == "votes":
@@ -747,11 +814,11 @@ def _fuzz_votes(n: int, seed: int = 7) -> int:
         ha.now = table.T0
         _seed(ha, control.Unit(), ctx)
         _context(ha, ctx, readings, {"sensors": sensors})
+        publish(ha, conditions_for(ctx, edges if i % 2 else None, None))
         reported = {sid: table.T0 - timedelta(seconds=age) for sid, age in ages.items()}
         for sid, when in reported.items():
             ha.entities[f"sensor.{sid}"]["last_reported"] = when
-        got = ha.variables(g.build_maintenance_automation(config, room),
-                           {"cold_edge": edges[0], "warm_edge": edges[1]}, until="votes")["votes"]
+        got = ha.variables(g.build_maintenance_automation(config, room), until="votes")["votes"]
         fresh = control.fresh_readings(readings, reported, table.T0, ctx.sensor_stale_minutes)
         stale_count += sum(1 for sid in readings if readings[sid] is not None and fresh[sid] is None)
         want = dataclasses.asdict(control.evaluate_votes(fresh, {"sensors": sensors}, *edges))
@@ -890,13 +957,82 @@ def _extra_cases() -> int:
            "a virtual sensor goes stale with its unit: 2 of 2 vote while the unit reports, "
            "1 of 1 once it last reported 3 h ago")
 
-    automations = [g.build_maintenance_automation(config, room),
-                   g.build_scene_automation(config, room, {"id": SECTION}),
-                   g.build_leak_release_automation(config, room, room["units"][0])]
-    blocked = {a["variables"]["blocked"] for a in automations}
-    expect(blocked == {g._blocked_template(room)}
-           and HA().render(g._blocked_template(room), {}) is False,
-           "blocked comes from one place and is false until phase 5")
+    # The conditions entity (phase 5), read only while it is the section's.
+    def reads(state, heat: str = "off", mode: str = "shadow", select: str = SECTION,
+              **attributes) -> tuple:
+        """(blocked, cold_edge, warm_edge) as maintenance reads them, and the
+        scene for SECTION's blocked, with sensor.ac_conditions_r in `state`
+        (None: no such entity) holding `attributes`."""
+        ctx = table._ctx({"block_mode": mode})
+        readings = table.READINGS["settled_warm"]
+        cfg, rm = _config(ctx, list(readings), False)
+        h = HA()
+        h.now = table.T0
+        _seed(h, cool, ctx)
+        _context(h, ctx, readings, table.ALMANAC)
+        h.set(g.scene_select_id(ROOM), select, options=list(g.SECTIONS))
+        h.set(HEATER, heat)
+        if state is not None:
+            h.set(g.conditions_id(ROOM), state, **attributes)
+        v = h.variables(g.build_maintenance_automation(cfg, rm), until="warm_edge")
+        scene = h.variables(g.build_scene_automation(cfg, rm, {"id": SECTION}),
+                            until="blocked")["blocked"]
+        return v["blocked"], v["cold_edge"], v["warm_edge"], scene
+
+    leaned = {"cold_edge": -0.4, "warm_edge": 1.6, "blocked": True, "would_block": True,
+              "block_mode": "active"}
+    for what, got, want in (
+            ("published for the section: read", reads(SECTION, **leaned),
+             (True, -0.4, 1.6, True)),
+            ("missing: edges -1/+1, not blocked", reads(None), (False, -1.0, 1.0, False)),
+            ("unknown: edges -1/+1, not blocked", reads("unknown", **leaned),
+             (False, -1.0, 1.0, False)),
+            ("unavailable: edges -1/+1, not blocked", reads("unavailable", **leaned),
+             (False, -1.0, 1.0, False)),
+            ("another section's: edges -1/+1, not blocked", reads("night", **leaned),
+             (False, -1.0, 1.0, False)),
+            ("the section's but with no attributes: edges -1/+1, not blocked", reads(SECTION),
+             (False, -1.0, 1.0, False)),
+            ("shadow (would block): not blocked, edges read",
+             reads(SECTION, **{**leaned, "blocked": False, "block_mode": "shadow"}),
+             (False, -0.4, 1.6, False)),
+            ("published for the next section before the select moves: the scene for it "
+             "reads it, maintenance (still in the last section) doesn't",
+             reads(SECTION, select="night", **leaned), (False, -1.0, 1.0, True)),
+            ("a heat source on, no entity: blocked (the config's shadow mode)",
+             reads(None, heat="on"), (True, -1.0, 1.0, True)),
+            ("a heat source on, no entity, the config's block_mode off: not blocked",
+             reads(None, heat="on", mode="off"), (False, -1.0, 1.0, False)),
+            ("a heat source on, the entity's block_mode off wins over the config's shadow",
+             reads(SECTION, heat="on", block_mode="off"), (False, -1.0, 1.0, False)),
+            ("a heat source on, the entity's block_mode active",
+             reads(SECTION, heat="on", mode="off", block_mode="active"),
+             (True, -1.0, 1.0, True)),
+            ("a heat source on, the entity unknown: the config's mode",
+             reads("unknown", heat="on", mode="active"), (True, -1.0, 1.0, True))):
+        expect(got == want, f"conditions entity {what} ({got})")
+
+    sections_of = {"maintenance": "section", "scene": repr(SECTION), "leak release": "section",
+                   "vote": "section", "manual change": "section"}
+    automations = {"maintenance": g.build_maintenance_automation(config, room),
+                   "scene": g.build_scene_automation(config, room, {"id": SECTION}),
+                   "leak release": g.build_leak_release_automation(config, room,
+                                                                   room["units"][0]),
+                   "vote": g.build_vote_automation(config, room),
+                   "manual change": g.build_manual_change_automation(config, room,
+                                                                     room["units"][0])}
+    one_place = []
+    for name, a in automations.items():
+        want = g._conditions_variables(config, room, sections_of[name],
+                                       edges=name == "maintenance")
+        text = repr(a)
+        one_place.append({k: a["variables"].get(k) for k in want} == want
+                         and text.count(g.conditions_id(ROOM)) == 1
+                         and text.count(HEATER) == 1)
+    expect(all(one_place) and "cold_edge" not in automations["scene"]["variables"],
+           "blocked and the edges come from one place (_conditions_variables), in every "
+           "automation that reads them; the conditions entity and the heat source are read "
+           "nowhere else")
 
     manual = g.build_manual_change_automation(config, room, room["units"][0])
     expect(manual["trigger"] == manual_triggers(ENTITY),

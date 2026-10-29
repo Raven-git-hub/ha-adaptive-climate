@@ -208,8 +208,10 @@ trust-weighted majority of the voters' sides picks the direction; an exact tie
 means no action. What happens next is the control state machine in
 `docs/V2_DESIGN.md` (Control: cool or rest); until phase 3 lands, the v1
 maintenance automation still corrects by ±2° for at most
-`system.control.boost_max_minutes`. Phase 5 leans the vote edges with the
-outdoor temperature; the quorum count is unchanged.
+`system.control.boost_max_minutes`. The vote edges lean with the outdoor
+temperature (phase 5: the container publishes them in
+`sensor.ac_conditions_<room>`, docs/ALMANAC_FORMAT.md); the quorum count is
+unchanged.
 
 ## How this shapes the almanac
 

@@ -19,7 +19,10 @@ The control logic is app/control.py's, rendered as Jinja (docs/V2_DESIGN.md,
 Control: cool or rest): the scene runs on_section_change, maintenance runs
 evaluate_votes and step, the vote automation runs on_button, the
 manual-change automation runs on_climate_change, and the leak automations
-run step's leak rules. The vote and manual-change automations decide
+run step's leak rules. Each reads the section's outdoor conditions (phase 5:
+the cooling block and the leaned vote edges) from sensor.ac_conditions_<room>,
+which the container publishes at each section change, and checks the room's
+heat sources live. The vote and manual-change automations decide
 whether a person's vote is accepted (one per episode) and report it in an
 ac_person_vote event, which is all the runtime learns from.
 tools/control_logic_check.py replays tools/control_check.py's scenario
@@ -76,6 +79,7 @@ def guard_id(room: str) -> str:        return f"input_boolean.ac_active_{room}"
 def hold_id(room: str) -> str:         return f"input_boolean.ac_hold_{room}"
 def scene_select_id(room: str) -> str: return f"input_select.ac_scene_{room}"
 def almanac_id(room: str) -> str:      return f"sensor.ac_almanac_{room}"
+def conditions_id(room: str) -> str:   return f"sensor.ac_conditions_{room}"
 
 def leak_id(room: str, unit: str) -> str:
     return f"input_boolean.ac_leak_{room}_{unit}"
@@ -247,11 +251,39 @@ def _live_section_variables(room: dict) -> dict:
     }
 
 
-def _blocked_template(room: dict) -> str:
-    """Whether cooling is blocked for the room: the one place every control
-    template reads it from. False until phase 5 publishes the block decision
-    and the room's heat sources here."""
-    return "{{ false }}"
+def _conditions_variables(config: dict, room: dict, section: str,
+                          edges: bool = False) -> dict:
+    """The one place `blocked` and the vote edges come from (decision 62):
+    sensor.ac_conditions_<room>, read only while its state is `section` (a
+    Jinja expression). Missing, unknown, unavailable or another section's
+    falls back to edges -1/+1 and no block (fail open). Any of the room's
+    heat sources on blocks too, checked live, unless block_mode is off: the
+    conditions' own block_mode, or the config's while there are none.
+    edges: also cold_edge and warm_edge, which only maintenance votes with."""
+    domain, obj = _split(conditions_id(room["id"]))
+    mode = (config.get("outdoor") or {}).get("block_mode", control.DEFAULT_BLOCK_MODE)
+    heat = " or ".join(f"states('{e}') == 'on'" for e in room.get("heat_sources") or [])
+    variables = {
+        "conditions": _fill(
+            "{%- set c = states.<<D>>.<<O>> -%}"
+            "{%- set a = c.attributes if c is not none else {} -%}"
+            "{%- set live = c is not none and c.state not in ['unknown', 'unavailable'] "
+            "and c.state == <<S>> -%}"
+            "{{ {'live': live, "
+            "'cold_edge': (a.get('cold_edge') | float(-1.0)) if live else -1.0, "
+            "'warm_edge': (a.get('warm_edge') | float(1.0)) if live else 1.0, "
+            "'blocked': live and a.get('blocked') == true, "
+            "'block_mode': a.get('block_mode') if a.get('block_mode') in <<MODES>> "
+            "else '<<MODE>>'} }}",
+            D=domain, O=obj, S=section, MODES=list(control.BLOCK_MODES), MODE=mode),
+        "blocked": _fill("{{ conditions.blocked or (conditions.block_mode in <<HM>> and "
+                         "(<<HEAT>>)) }}", HM=list(control.HEAT_BLOCK_MODES),
+                         HEAT=heat or "false"),
+    }
+    if edges:
+        variables.update(cold_edge="{{ conditions.cold_edge }}",
+                         warm_edge="{{ conditions.warm_edge }}")
+    return variables
 
 
 def _sa_live(unit: dict) -> str:
@@ -402,7 +434,8 @@ def _step(config: dict, room: dict, unit: dict) -> str:
 
 def _vote(config: dict, direction: str, chosen: str) -> str:
     """control.on_person_vote for one unit; direction and chosen are Jinja
-    expressions (chosen none: a button press, one step from the target)."""
+    expressions (chosen none: a button press, one step from the target). A
+    too_hot vote while `blocked` unblocks the unit (unblock_for_vote)."""
     cfg = control.ControlConfig.from_config(config)
     return _fill(
         "{%- set vd = <<D>> -%}{%- set vc = <<C>> -%}"
@@ -413,6 +446,7 @@ def _vote(config: dict, direction: str, chosen: str) -> str:
         "{%- set nb = <<CLAMP>> -%}"
         "{%- set r.base = nb -%}{%- set r.offset = 0 -%}{%- set r.grace = now_ts -%}"
         "{%- set r.go = true -%}"
+        "{%- if vd == 'too_hot' and blocked -%}{%- set r.unb = true -%}{%- endif -%}"
         "{%- set into = 'rest' if vd == 'too_cold' else 'boost' -%}"
         "{%- if not (vd == 'too_cold' and st == 'user_off') -%}"
         "{%- if st != into -%}{%- set r.since = now_ts -%}{%- endif -%}"
@@ -589,7 +623,8 @@ def build_scene_automation(config: dict, room: dict, section: dict) -> dict:
     scenes = room.get("scenes", {})
     transition = int(scenes.get(sid, {}).get("transition_seconds", 0) or 0)
 
-    variables: dict[str, str] = {"now_ts": NOW_TS, "blocked": _blocked_template(room)}
+    variables: dict[str, str] = {"now_ts": NOW_TS,
+                                 **_conditions_variables(config, room, repr(sid))}
     for unit in room["units"]:
         forced = "true" if sid in _forced_off_sections(room, unit) else "false"
         variables[_unit_var(unit)] = (
@@ -680,7 +715,7 @@ def build_leak_release_automation(config: dict, room: dict, unit: dict) -> dict:
         "condition": condition,
         "variables": {
             **_live_section_variables(room), "now_ts": NOW_TS,
-            "blocked": _blocked_template(room),
+            **_conditions_variables(config, room, "section"),
             # the latch is being released, so it reads as off
             _unit_var(unit): _read_unit(room, unit, _sa_live(unit), "false")
                              + "{%- if st == 'leak' -%}"
@@ -804,10 +839,7 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
         **_live_section_variables(room),
         "sensor_data": "{{ sect.get('sensors') or {} }}",
         "now_ts": NOW_TS,
-        "blocked": _blocked_template(room),
-        # phase 5 leans these per sensor from the conditions entity
-        "cold_edge": "{{ -1.0 }}",
-        "warm_edge": "{{ 1.0 }}",
+        **_conditions_variables(config, room, "section", edges=True),
         "votes": _votes_expr(room, config.get("system", {}).get(
             "sensor_stale_minutes", control.DEFAULT_STALE_MINUTES)),
     }
@@ -847,6 +879,7 @@ def build_vote_automation(config: dict, room: dict) -> dict:
     r = room["id"]
     variables: dict[str, str] = {
         **_live_section_variables(room), "now_ts": NOW_TS,
+        **_conditions_variables(config, room, "section"),
         "direction": "{{ trigger.id }}",
         "episode": _episode(room),
     }
@@ -898,6 +931,7 @@ def build_manual_change_automation(config: dict, room: dict, unit: dict) -> dict
     r, u, e = room["id"], unit["id"], unit["entity_id"]
     variables: dict[str, str] = {
         **_live_section_variables(room), "now_ts": NOW_TS,
+        **_conditions_variables(config, room, "section"),
         "before": _climate_snapshot("trigger.from_state"),
         "after": _climate_snapshot("trigger.to_state"),
         "change": _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))

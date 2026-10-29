@@ -155,6 +155,10 @@ async def check(config: dict, rest: HARest, ws: HAWebSocket | None = None,
                 continue   # virtual sensor - no entity_id to verify
             if s["entity_id"] not in states:
                 report.missing_entities.append(s["entity_id"])
+        for e in room.get("heat_sources") or []:
+            # the generated templates read them live; a typo would never block
+            if e not in states:
+                report.missing_entities.append(e)
 
     if report.missing_entities:
         report.problems.append(

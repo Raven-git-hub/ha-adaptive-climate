@@ -57,6 +57,29 @@ Store (no Home Assistant, no network). Verifies:
     midnight but not local midnight (Day from 07:00), one crossing local
     midnight but not UTC midnight (Sleep), and one whose hour is on the
     previous UTC date (Sunrise)
+  * the conditions (phase 5), as a two-day story with outdoor.block_mode
+    shadow, a room comfort point of 23.9 and the margin starting at 6:
+      - published before the scene when the forecast cache is fresh, and
+        after it (the scene firing on fail-open conditions published first)
+        when a fetch is needed, the next follow-up then publishing the real
+        ones; recorded on the section run with one block event each;
+      - shadow logs "would block Night: forecast max 17.0, comfort 23.9,
+        margin 6.0" while the entity tells control blocked = false, and
+        active mode tells it true;
+      - hysteresis across sections: a room blocked last section stays
+        blocked while delta max > margin - 1, and one that wasn't blocked
+        needs delta max >= margin;
+      - a restart inside a decided run keeps its decision and margin;
+      - the margin learning: a too_hot vote and a person's on in a blocked
+        run, a too_cold vote 20 minutes after the scene started cooling and
+        an off 25 minutes after a wake in an unblocked one, and nothing for
+        an off 46 minutes after cooling started or a vote in a run decided
+        with block_mode off; each move logged, pushed in the almanac, and
+        used by the next crossover;
+      - the entity re-pushed on reconnect, on homeassistant_start and by
+        the almanac timer;
+      - fail open: a failing forecast, and outdoor.source none (one warning,
+        not repeated after a restart)
 
     PYTHONPATH=. python tools/runtime_check.py
 """
@@ -297,10 +320,11 @@ async def main() -> int:
           "(NULL where a room has none yet) - OK")
 
     # --- a person's vote: a setpoint change on the remote ---
-    assert set(ws.subscribed) == {"state_changed", "ac_person_vote"}, ws.subscribed
-    ws.subscribed.clear()                         # a dropped socket loses both
+    subscriptions = {"state_changed", "ac_person_vote", "homeassistant_start"}
+    assert set(ws.subscribed) == subscriptions, ws.subscribed
+    ws.subscribed.clear()                         # a dropped socket loses them all
     await rt._resubscribe()
-    assert set(ws.subscribed) == {"state_changed", "ac_person_vote"}, ws.subscribed
+    assert set(ws.subscribed) == subscriptions, ws.subscribed
     rt._cache["input_boolean.ac_active_main_room"] = "off"
     rt._on_state_change(_state_changed("climate.lounge_lounge", 22.0, 24.0))
     assert not rt.rooms["main_room"].reactive_units, "a remote's setpoint change opened a window"
@@ -317,8 +341,8 @@ async def main() -> int:
     assert rx == 1, rx
     assert rxs == 3, rxs   # all sensors snapshotted at reaction time
     assert last_reaction(c, "main_room") == ("too_cold", "too_cold", None, None, None, 24.0, 1)
-    print("vote: subscribed to ac_person_vote as well as state_changed, both again after a "
-          "reconnect - OK")
+    print("vote: subscribed to ac_person_vote and homeassistant_start as well as "
+          "state_changed, all again after a reconnect - OK")
     print("vote: a remote's setpoint change opens no window of the runtime's own; HA's event for "
           "it is one too_cold reaction (unit, chosen 24), hold not raised, 3 sensors "
           "snapshotted - OK")
@@ -617,6 +641,8 @@ async def main() -> int:
     await check_stale_sensor()
     await check_outdoor()
     await check_outdoor_utc()
+    await check_conditions()
+    await check_conditions_without_outdoor()
     print("\nALL RUNTIME CHECKS PASSED")
     return 0
 
@@ -1174,6 +1200,350 @@ async def check_outdoor_utc() -> None:
           "UTC midnight but not local (mean 29.0, max 32.0 from 23:00-05:00 UTC), Sleep "
           "22:00-05:30 crosses local midnight but not UTC (mean 21.25, max 23.0 from "
           "14:00-21:00 UTC), Sunrise's 06:00 is 22:00 UTC the day before - OK")
+
+
+# The phase 5 story's forecast, by local hour (any other hour: 26.0). The
+# room comfort point is 23.9 throughout; the margin starts at 6.
+STORY_TEMPS = {
+    (3, 16): 30.0, (3, 17): 31.0, (3, 18): 30.0, (3, 19): 29.0, (3, 20): 28.0,  # Sunset
+    (3, 21): 17.0,                                                          # Night: delta max 6.9
+    (3, 22): 18.0, (3, 23): 17.8, (4, 0): 17.8, (4, 1): 17.8,               # Sleep: max 18.0,
+    (4, 2): 17.8, (4, 3): 17.8, (4, 4): 17.8, (4, 5): 17.8,                 # delta max 5.9
+    (4, 6): 18.4, (4, 7): 18.2,                                             # Sunrise: 5.5
+    **{(4, h): 18.0 for h in range(8, 14)},                                 # Day: 5.9
+    (4, 14): 17.0, (4, 15): 17.0,                                           # Afternoon: 6.9
+    **{(4, h): 30.0 for h in range(16, 21)},                                # Sunset: -6.1
+    (4, 21): 17.0,                                                          # Night: 6.9
+}
+
+
+def story_forecast(hk) -> list[dict]:
+    first = datetime(2026, 8, 3, 12, 0, tzinfo=hk)
+    out = []
+    for k in range(48):
+        at = first + timedelta(hours=k)
+        out.append({"datetime": at.astimezone(timezone.utc).isoformat(), "condition": "cloudy",
+                    "temperature": STORY_TEMPS.get((at.day, at.hour), 26.0)})
+    return out
+
+
+async def check_conditions() -> None:
+    """Phase 5: the lean and the block, decided by the runtime at each
+    crossover, published to sensor.ac_conditions_<room>, and the margin
+    learned by the replay."""
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+    tmp = Path(tempfile.mkdtemp())
+    store = Store(tmp, SCHEMA)
+    config = json.loads(json.dumps(CONFIG))
+    config["outdoor"].update(source="forecast", weather_entity="weather.forecast_home",
+                             block_mode="shadow", initial_margin=6, lean_per_degree=0.1)
+    clock = {"t": datetime(2026, 8, 3, 15, 50, 0, tzinfo=hk)}
+    states = _build_states()
+    states.append({"entity_id": "weather.forecast_home", "state": "cloudy",
+                   "attributes": {"temperature": 28.0, "supported_features": 3},
+                   "last_updated": clock["t"].astimezone(utc).isoformat()})
+    helper = {"entity_id": "input_select.ac_state_main_room_main_room_ac", "state": "cool",
+              "attributes": {}}
+    states.append(helper)
+    # Main Room's history: one heartbeat per section, its sensors at 23.4,
+    # 23.9 and 24.4, so each section's comfort readings seed there (no trust
+    # yet: the comfort point is their plain mean, 23.9).
+    seed_day = datetime(2026, 8, 1, 0, 0, tzinfo=hk)
+    for k, sec in enumerate(SECTIONS):
+        at = seed_day + timedelta(hours=3 * k)
+        store.record_heartbeat("main_room", at.isoformat(), at.astimezone(utc).isoformat(),
+                               "2026-08-01", sec,
+                               {"living1": 23.4, "living2": 23.9, "living3": 24.4},
+                               {"main_room_ac": UnitSample(True, "cool", "low", 22.0, 24.0, None,
+                                                           control_state="cool")})
+    forecast = story_forecast(hk)
+    c = store._conn
+
+    def runtime(rest) -> Runtime:
+        rt = Runtime(config, store, rest, StubWS(), tmp)
+        rt._now = lambda: (clock["t"].isoformat(timespec="seconds"),
+                           clock["t"].astimezone(utc).isoformat(timespec="seconds"),
+                           clock["t"].date().isoformat(), clock["t"])
+        return rt
+
+    async def settle(rt) -> None:
+        await asyncio.sleep(0)
+        await asyncio.gather(*[t for t in list(rt._followups)
+                               if t.get_name().startswith(("ac-outdoor-", "ac-republish"))])
+
+    def at(day: int, hour: int, minute: int = 0, second: int = 0) -> datetime:
+        clock["t"] = datetime(2026, 8, day, hour, minute, second, tzinfo=hk)
+        return clock["t"]
+
+    def run(day: str, section: str) -> tuple:
+        return tuple(c.execute(
+            "SELECT outdoor_mean, outdoor_max, comfort_point, lean, blocked, block_mode "
+            "FROM section_run WHERE room_id = 'main_room' AND local_date = ? AND section = ?",
+            (day, section)).fetchone())
+
+    def block_events() -> list[str]:
+        return [e["message"] for e in reversed(store.recent_events(
+            limit=1000, room_id="main_room", category="block"))]
+
+    def pushes(rest) -> list[tuple[str, dict]]:
+        return [(e[2].get("section"), e[2]) for e in rest.log
+                if e[0] == "set_state" and e[1] == "sensor.ac_conditions_main_room"]
+
+    def order(rest, section: str) -> list[str]:
+        """The conditions pushes (fail open or decided) and the scene
+        trigger for a section, in the order they happened."""
+        out = []
+        for e in rest.log:
+            if e[0] == "set_state" and e[1] == "sensor.ac_conditions_main_room" \
+                    and e[2]["section"] == section:
+                out.append("fail-open conditions" if e[2]["fail_open"] else "conditions")
+            elif e[0] == "service" and e[1:3] == ("automation", "trigger") \
+                    and e[3]["entity_id"] == f"automation.ac_main_room_{section}":
+                out.append("scene")
+        return out
+
+    async def cross(rt, section: str, day: int, hour: int, minute: int = 0) -> None:
+        at(day, hour, minute, 5)
+        await rt._crossover(rt.rooms["main_room"], section,
+                            datetime(2026, 8, day, hour, minute, tzinfo=hk), catch_up=False)
+        await settle(rt)
+
+    async def beat(rt, day: int, hour: int, minute: int, state: str) -> None:
+        at(day, hour, minute)
+        helper["state"] = state
+        await rt._do_heartbeat(rt.rooms["main_room"])
+
+    async def person(rt, day: int, hour: int, minute: int, before: str, after: str,
+                     state: str | None = None) -> None:
+        """A person's change; `state`: the unit's state helper just before
+        it, so the change isn't taken for our own command arriving late."""
+        at(day, hour, minute)
+        if state is not None:
+            helper["state"] = rt._cache[helper["entity_id"]] = state
+        rt._on_state_change(_state_changed("climate.lounge_lounge", 22.0, 22.0, state=before,
+                                           new_state=after))
+        await rt._flush_reactive(rt.rooms["main_room"])
+
+    async def vote(rt, day: int, hour: int, minute: int, direction: str) -> None:
+        at(day, hour, minute)
+        await rt._record_vote(vote_event("main_room", direction))
+
+    rest = ForecastRest(states, clock, fixed=forecast)
+    rt = runtime(rest)
+    await rt.start()
+    await settle(rt)
+    assert round(rt.margin("main_room"), 6) == 6.0
+    assert [p[2]["margin"] for p in rest.set_states if p[0] == "sensor.ac_almanac_main_room"][-1] \
+        == 6.0
+
+    # --- a fresh cache: the conditions go out before the scene ---
+    await cross(rt, "sunset", 3, 16)
+    assert len(rest.forecast_calls) == 1, "a 10-minute-old forecast was fetched again"
+    assert order(rest, "sunset") == ["conditions", "scene"], order(rest, "sunset")
+    sunset = pushes(rest)[-1][1]
+    assert {k: sunset[k] for k in ("comfort_point", "outdoor_mean", "outdoor_max", "delta_mean",
+                                   "delta_max", "lean", "cold_edge", "warm_edge", "blocked",
+                                   "would_block", "block_mode", "margin")} == {
+        "comfort_point": 23.9, "outdoor_mean": 29.6, "outdoor_max": 31.0, "delta_mean": -5.7,
+        "delta_max": -7.1, "lean": -0.57, "cold_edge": -1.57, "warm_edge": 0.43,
+        "blocked": False, "would_block": False, "block_mode": "shadow", "margin": 6.0}, sunset
+    assert sunset["edges"]["living1"] == {"cold": 15.55, "warm": 25.55} \
+        and sunset["computed_at"] == "2026-08-03T16:00:05+08:00", sunset
+    assert run("2026-08-03", "sunset") == (29.6, 31.0, 23.9, -0.57, 0, "shadow")
+    assert block_events()[-1] == (
+        "Main Room: not blocking Sunset: forecast max 31.0, comfort 23.9, margin 6.0; lean -0.57 "
+        "from the forecast mean 29.6: edges -1.57 / +0.43"), block_events()[-1]
+    print("conditions: with a 10-minute-old forecast, Sunset's are published before its scene "
+          "fires - comfort point 23.9, delta -5.7, lean -0.57, edges -1.57 / +0.43, not blocked "
+          "- each sensor's edges in degrees, recorded on the run, one block event - OK")
+
+    # --- a stale cache: the scene fires on fail-open conditions, then the real ones ---
+    await cross(rt, "night", 3, 20, 30)
+    assert rest.forecast_calls[1:] == [at(3, 20, 30, 5)], rest.forecast_calls
+    assert order(rest, "night") == ["fail-open conditions", "scene", "conditions"], \
+        order(rest, "night")
+    placeholder, night = [p[1] for p in pushes(rest) if p[0] == "night"]
+    assert (placeholder["cold_edge"], placeholder["warm_edge"], placeholder["blocked"],
+            placeholder["fail_open"]) == (-1.0, 1.0, False, "no_outdoor"), placeholder
+    assert (night["would_block"], night["blocked"], night["delta_max"], night["fail_open"]) == \
+        (True, False, 6.9, None), night
+    assert run("2026-08-03", "night") == (17.0, 17.0, 23.9, 0.69, 1, "shadow")
+    assert block_events()[-1].startswith(
+        "Main Room: would block Night: forecast max 17.0, comfort 23.9, margin 6.0 (shadow mode: "
+        "not applied); lean +0.69"), block_events()[-1]
+    assert len(block_events()) == 3, block_events()   # startup's Afternoon, Sunset, Night
+    print("conditions: with a 4 h 40 min old forecast, Night's scene fires on fail-open "
+          "conditions (-1/+1, not blocked) published first, and the follow-up publishes the "
+          "real ones; shadow logs \"would block Night: forecast max 17.0, comfort 23.9, margin "
+          "6.0\" while the entity tells control blocked = false - OK")
+    await rt.stop()
+
+    # --- a restart inside Night keeps its decision ---
+    forecast[9]["temperature"] = 30.0                     # 21:00 is no longer cold
+    assert forecast[9]["datetime"] == "2026-08-03T13:00:00+00:00"
+    at(3, 21, 0)
+    rest = ForecastRest(states, clock, fixed=forecast)
+    rt = runtime(rest)
+    await rt.start()
+    await settle(rt)
+    kept = pushes(rest)[0][1]
+    assert (kept["would_block"], kept["delta_max"], kept["margin"], kept["lean"]) == \
+        (True, 6.9, 6.0, 0.69), kept
+    assert run("2026-08-03", "night") == (17.0, 17.0, 23.9, 0.69, 1, "shadow")
+    assert block_events()[-1].endswith("(kept from the run's start)"), block_events()[-1]
+    print("conditions: a 21:00 restart inside Night re-publishes the decision made at 20:30, "
+          "though the forecast for 21:00 has changed since - OK")
+
+    # --- margin: a too_hot vote in a (shadow) blocked run ---
+    await vote(rt, 3, 21, 10, "too_hot")
+    assert round(rt.margin("main_room"), 6) == 6.7, rt.margin("main_room")      # 6 + (6.9 + 0.5 - 6) / 2
+    assert block_events()[-1] == (
+        "Main Room: block margin 6.0 -> 6.7: a too_hot vote in Night 2026-08-03, which would "
+        "have been blocked (shadow) (delta max 6.9, so toward 7.4)"), block_events()[-1]
+    assert [p[2]["margin"] for p in rest.set_states
+            if p[0] == "sensor.ac_almanac_main_room"][-1] == 6.7
+    print("margin: a too_hot vote in Night, shadow-blocked at delta max 6.9, moves it halfway "
+          "to 7.4: 6.0 -> 6.7, logged and pushed in the almanac - OK")
+
+    # --- hysteresis: blocked last section, held while delta max > margin - 1 ---
+    await cross(rt, "sleep", 3, 22)
+    assert order(rest, "sleep") == ["conditions", "scene"], order(rest, "sleep")
+    assert run("2026-08-03", "sleep")[1:] == (18.0, 23.9, 0.608, 1, "shadow"), run("2026-08-03", "sleep")
+    assert block_events()[-1].startswith(
+        "Main Room: would block Sleep: forecast max 18.0, comfort 23.9, margin 6.7, held from the "
+        "last section until delta 5.9 is 5.7 or less (shadow mode: not applied)"), \
+        block_events()[-1]
+    # --- margin: a person's on in a blocked run ---
+    await person(rt, 3, 22, 30, "off", "cool", state="user_off")
+    assert round(rt.margin("main_room"), 6) == 6.55, rt.margin("main_room")     # 6.7 + (6.4 - 6.7) / 2
+    assert "a unit turned on in Sleep 2026-08-03" in block_events()[-1], block_events()[-1]
+    await cross(rt, "sunrise", 4, 5, 30)
+    assert run("2026-08-04", "sunrise")[1:] == (18.4, 23.9, 0.56, 0, "shadow"), \
+        run("2026-08-04", "sunrise")
+    await cross(rt, "day", 4, 8)
+    assert run("2026-08-04", "day")[1:] == (18.0, 23.9, 0.59, 0, "shadow")
+    assert block_events()[-1].startswith(
+        "Main Room: not blocking Day: forecast max 18.0, comfort 23.9, margin 6.55;"), \
+        block_events()[-1]
+    print("hysteresis: Sleep (delta max 5.9) stays blocked after Night, since 5.9 > 6.7 - 1; "
+          "a person's on in it moves the margin to 6.55; Sunrise (5.5 <= 5.55) lifts the block; "
+          "Day (5.9, above margin - 1 but below the margin) isn't blocked, since Sunrise "
+          "wasn't - OK")
+
+    # --- margin: too_cold 20 min after the scene started cooling, unblocked ---
+    await beat(rt, 4, 8, 5, "cool")
+    await vote(rt, 4, 8, 20, "too_cold")
+    assert round(rt.margin("main_room"), 6) == 6.225, rt.margin("main_room")   # 6.55 + (5.9 - 6.55) / 2
+    assert "a too_cold vote 20 min after cooling started in Day 2026-08-04, unblocked" in \
+        block_events()[-1], block_events()[-1]
+    # --- margin: an off 25 min after a wake (dated by the last rest heartbeat) ---
+    await beat(rt, 4, 8, 25, "rest")
+    await beat(rt, 4, 8, 35, "rest")
+    await beat(rt, 4, 8, 45, "cool")
+    await person(rt, 4, 9, 0, "cool", "off")
+    assert round(rt.margin("main_room"), 6) == 6.0625, rt.margin("main_room")  # 6.225 + (5.9 - 6.225) / 2
+    assert "a unit turned off 25 min after cooling started in Day" in block_events()[-1]
+    print("margin: in Day (unblocked, delta max 5.9) a too_cold vote 20 min after the scene "
+          "started cooling moves it to 6.225, and an off 25 min after maintenance woke the unit "
+          "(dated by its last rest heartbeat, 08:35) to 6.0625 - OK")
+
+    # --- block_mode off: never blocked, and nothing to learn from ---
+    config["outdoor"]["block_mode"] = "off"
+    await cross(rt, "afternoon", 4, 14)
+    assert run("2026-08-04", "afternoon")[1:] == (17.0, 23.9, 0.69, 0, "off")
+    assert block_events()[-1].startswith("Main Room: Afternoon not blocked (block_mode off): "
+                                         "forecast max 17.0"), block_events()[-1]
+    n = len(block_events())
+    await vote(rt, 4, 14, 10, "too_hot")
+    assert round(rt.margin("main_room"), 6) == 6.0625 and len(block_events()) == n
+    # --- too late: an off 46 min after the scene started cooling ---
+    config["outdoor"]["block_mode"] = "shadow"
+    await cross(rt, "sunset", 4, 16)
+    for minute in (5, 15, 25, 35, 45):
+        await beat(rt, 4, 16, minute, "cool")
+    n = len(block_events())
+    await person(rt, 4, 16, 46, "cool", "off")
+    assert round(rt.margin("main_room"), 6) == 6.0625 and len(block_events()) == n, block_events()[n:]
+    print("margin: nothing learned from a too_hot vote in Afternoon, decided with block_mode "
+          "off (which blocks nothing, at delta max 6.9), nor from an off in Sunset 46 min "
+          "after its scene started cooling - OK")
+
+    # --- active mode: control sees the block; the learned margin decides it ---
+    config["outdoor"]["block_mode"] = "active"
+    await cross(rt, "night", 4, 20, 30)
+    night = pushes(rest)[-1][1]
+    assert (night["section"], night["blocked"], night["would_block"], night["margin"]) == \
+        ("night", True, True, 6.06), night
+    assert block_events()[-1].startswith(
+        "Main Room: blocking Night: forecast max 17.0, comfort 23.7, margin 6.06;"), \
+        block_events()[-1]
+    assert run("2026-08-04", "night")[1:] == (17.0, 23.7, 0.67, 1, "active")
+    print("conditions: in active mode Night's block reaches control: blocked = true (the "
+          "too_hot vote last night moved Night's comfort point to 23.7: delta max 6.7 >= the "
+          "learned 6.06) - OK")
+
+    # --- re-pushed on reconnect, on homeassistant_start and by the almanac timer ---
+    count = len(pushes(rest))
+    await rt._resubscribe()
+    assert len(pushes(rest)) == count + 1 and pushes(rest)[-1][1] == night, pushes(rest)[-1]
+    rt.ws.subscribed["homeassistant_start"]({"event_type": "homeassistant_start", "data": {}})
+    await settle(rt)
+    assert len(pushes(rest)) == count + 2
+    await rt._republish()                                # what the almanac timer runs
+    assert len(pushes(rest)) == count + 3
+    print("conditions: re-pushed on a websocket reconnect, on homeassistant_start and by the "
+          "almanac timer, with the almanac - OK")
+
+    # --- a failing forecast fails open, with the per-streak warning ---
+    rest.mode, rest.fixed = "error", None
+    await cross(rt, "day", 5, 8)
+    day = pushes(rest)[-1][1]
+    assert (day["section"], day["cold_edge"], day["warm_edge"], day["blocked"],
+            day["fail_open"]) == ("day", -1.0, 1.0, False, "no_outdoor"), day
+    assert run("2026-08-05", "day") == (None, None, 24.7, None, 0, "active"), \
+        run("2026-08-05", "day")             # Day's comfort moved by yesterday's too_cold vote
+    assert block_events()[-1] == ("Main Room: no outdoor value for Day (no forecast for the "
+                                  "section), so no lean and no block: fail open"), \
+        block_events()[-1]
+    assert store.recent_events(category="outdoor", severity="warning")[0]["detail"]["kind"] \
+        == "error"
+    print("fail open: a failing forecast leaves Day with edges -1/+1 and no block (active "
+          "mode), one outdoor warning for the streak and one block event - OK")
+    await rt.stop()
+    store.close()
+
+
+async def check_conditions_without_outdoor() -> None:
+    """outdoor.source none: every section fails open, published before the
+    scene, with one outdoor warning that a restart doesn't repeat."""
+    tmp = Path(tempfile.mkdtemp())
+    store = Store(tmp, SCHEMA)
+    config = json.loads(json.dumps(CONFIG))
+    assert config["outdoor"]["source"] == "none"
+    for _ in range(2):
+        rest = StubRest(_build_states())
+        rt = Runtime(config, store, rest, StubWS(), tmp)
+        await rt.start()
+        first = next(i for i, e in enumerate(rest.log)
+                     if e[0] == "service" and e[1:3] == ("automation", "trigger")
+                     and e[3]["entity_id"].startswith("automation.ac_main_room_"))
+        cond = [e for e in rest.log[:first]
+                if e[0] == "set_state" and e[1] == "sensor.ac_conditions_main_room"]
+        assert cond and (cond[0][2]["cold_edge"], cond[0][2]["warm_edge"], cond[0][2]["blocked"],
+                         cond[0][2]["fail_open"]) == (-1.0, 1.0, False, "no_outdoor"), cond
+        await rt.stop()
+    warnings = store.recent_events(category="outdoor", severity="warning")
+    assert len(warnings) == 1 and warnings[0]["message"].startswith(
+        "outdoor.source is 'none': no outdoor value is recorded, and every section fails open"), \
+        warnings
+    run = store._conn.execute("SELECT lean, blocked, block_mode FROM section_run "
+                              "WHERE room_id = 'main_room'").fetchone()
+    assert tuple(run) == (None, 0, "shadow"), tuple(run)
+    msg = store.recent_events(room_id="main_room", category="block")[0]["message"]
+    assert "(outdoor.source is none), so no lean and no block: fail open" in msg, msg
+    store.close()
+    print("fail open: with outdoor.source none the conditions (-1/+1, not blocked) go out "
+          "before the scene, with one outdoor warning that a restart doesn't repeat - OK")
 
 
 if __name__ == "__main__":

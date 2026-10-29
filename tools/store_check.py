@@ -244,6 +244,30 @@ def check_fresh_store() -> None:
           "forecast mean and max (also set after its crossover, in a row of their own), "
           "round-trip through the CSV and SQLite; no value is a blank field and NULL - OK")
 
+    # a run's conditions (phase 5), decided at its crossover: a CSV row of
+    # their own, the SQLite row updated in place; read back with the outdoor
+    # values, and the run before's decision found by start time
+    assert store.section_run_conditions("baby_room", rd, "sunset")["block_mode"] is None
+    store.record_section_conditions("baby_room", rd, "sunset", 23.9, 0.69, True, "shadow")
+    assert store.section_run_conditions("baby_room", rd, "sunset") == {
+        "outdoor_mean": 24.1, "outdoor_max": 25.3, "comfort_point": 23.9, "lean": 0.69,
+        "blocked": 1, "block_mode": "shadow"}
+    assert store.section_run_conditions("baby_room", rd, "night") is None
+    assert csv_rows("section_run")[-1] == {
+        **{k: "" for k in SECTION_RUN_CSV}, "section": "sunset", "comfort_point": "23.9",
+        "lean": "0.69", "blocked": "1", "block_mode": "shadow"}, csv_rows("section_run")[-1]
+    store.record_section_run("baby_room", rd, "night", planned_start=f"{rd}T20:30:00+08:00",
+                             actual_start=f"{rd}T20:30:03+08:00", outcome="ran")
+    night = datetime.fromisoformat(f"{rd}T20:30:00+08:00")
+    assert store.previous_blocked("baby_room", rd, "night", night) is True
+    store.record_section_conditions("baby_room", rd, "sunset", None, None, False, "shadow")
+    assert store.previous_blocked("baby_room", rd, "night", night) is False
+    assert store.previous_blocked("baby_room", rd, "sunset",
+                                  datetime.fromisoformat(f"{rd}T16:00:00+08:00")) is False
+    print("conditions: a section run's comfort point, lean, block decision and block_mode "
+          "round-trip through a CSV row of their own and SQLite; the run before's decision is "
+          "found by start time - OK")
+
     # --- every reaction kind round-trips through CSV and SQLite ---
     kinds = {  # minute -> (room kind, setpoint before/after, changed, power before/after)
         20: ("off", 22.0, 22.0, False, True, False),

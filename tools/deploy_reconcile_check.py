@@ -234,6 +234,18 @@ async def main() -> int:
     print("a config with a duplicate sensor id: the check names it and the deploy aborts "
           "without writing anything - OK")
 
+    # a heat source the templates would read but that isn't in Home Assistant
+    heated = json.loads(json.dumps(cfg4))
+    heated["rooms"][0]["heat_sources"] = ["switch.no_such_heater"]
+    dry = await d.check(heated, rest, ws, tmp)
+    real = await d.deploy(heated, rest, ws, tmp)
+    assert not dry.ok and dry.missing_entities == ["switch.no_such_heater"], dry.missing_entities
+    assert not real.ok and real.helpers_created == real.automations_written == []
+    assert (copy.deepcopy(ws.store), len(rest.set_calls), len(rest.delete_calls),
+            len(rest.service_calls), d._manifest_path(tmp).read_text()) == before
+    print("a heat source that isn't in Home Assistant is a missing entity: the deploy aborts "
+          "without writing anything - OK")
+
     print(f"check (the dry run) before each of the 4 deploys wrote nothing and listed exactly "
           f"what the deploy then did: {[r['helpers_created'] for r in dry_runs]} created, "
           f"{[r['helpers_removed'] for r in dry_runs]} removed, "
