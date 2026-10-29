@@ -174,6 +174,20 @@ def main() -> int:
     print("outdoor: weather_entity required for 'forecast', probe_entity for 'probe', "
           "domains checked; knobs need an id; heat sources accepted - OK")
 
+    # The block margin may be negative, down to -3; the default is -1.
+    assert V2["outdoor"]["initial_margin"] == -1
+    for accepted in (-3, -1, 0, 6, 10):
+        cfg = copy.deepcopy(V2)
+        cfg["outdoor"]["initial_margin"] = accepted
+        validate(cfg)
+    for rejected, why in ((-3.5, "less than the minimum of -3"),
+                          (10.5, "greater than the maximum of 10")):
+        cfg = copy.deepcopy(V2)
+        cfg["outdoor"]["initial_margin"] = rejected
+        expect_error(cfg, f"outdoor.initial_margin: {rejected} is {why}")
+    print("outdoor.initial_margin: -3, -1 (the default), 0, 6 and 10 accepted; -3.5 and 10.5 "
+          "rejected - OK")
+
     # --- duplicate ids: a repeated sensor id once hid a live sensor ---
     dup_sensor = copy.deepcopy(V2)
     baby = next(r for r in dup_sensor["rooms"] if r["id"] == "baby_room")

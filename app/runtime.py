@@ -138,10 +138,15 @@ def _ago(delta: timedelta) -> str:
     return f"{hours} h" if hours < 48 else f"{hours // 24} d {hours % 24} h"
 
 
+def _round2(value: float) -> float:
+    """To 2 decimals, a negative margin that rounds to zero as 0.0, not -0.0."""
+    return round(value, 2) + 0.0
+
+
 def _deg(value: float) -> str:
     """A margin for the log: to 2 decimals, trailing zeros dropped down to
-    one (6.0, 6.55, 6.06)."""
-    text = f"{value:.2f}".rstrip("0")
+    one (6.0, 6.55, 6.06, -1.0, -0.63; never -0.0)."""
+    text = f"{_round2(value):.2f}".rstrip("0")
     return text + "0" if text.endswith(".") else text
 
 
@@ -1083,7 +1088,7 @@ class Runtime:
     def _conditions_detail(cond: control.Conditions) -> dict:
         return {"section": cond.section, "block_mode": cond.block_mode,
                 "would_block": cond.would_block, "blocked": cond.blocked,
-                "margin": None if cond.margin is None else round(cond.margin, 2),
+                "margin": None if cond.margin is None else _round2(cond.margin),
                 "comfort_point": cond.comfort_point, "outdoor_mean": cond.outdoor_mean,
                 "outdoor_max": cond.outdoor_max, "delta_mean": cond.delta_mean,
                 "delta_max": cond.delta_max, "lean": cond.lean, "cold_edge": cond.cold_edge,
@@ -1217,7 +1222,7 @@ class Runtime:
             almanac_id(room_id),
             state=str(len(sections)),
             attributes={"sections": sections, "room_id": room_id,
-                        "margin": round(self.margin(room_id), 2),
+                        "margin": _round2(self.margin(room_id)),
                         "updated": self._now()[0]})
 
     # ---- learning -------------------------------------------------

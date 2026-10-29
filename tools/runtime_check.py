@@ -80,6 +80,10 @@ Store (no Home Assistant, no network). Verifies:
         the almanac timer;
       - fail open: a failing forecast, and outdoor.source none (one warning,
         not repeated after a restart)
+  * a negative margin (the default -1) through the runtime: Night blocks at
+    a max of comfort + 1, Sleep stays blocked at comfort + 1.5 and Sunrise
+    lifts it at comfort + 2, with the margin logged and published as -1.0
+    (and one that rounds to zero from below as 0.0, never -0.0)
 
     PYTHONPATH=. python tools/runtime_check.py
 """
@@ -643,6 +647,7 @@ async def main() -> int:
     await check_outdoor_utc()
     await check_conditions()
     await check_conditions_without_outdoor()
+    await check_negative_margin()
     print("\nALL RUNTIME CHECKS PASSED")
     return 0
 
@@ -1544,6 +1549,82 @@ async def check_conditions_without_outdoor() -> None:
     store.close()
     print("fail open: with outdoor.source none the conditions (-1/+1, not blocked) go out "
           "before the scene, with one outdoor warning that a restart doesn't repeat - OK")
+
+
+async def check_negative_margin() -> None:
+    """The default margin, -1: blocked at a forecast max up to comfort + 1,
+    held after a block until the max reaches comfort + 2; the log and the
+    published entities show the negative margin as it is."""
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+    assert runtime_mod._deg(-1.0) == "-1.0" and runtime_mod._deg(-0.625) == "-0.62"
+    assert runtime_mod._deg(-0.004) == "0.0" and str(runtime_mod._round2(-0.004)) == "0.0"
+    tmp = Path(tempfile.mkdtemp())
+    store = Store(tmp, SCHEMA)
+    config = json.loads(json.dumps(CONFIG))
+    assert config["outdoor"]["initial_margin"] == -1
+    config["outdoor"].update(source="forecast", weather_entity="weather.forecast_home")
+    clock = {"t": datetime(2026, 8, 3, 20, 25, 0, tzinfo=hk)}
+    states = _build_states() + [{"entity_id": "weather.forecast_home", "state": "cloudy",
+                                 "attributes": {"temperature": 28.0, "supported_features": 3},
+                                 "last_updated": clock["t"].astimezone(utc).isoformat()}]
+    seed = datetime(2026, 8, 1, 0, 0, tzinfo=hk)
+    for k, sec in enumerate(SECTIONS):                    # comfort point 23.9 everywhere
+        at = seed + timedelta(hours=3 * k)
+        store.record_heartbeat("main_room", at.isoformat(), at.astimezone(utc).isoformat(),
+                               "2026-08-01", sec,
+                               {"living1": 23.4, "living2": 23.9, "living3": 24.4},
+                               {"main_room_ac": UnitSample(True, "cool", "low", 22.0, 24.0, None,
+                                                           control_state="cool")})
+    temps = {(3, 21): 24.9,                                              # Night: comfort + 1
+             **{(3, h): 25.4 for h in (22, 23)}, **{(4, h): 25.4 for h in range(6)},  # + 1.5
+             (4, 6): 25.9, (4, 7): 25.9}                                 # Sunrise: + 2
+    first = datetime(2026, 8, 3, 12, 0, tzinfo=hk)
+    fixed = [{"datetime": (first + timedelta(hours=k)).astimezone(timezone.utc).isoformat(),
+              "temperature": temps.get(((first + timedelta(hours=k)).day,
+                                        (first + timedelta(hours=k)).hour), 26.0)}
+             for k in range(30)]
+    rest = ForecastRest(states, clock, fixed=fixed)
+    rt = Runtime(config, store, rest, StubWS(), tmp)
+    rt._now = lambda: (clock["t"].isoformat(timespec="seconds"),
+                       clock["t"].astimezone(utc).isoformat(timespec="seconds"),
+                       clock["t"].date().isoformat(), clock["t"])
+
+    async def cross(section: str, when: datetime) -> dict:
+        clock["t"] = when + timedelta(seconds=5)
+        await rt._crossover(rt.rooms["main_room"], section, when, catch_up=False)
+        await asyncio.sleep(0)
+        await asyncio.gather(*[t for t in list(rt._followups)
+                               if t.get_name().startswith("ac-outdoor-")])
+        return [e[2] for e in rest.log if e[0] == "set_state"
+                and e[1] == "sensor.ac_conditions_main_room"][-1]
+
+    def said() -> str:
+        return store.recent_events(room_id="main_room", category="block")[0]["message"]
+
+    await rt.start()
+    await asyncio.sleep(0.1)
+    assert rt.margin("main_room") == -1.0
+    assert [p[2]["margin"] for p in rest.set_states
+            if p[0] == "sensor.ac_almanac_main_room"][-1] == -1.0
+    night = await cross("night", datetime(2026, 8, 3, 20, 30, tzinfo=hk))
+    assert (night["delta_max"], night["margin"], night["would_block"], night["blocked"]) == \
+        (-1.0, -1.0, True, False), night
+    assert said().startswith("Main Room: would block Night: forecast max 24.9, comfort 23.9, "
+                             "margin -1.0 (shadow mode: not applied);"), said()
+    sleep = await cross("sleep", datetime(2026, 8, 3, 22, 0, tzinfo=hk))
+    assert (sleep["delta_max"], sleep["would_block"]) == (-1.5, True), sleep
+    assert said().startswith(
+        "Main Room: would block Sleep: forecast max 25.4, comfort 23.9, margin -1.0, held from "
+        "the last section until delta -1.5 is -2.0 or less (shadow mode: not applied)"), said()
+    sunrise = await cross("sunrise", datetime(2026, 8, 4, 5, 30, tzinfo=hk))
+    assert (sunrise["delta_max"], sunrise["would_block"]) == (-2.0, False), sunrise
+    assert said().startswith("Main Room: not blocking Sunrise: forecast max 25.9, comfort 23.9, "
+                             "margin -1.0;"), said()
+    await rt.stop()
+    store.close()
+    print("negative margin: at the default -1, Night blocks at a max of comfort + 1 (24.9), "
+          "Sleep stays blocked at comfort + 1.5 and Sunrise lifts it at comfort + 2, logged "
+          "and published as margin -1.0; a margin rounding to zero from below shows 0.0 - OK")
 
 
 if __name__ == "__main__":

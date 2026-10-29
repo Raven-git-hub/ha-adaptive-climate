@@ -30,10 +30,10 @@ docs/V2_DESIGN.md and docs/TRUST_MODEL.md:
   * on and off teach bands as cooler and warmer wanted, manual teaches
     nothing, and every kind resets quiet and disqualifies a window
   * the confidence curve
-  * the block margin: clamped to 0..10, so a margin learned down from 1 by
-    an unblocked section whose forecast max was above the comfort point
-    stops at 0 (blocking at the comfort point itself) rather than going
-    negative, and climbs again from a blocked one; capped at 10
+  * the block margin: starts at -1 and learns within -3 to 10, crossing 0
+    either way (a too_hot vote in a blocked section takes it from -1 to
+    0.75, a too_cold vote just after cooling started in an unblocked one
+    back to -0.625), stopping at -3 and at 10
   * no seed, no almanac entry
   * tools/compare_analyser.py shows v1 against v2 on the same data
 
@@ -538,13 +538,14 @@ def check_confidence() -> None:
 
 
 def check_margin() -> None:
-    print("the block margin: within 0 to 10")
-    assert (MARGIN_MIN, MARGIN_MAX) == (0.0, 10.0)
-    assert margin_step(1.0, -3.0, 0.5) == 0.0 and margin_step(0.0, -3.0, 0.5) == 0.0
-    assert margin_step(0.0, 0.9, 0.5) == 0.45
+    print("the block margin: within -3 to 10, and may be negative")
+    assert (MARGIN_MIN, MARGIN_MAX) == (-3.0, 10.0)
+    assert MarginConfig().initial == -1.0
+    assert margin_step(-2.0, -5.0, 0.5) == -3.0 and margin_step(-3.0, -5.0, 0.5) == -3.0
+    assert margin_step(-1.0, 2.5, 0.5) == 0.75 and margin_step(0.75, -2.0, 0.5) == -0.625
     assert margin_step(9.0, 12.5, 0.5) == 10.0 and margin_step(10.0, 3.0, 0.5) == 6.5
-    ok("a step toward -3 from 1 (or from 0) stops at 0; toward 12.5 from 9 stops at 10; "
-       "inside the range it is halfway")
+    ok("a step toward -5 from -2 (or from -3) stops at -3; toward 12.5 from 9 stops at 10; "
+       "inside the range it is halfway, across 0 either way")
 
     def decided(sc: Scenario, start: datetime, section: str, comfort: float, mx: float,
                 blocked: bool) -> None:
@@ -557,37 +558,45 @@ def check_margin() -> None:
         sc.store.record_section_conditions("lounge", day, section, comfort, 0.1, blocked,
                                            "shadow")
 
-    def margin(sc: Scenario, as_of: datetime, initial: float) -> tuple[float, list]:
+    def margin(sc: Scenario, as_of: datetime, initial: float = -1.0) -> tuple[float, list]:
         return learn_margin(sc.store._conn, ROOM, MarginConfig(initial=initial), as_of)
 
     sc = Scenario()
-    # Day, unblocked: the forecast max 27.0 is 3 above the comfort point
-    # (delta max -3). The scene starts cooling at 08:00; a too_cold vote at
-    # 08:15 pulls M toward -3.
-    decided(sc, t(2, 8), "day", 24.0, 27.0, False)
-    sc.beat(t(2, 8, 5), state="cool")
-    sc.vote(t(2, 8, 15), "too_cold")
-    m, steps = margin(sc, t(2, 8, 16), 1.0)
-    assert m == 0.0 and [(st.before, st.target, st.after) for st in steps] == [(1.0, -3.0, 0.0)]
-    ok("learned down from 1: a too_cold vote 15 min after Day's scene started cooling, delta "
-       "max -3, would take it halfway to -1; it stops at 0, the comfort point itself")
-    sc.vote(t(2, 8, 25), "too_cold")
-    m, steps = margin(sc, t(2, 8, 26), 1.0)
-    assert m == 0.0 and steps[-1].after == 0.0
-    ok("a second one leaves it at 0, never negative")
-    # Sunset, decided blocked at M 0: the max 23.6 is 0.4 below the comfort
-    # point. A too_hot vote there pulls M back up toward 0.9.
-    decided(sc, t(2, 16), "sunset", 24.0, 23.6, True)
-    sc.vote(t(2, 16, 10), "too_hot", section="sunset")
-    m, steps = margin(sc, t(2, 16, 11), 1.0)
-    assert m == 0.45 and steps[-1].target == 0.9, (m, steps[-1])
-    ok("and it climbs again: a too_hot vote in Sunset, blocked at delta max 0.4, moves it "
-       "from 0 halfway to 0.9")
+    # Night, blocked at the starting -1: the max 22.0 is 2 below the comfort
+    # point (delta max 2). A too_hot vote pulls M toward 2.5, past 0.
+    decided(sc, t(2, 20, 30), "night", 24.0, 22.0, True)
+    sc.vote(t(2, 20, 40), "too_hot", section="night")
+    m, steps = margin(sc, t(2, 20, 41))
+    assert m == 0.75 and [(st.before, st.target, st.after) for st in steps] == \
+        [(-1.0, 2.5, 0.75)], steps
+    ok("from -1, a too_hot vote in a Night blocked at delta max 2 moves it halfway to 2.5: "
+       "-1 -> 0.75, negative to positive")
+    # Day, unblocked at 0.75: the max 26.0 is 2 above the comfort point
+    # (delta max -2). The scene starts cooling at 08:00; a too_cold vote at
+    # 08:15 pulls M toward -2, back below 0.
+    decided(sc, t(3, 8), "day", 24.0, 26.0, False)
+    sc.beat(t(3, 8, 5), state="cool")
+    sc.vote(t(3, 8, 15), "too_cold")
+    m, steps = margin(sc, t(3, 8, 16))
+    assert m == -0.625 and (steps[-1].before, steps[-1].target) == (0.75, -2.0), steps[-1]
+    ok("then a too_cold vote 15 min after Day's scene started cooling, delta max -2, moves it "
+       "halfway to -2: 0.75 -> -0.625, positive to negative")
+    # Sunset, unblocked at -0.625: the max 29.0 is 5 above the comfort point.
+    # Two too_cold votes pull M toward -5: the first to -2.81, the second
+    # would take it to -3.91 and stops at -3.
+    decided(sc, t(3, 16), "sunset", 24.0, 29.0, False)
+    sc.beat(t(3, 16, 5), state="cool")
+    sc.vote(t(3, 16, 10), "too_cold", section="sunset")
+    sc.vote(t(3, 16, 20), "too_cold", section="sunset")
+    m, steps = margin(sc, t(3, 16, 21))
+    assert [st.after for st in steps[-2:]] == [-2.8125, -3.0] and m == -3.0, steps[-2:]
+    ok("and in a Sunset whose max was 5 above the comfort point, two too_cold votes take it "
+       "to -2.81, then to -3, no lower (blocking at a max up to comfort + 3)")
 
     sc = Scenario()
-    decided(sc, t(3, 20, 30), "night", 24.0, 12.0, True)
-    sc.vote(t(3, 20, 40), "too_hot", section="night")
-    m, _ = margin(sc, t(3, 20, 41), 9.0)
+    decided(sc, t(4, 20, 30), "night", 24.0, 12.0, True)
+    sc.vote(t(4, 20, 40), "too_hot", section="night")
+    m, _ = margin(sc, t(4, 20, 41), 9.0)
     assert m == 10.0
     ok("capped at 10: from 9 toward 12.5 (a too_hot vote in a Night blocked at delta max 12)")
 

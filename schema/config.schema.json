@@ -171,8 +171,8 @@
           "description": "k: how far, in band widths per degree of (room comfort point - outdoor), the trigger edges lean."
         },
         "initial_margin": {
-          "type": "number", "minimum": 0, "maximum": 10, "default": 0,
-          "description": "Starting per-room block margin M in degrees: cooling is blocked for a section when its warmest forecast hour is at least M below the room comfort point (0: at or below it). It then learns from reactions, within 0 to 10."
+          "type": "number", "minimum": -3, "maximum": 10, "default": -1,
+          "description": "Starting per-room block margin M in degrees, which may be negative: cooling is blocked for a section when its warmest forecast hour is at or below the room comfort point minus M (at -1: comfort + 1 or below). It then learns from reactions, within -3 to 10."
         }
       },
       "allOf": [

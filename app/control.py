@@ -69,7 +69,7 @@ HEAT_BLOCK_MODES = ("shadow", "active")
 DEFAULT_BLOCK_MODE = "shadow"
 LEAN_CAP = 0.6          # each edge stays this far on its own side of comfort
 BLOCK_RELEASE = 1.0     # a block lifts only once delta_max <= margin - this
-MARGIN_MIN, MARGIN_MAX = 0.0, 10.0      # 0: block at the comfort point itself, no lower
+MARGIN_MIN, MARGIN_MAX = -3.0, 10.0     # -1: block at a max up to comfort + 1; -3 at most
 
 
 # ---------------------------------------------------------------------
@@ -524,9 +524,11 @@ def lean_edges(lean: float | None) -> tuple[float, float]:
 
 
 def decide_block(delta_max: float | None, margin: float, was_blocked: bool) -> bool:
-    """Block cooling when the section's warmest forecast hour is at least
-    the margin below the comfort point (delta_max >= margin). A room blocked
-    last section stays blocked until delta_max <= margin - 1."""
+    """Block cooling when the section's warmest forecast hour is at or below
+    the comfort point minus the margin (delta_max >= margin): with a margin
+    of -1, at a max up to comfort + 1. A room blocked last section stays
+    blocked until delta_max <= margin - 1 (comfort + 2 at -1). The margin
+    may be negative."""
     if delta_max is None:
         return False
     if was_blocked:

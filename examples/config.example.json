@@ -32,7 +32,7 @@
     "probe_entity": null,
     "block_mode": "shadow",
     "lean_per_degree": 0.1,
-    "initial_margin": 0
+    "initial_margin": -1
   },
   "rooms": [
     {
