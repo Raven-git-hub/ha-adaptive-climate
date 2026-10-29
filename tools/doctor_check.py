@@ -2,14 +2,16 @@
 Adaptive Climate - doctor offline check.
 
 Runs tools/doctor.py's whole _run() against a stub Home Assistant (REST and
-WebSocket, no network) holding two weather entities: weather.home, with an
-hourly forecast, and weather.daily, without one (supported_features bit 2
+WebSocket, no network) holding the live install's two weather entities:
+weather.forecast_home (Met.no), with an hourly forecast, and
+weather.hong_kong_observatory, without one (supported_features bit 2
 clear). Verifies the outdoor step, which runs without --v2-preflight:
   * both entities are listed with their current temperature and whether
     they offer an hourly forecast
-  * the configured weather.home shows its next 6 hourly entries, from the
-    current hour, fetched through weather.get_forecasts (hourly, with its
-    response)
+  * the configured weather.forecast_home shows its next 6 hourly entries,
+    from the current hour, fetched through weather.get_forecasts (hourly,
+    with its response); the forecast's UTC times are shown in Home
+    Assistant's time zone (Hong Kong, UTC+8)
   * a configured entity that lacks hourly support, is missing, or returns
     an empty forecast is flagged: a hard failure (exit 1) with
     outdoor.source 'forecast', a warning with 'none'
@@ -38,10 +40,10 @@ NOW = datetime.now(timezone.utc)
 HOUR0 = NOW.replace(minute=0, second=0, microsecond=0)
 STATES = [
     {"entity_id": "climate.lounge", "state": "cool", "attributes": {}},
-    {"entity_id": "weather.home", "state": "sunny",
+    {"entity_id": "weather.forecast_home", "state": "sunny",
      "attributes": {"temperature": 29.4, "temperature_unit": "\u00b0C",
                     "supported_features": 3}},                    # daily + hourly
-    {"entity_id": "weather.daily", "state": "cloudy",
+    {"entity_id": "weather.hong_kong_observatory", "state": "cloudy",
      "attributes": {"temperature": 28.0, "temperature_unit": "\u00b0C",
                     "supported_features": 1}},                    # daily only
 ]
@@ -65,7 +67,8 @@ class StubRest:
         self.forecast_calls.append(data["entity_id"])
         if self.forecast == "empty":
             return {data["entity_id"]: {"forecast": []}}
-        # the last hour, then 24 ahead: the doctor shows from the current hour
+        # the last hour, then 24 ahead, in UTC as Met.no gives them
+        # ("2026-10-29T04:00:00+00:00"): the doctor shows from the current hour
         return {data["entity_id"]: {"forecast": [
             {"datetime": (HOUR0 + timedelta(hours=k)).isoformat(),
              "temperature": 25.0 + k, "condition": "sunny"} for k in range(-1, 24)]}}
@@ -111,46 +114,50 @@ def outdoor_lines(text: str) -> list[str]:
 
 
 def main() -> int:
-    forecast = {"source": "forecast", "weather_entity": "weather.home"}
+    forecast = {"source": "forecast", "weather_entity": "weather.forecast_home"}
     code, text, rest = run(forecast)
     lines = outdoor_lines(text)
     assert code == 0, text
-    assert "\u2713 weather.home (configured): 29.4 \u00b0C, sunny; hourly forecast: yes" in lines, lines
-    assert "\u00b7 weather.daily: 28.0 \u00b0C, cloudy; hourly forecast: no" in lines, lines
-    assert rest.forecast_calls == ["weather.home"], rest.forecast_calls
-    assert "\u2713 weather.home: next 6 hourly entries:" in lines, lines
+    assert ("\u2713 weather.forecast_home (configured): 29.4 \u00b0C, sunny; hourly forecast: "
+            "yes") in lines, lines
+    assert ("\u00b7 weather.hong_kong_observatory: 28.0 \u00b0C, cloudy; hourly forecast: "
+            "no") in lines, lines
+    assert rest.forecast_calls == ["weather.forecast_home"], rest.forecast_calls
+    assert "\u2713 weather.forecast_home: next 6 hourly entries:" in lines, lines
     shown = [line for line in lines if re.match(r"\u00b7 +\w{3} \d\d:\d\d ", line)]
     assert [float(line.split()[3]) for line in shown] == [25.0 + k for k in range(6)], shown
-    first = HOUR0.astimezone(doctor.ZoneInfo("Asia/Hong_Kong")).strftime("%a %H:%M")
+    # the current UTC hour, shown as Hong Kong time: 8 hours on
+    first = (HOUR0 + timedelta(hours=8)).strftime("%a %H:%M")
     assert shown[0] == f"\u00b7   {first}  25 \u00b0C  sunny", shown[0]
     assert "v2 preflight" not in text
-    print("doctor: lists weather.home (29.4, hourly) and weather.daily (28.0, no hourly), and "
-          "shows weather.home's next 6 hourly entries from the current hour, without "
+    print("doctor: lists weather.forecast_home (29.4, hourly) and "
+          "weather.hong_kong_observatory (28.0, no hourly), and shows weather.forecast_home's "
+          "next 6 hourly entries from the current hour, in Hong Kong time, without "
           "--v2-preflight - OK")
 
     for outdoor, kind, want in (
-            ({**forecast, "weather_entity": "weather.daily"}, "ok",
-             "\u2717 outdoor.weather_entity weather.daily has no hourly forecast "
-             "(supported_features bit 2 not set); pick one with hourly forecast: yes"),
+            ({**forecast, "weather_entity": "weather.hong_kong_observatory"}, "ok",
+             "\u2717 outdoor.weather_entity weather.hong_kong_observatory has no hourly "
+             "forecast (supported_features bit 2 not set); pick one with hourly forecast: yes"),
             ({**forecast, "weather_entity": "weather.gone"}, "ok",
              "\u2717 outdoor.weather_entity weather.gone not found"),
-            (forecast, "empty", "\u2717 weather.home returned an empty hourly forecast")):
+            (forecast, "empty", "\u2717 weather.forecast_home returned an empty hourly forecast")):
         code, text, rest = run(outdoor, kind)
         assert code == 1 and want in outdoor_lines(text), (want, outdoor_lines(text))
-        assert rest.forecast_calls == (["weather.home"] if kind == "empty" else []), \
+        assert rest.forecast_calls == (["weather.forecast_home"] if kind == "empty" else []), \
             rest.forecast_calls
     print("doctor: with outdoor.source 'forecast', a configured entity without an hourly "
           "forecast, a missing one and an empty forecast are each a hard failure - OK")
 
-    code, text, _ = run({"source": "none", "weather_entity": "weather.daily"})
-    assert code == 0 and ("! outdoor.weather_entity weather.daily has no hourly forecast "
-                          "(supported_features bit 2 not set) (outdoor.source is 'none', so "
-                          "it isn't read); pick one with hourly forecast: yes"
+    code, text, _ = run({"source": "none", "weather_entity": "weather.hong_kong_observatory"})
+    assert code == 0 and ("! outdoor.weather_entity weather.hong_kong_observatory has no "
+                          "hourly forecast (supported_features bit 2 not set) (outdoor.source "
+                          "is 'none', so it isn't read); pick one with hourly forecast: yes"
                           in outdoor_lines(text)), outdoor_lines(text)
     code, text, rest = run(None)
     lines = outdoor_lines(text)
-    assert code == 0 and rest.forecast_calls == [] and len(
-        [line for line in lines if line.startswith(("\u2713 weather.", "\u00b7 weather."))]) == 2, lines
+    listed = [line for line in lines if line.startswith(("\u2713 weather.", "\u00b7 weather."))]
+    assert code == 0 and rest.forecast_calls == [] and len(listed) == 2, lines
     print("doctor: with outdoor.source 'none' the same problem is a warning; with no config "
           "the weather entities are still listed - OK")
     print("\nALL DOCTOR CHECKS PASSED")

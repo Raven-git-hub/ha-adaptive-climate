@@ -106,3 +106,13 @@ probes, `sensor.light_sensor_main_room_temperature` (0.0),
 `sensor.bathroom_sensor_temperature` (no AC in the bathroom). The outdoor sensor
 is context only, never a comfort vote. An `unavailable` sensor casts no vote -
 the trust model already handles that.
+
+**Outdoor input (v2 phase 4).** The outdoor sensor has been moved, so the
+outdoor value comes from a forecast: `weather.forecast_home` (Met.no), which
+offers an hourly forecast and is the one to configure as
+`outdoor.weather_entity`. `weather.hong_kong_observatory` has no hourly
+forecast (`supported_features` bit 2 clear), and the doctor lists it as such.
+Met.no's `weather.get_forecasts` gives each entry's time in UTC
+(`2026-10-29T04:00:00+00:00` is 12:00 in Hong Kong), so the runtime converts
+every entry to Home Assistant's time zone before matching it to a section
+window: UTC midnight is 08:00 local.

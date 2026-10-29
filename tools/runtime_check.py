@@ -52,6 +52,11 @@ Store (no Home Assistant, no network). Verifies:
     or last updated more than 3 hours ago; with source 'none', null; the
     real REST client posts to ?return_response, returns service_response,
     and raises its own timeout as HATimeoutError
+  * the forecast's UTC times (as Met.no's weather.forecast_home gives them)
+    are matched to section windows by Hong Kong time: a window crossing UTC
+    midnight but not local midnight (Day from 07:00), one crossing local
+    midnight but not UTC midnight (Sleep), and one whose hour is on the
+    previous UTC date (Sunrise)
 
     PYTHONPATH=. python tools/runtime_check.py
 """
@@ -611,6 +616,7 @@ async def main() -> int:
     await check_startup_race()
     await check_stale_sensor()
     await check_outdoor()
+    await check_outdoor_utc()
     print("\nALL RUNTIME CHECKS PASSED")
     return 0
 
@@ -762,26 +768,30 @@ TEMPS = {15: 27.0, 16: 25.3, 17: 24.6, 18: 24.0, 19: 23.5, 20: 23.1, 21: 30.0,
 
 class ForecastRest(StubRest):
     """StubRest with weather.get_forecasts: 48 hourly entries from the
-    current hour, as Home Assistant returns them, or a failure as `mode`
-    says (error, timeout, empty)."""
-    def __init__(self, states, clock, mode="ok"):
+    current hour, in UTC as Met.no's weather.forecast_home returns them
+    ("2026-10-29T04:00:00+00:00"), or `fixed` entries, or a failure as
+    `mode` says (error, timeout, empty)."""
+    def __init__(self, states, clock, mode="ok", fixed=None):
         super().__init__(states)
-        self.clock, self.mode, self.forecast_calls = clock, mode, []
+        self.clock, self.mode, self.fixed, self.forecast_calls = clock, mode, fixed, []
 
     async def call_service(self, domain, service, data=None, *, return_response=False):
         if (domain, service) != ("weather", "get_forecasts"):
             return await super().call_service(domain, service, data)
-        assert return_response and data == {"entity_id": "weather.home", "type": "hourly"}, data
+        assert return_response and \
+            data == {"entity_id": "weather.forecast_home", "type": "hourly"}, data
         self.forecast_calls.append(self.clock["t"])
+        if self.fixed is not None:
+            return {"weather.forecast_home": {"forecast": self.fixed}}
         if self.mode == "error":
             raise HAError("500: Internal Server Error")
         if self.mode == "timeout":
             await asyncio.sleep(5)
         if self.mode == "empty":
-            return {"weather.home": {"forecast": []}}
+            return {"weather.forecast_home": {"forecast": []}}
         first = self.clock["t"].replace(minute=0, second=0, microsecond=0)
         hours = [first + timedelta(hours=k) for k in range(48)]
-        return {"weather.home": {"forecast": [
+        return {"weather.forecast_home": {"forecast": [
             {"datetime": h.astimezone(timezone.utc).isoformat(), "condition": "sunny",
              "temperature": TEMPS.get(h.hour, 26.0)} for h in hours]}}
 
@@ -794,10 +804,10 @@ async def check_outdoor() -> None:
     tmp = Path(tempfile.mkdtemp())
     store = Store(tmp, SCHEMA)
     config = json.loads(json.dumps(CONFIG))
-    config["outdoor"].update(source="forecast", weather_entity="weather.home")
+    config["outdoor"].update(source="forecast", weather_entity="weather.forecast_home")
     clock = {"t": datetime(2026, 8, 3, 15, 50, 0, tzinfo=hk)}
     states = _build_states()
-    weather = {"entity_id": "weather.home", "state": "sunny",
+    weather = {"entity_id": "weather.forecast_home", "state": "sunny",
                "attributes": {"temperature": 30.5, "supported_features": 3},
                "last_updated": clock["t"].astimezone(utc).isoformat()}
     states.append(weather)
@@ -834,7 +844,7 @@ async def check_outdoor() -> None:
     def set_weather(state: str) -> None:
         weather["state"] = state
         rt._on_state_change({"event_type": "state_changed", "context": {},
-                             "data": {"entity_id": "weather.home", "old_state": {},
+                             "data": {"entity_id": "weather.forecast_home", "old_state": {},
                                       "new_state": {"state": state}}})
 
     # --- startup: one fetch, shared by three catch-up crossovers and the loop ---
@@ -848,7 +858,7 @@ async def check_outdoor() -> None:
     assert run("main_room", "2026-08-03", "afternoon") == (27.0, 27.0)
     assert said("main_room", "afternoon") == [
         "Main Room -> afternoon: forecast mean 27.0, max 27.0 over 15:00-16:00 only "
-        "(weather.home): the forecast covers 1 of the 2 hours in 14:00-16:00"], \
+        "(weather.forecast_home): the forecast covers 1 of the 2 hours in 14:00-16:00"], \
         said("main_room", "afternoon")
     print("outdoor: startup fetched the forecast once for three catch-up crossovers and the "
           "hourly loop; Afternoon, which it covers only from 15:00, records what is covered "
@@ -863,7 +873,8 @@ async def check_outdoor() -> None:
     assert run("main_room", "2026-08-03", "sunset") == (24.1, 25.3), \
         run("main_room", "2026-08-03", "sunset")
     assert said("main_room", "sunset") == [
-        "Main Room -> sunset: forecast mean 24.1, max 25.3 over 16:00-20:30 (weather.home)"]
+        "Main Room -> sunset: forecast mean 24.1, max 25.3 over 16:00-20:30 "
+        "(weather.forecast_home)"]
     # --- sleep across midnight, refetched (the cache is 6 hours old) ---
     clock["t"] = datetime(2026, 8, 3, 22, 0, 5, tzinfo=hk)
     await rt._crossover(main, "sleep", datetime(2026, 8, 3, 22, 0, tzinfo=hk), catch_up=False)
@@ -872,7 +883,7 @@ async def check_outdoor() -> None:
     assert run("main_room", "2026-08-03", "sleep") == (21.25, 23.0), \
         run("main_room", "2026-08-03", "sleep")
     assert said("main_room", "sleep") == [
-        "Main Room -> sleep: forecast mean 21.2, max 23.0 over 22:00-05:30 (weather.home)"]
+        "Main Room -> sleep: forecast mean 21.2, max 23.0 over 22:00-05:30 (weather.forecast_home)"]
     print("outdoor: Sunset 16:00-20:30 from the 10-minute-old cache (mean 24.1, max 25.3); "
           "Sleep 22:00-05:30 across midnight, refetched (mean 21.25, max 23.0); the hours "
           "just outside each window left out - OK")
@@ -929,9 +940,9 @@ async def check_outdoor() -> None:
                 (mode, rest.forecast_calls[calls:])
             for r in rt.rooms:
                 assert run(r, day.date().isoformat(), "day") == (None, None), (mode, r)
-            assert said("main_room", "day")[-1] == ("Main Room -> day: no forecast from "
-                                                    "weather.home, so no outdoor value for "
-                                                    "08:00-14:00"), said("main_room", "day")
+            assert said("main_room", "day")[-1] == (
+                "Main Room -> day: no forecast from weather.forecast_home, so no outdoor value "
+                "for 08:00-14:00"), said("main_room", "day")
             clock["t"] += timedelta(minutes=10)          # the next try fails too
             assert await rt._forecast_for(runtime_mod.FORECAST_REFRESH) is None
             assert streak_events()[len(before):] == [("warning", True, mode)], \
@@ -947,7 +958,7 @@ async def check_outdoor() -> None:
         warning = next(e["message"] for e in store.recent_events(
             limit=1000, category="outdoor", severity="warning")
             if (e.get("detail") or {}).get("kind") == "timeout")
-        assert warning.startswith("Outdoor forecast from weather.home failed: no answer "
+        assert warning.startswith("Outdoor forecast from weather.forecast_home failed: no answer "
                                   "within 0.3 s. Section runs get no forecast values until it "
                                   "works again"), warning
         print("outdoor: a service error, an unavailable entity, an empty forecast and a "
@@ -1037,18 +1048,18 @@ async def check_outdoor() -> None:
         if mode["timeout"]:
             raise httpx.ReadTimeout("timed out", request=request)
         return httpx.Response(200, json={"changed_states": [], "service_response": {
-            "weather.home": {"forecast": [{"datetime": "2026-08-12T08:00:00+00:00",
+            "weather.forecast_home": {"forecast": [{"datetime": "2026-08-12T08:00:00+00:00",
                                            "temperature": 29.0}]}}})
     mode = {"timeout": False}
     client = HARest("http://ha.test:8123", "token")
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
     got = await client.call_service("weather", "get_forecasts",
-                                    {"entity_id": "weather.home", "type": "hourly"},
+                                    {"entity_id": "weather.forecast_home", "type": "hourly"},
                                     return_response=True)
     assert seen == [("POST", "/api/services/weather/get_forecasts", "return_response",
-                     {"entity_id": "weather.home", "type": "hourly"})], seen
-    assert list(got) == ["weather.home"] and \
-        runtime_mod.outdoor.parse_forecast(got, "weather.home")[0].temperature == 29.0
+                     {"entity_id": "weather.forecast_home", "type": "hourly"})], seen
+    assert list(got) == ["weather.forecast_home"] and \
+        runtime_mod.outdoor.parse_forecast(got, "weather.forecast_home")[0].temperature == 29.0
     mode["timeout"] = True
     try:
         await client.call_service("weather", "get_forecasts", {}, return_response=True)
@@ -1058,7 +1069,7 @@ async def check_outdoor() -> None:
         raise AssertionError("an httpx timeout wasn't raised as HATimeoutError")
     clock["t"] += timedelta(hours=3)                 # through the runtime: a timeout warning
     rt = runtime(client)
-    rt._cache["weather.home"] = "sunny"
+    rt._cache["weather.forecast_home"] = "sunny"
     n = len(streak_events())
     assert await rt._fetch_forecast() is None
     assert streak_events()[n:] == [("warning", True, "timeout")], streak_events()[n:]
@@ -1068,6 +1079,101 @@ async def check_outdoor() -> None:
     store.close()
     print("outdoor: the REST client posts to ?return_response and returns service_response; "
           "its own timeout is an HATimeoutError, logged as a timeout failure - OK")
+
+
+async def check_outdoor_utc() -> None:
+    """Met.no's forecast times are UTC; Hong Kong is UTC+8, so UTC midnight
+    is 08:00 there. Each entry must be matched to a section window by its
+    local time. With Day moved to 07:00, Day (07:00-14:00 HKT, 23:00-06:00
+    UTC) crosses UTC midnight but not local midnight; Sleep (22:00-05:30
+    HKT, 14:00-21:30 UTC) crosses local midnight but not UTC midnight; and
+    Sunrise (05:30-07:00 HKT) has its one hour, 06:00, on the previous UTC
+    date. Every hour outside those windows is forecast at 40, so an entry
+    matched by its UTC date or UTC hour shows in the max."""
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+    od = runtime_mod.outdoor
+    one = od.parse_forecast({"weather.forecast_home": {"forecast": [
+        {"datetime": "2026-10-29T04:00:00+00:00", "temperature": 25.0}]}},
+        "weather.forecast_home", hk)[0]
+    assert one.at.isoformat() == "2026-10-29T12:00:00+08:00", one.at
+    print("outdoor: a forecast time of 2026-10-29T04:00:00+00:00 reads as 12:00 Hong Kong "
+          "time - OK")
+
+    temps = {"2026-10-29T22:00:00+00:00": 24.0,                       # 06:00 HKT, Sunrise
+             "2026-10-29T23:00:00+00:00": 26.0,                       # 07:00 HKT, Day ...
+             "2026-10-30T00:00:00+00:00": 27.0, "2026-10-30T01:00:00+00:00": 28.0,
+             "2026-10-30T02:00:00+00:00": 29.0, "2026-10-30T03:00:00+00:00": 30.0,
+             "2026-10-30T04:00:00+00:00": 31.0, "2026-10-30T05:00:00+00:00": 32.0,
+             "2026-10-30T14:00:00+00:00": 23.0,                       # 22:00 HKT, Sleep ...
+             "2026-10-30T15:00:00+00:00": 22.5, "2026-10-30T16:00:00+00:00": 22.0,
+             "2026-10-30T17:00:00+00:00": 21.5, "2026-10-30T18:00:00+00:00": 21.0,
+             "2026-10-30T19:00:00+00:00": 20.5, "2026-10-30T20:00:00+00:00": 20.0,
+             "2026-10-30T21:00:00+00:00": 19.5}                       # ... 05:00 HKT
+    first = datetime(2026, 10, 29, 12, 0, tzinfo=utc)
+    fixed = []
+    for k in range(40):                                  # 29 Oct 12:00 to 31 Oct 03:00 UTC
+        at = (first + timedelta(hours=k)).isoformat()
+        fixed.append({"datetime": at, "temperature": temps.get(at, 40.0),
+                      "condition": "cloudy"})
+    assert all(f["datetime"].endswith("+00:00") for f in fixed)
+
+    tmp = Path(tempfile.mkdtemp())
+    store = Store(tmp, SCHEMA)
+    config = json.loads(json.dumps(CONFIG))
+    config["outdoor"].update(source="forecast", weather_entity="weather.forecast_home")
+    day = next(s for s in config["schedule_profiles"][0]["sections"] if s["id"] == "day")
+    day["trigger"]["time"] = "07:00"
+    clock = {"t": datetime(2026, 10, 30, 6, 10, 0, tzinfo=hk)}
+    states = _build_states() + [{"entity_id": "weather.forecast_home", "state": "cloudy",
+                                 "attributes": {"temperature": 27.0, "supported_features": 3},
+                                 "last_updated": clock["t"].isoformat()}]
+    rest = ForecastRest(states, clock, fixed=fixed)
+    rt = Runtime(config, store, rest, StubWS(), tmp)
+    rt._now = lambda: (clock["t"].isoformat(timespec="seconds"),
+                       clock["t"].astimezone(utc).isoformat(timespec="seconds"),
+                       clock["t"].date().isoformat(), clock["t"])
+
+    async def settle() -> None:
+        await asyncio.sleep(0)
+        await asyncio.gather(*[t for t in list(rt._followups)
+                               if t.get_name().startswith("ac-outdoor-")])
+
+    def run(day: str, section: str) -> tuple:
+        return tuple(store._conn.execute(
+            "SELECT outdoor_mean, outdoor_max FROM section_run WHERE room_id = 'main_room' "
+            "AND local_date = ? AND section = ?", (day, section)).fetchone())
+
+    def said(section: str) -> str:
+        return next(e["message"] for e in store.recent_events(
+            limit=1000, room_id="main_room", category="outdoor")
+            if (e.get("detail") or {}).get("section") == section)
+
+    await rt.start()                                     # 06:10 HKT: Sunrise, caught up
+    await settle()
+    assert rt._forecast.hours[0].at.utcoffset() == timedelta(hours=8)
+    assert run("2026-10-30", "sunrise") == (24.0, 24.0), run("2026-10-30", "sunrise")
+    assert said("sunrise") == ("Main Room -> sunrise: forecast mean 24.0, max 24.0 over "
+                               "05:30-07:00 (weather.forecast_home)"), said("sunrise")
+    main = rt.rooms["main_room"]
+    clock["t"] = datetime(2026, 10, 30, 7, 0, 5, tzinfo=hk)
+    await rt._crossover(main, "day", datetime(2026, 10, 30, 7, 0, tzinfo=hk), catch_up=False)
+    await settle()
+    assert run("2026-10-30", "day") == (29.0, 32.0), run("2026-10-30", "day")
+    assert said("day") == ("Main Room -> day: forecast mean 29.0, max 32.0 over 07:00-14:00 "
+                           "(weather.forecast_home)"), said("day")
+    clock["t"] = datetime(2026, 10, 30, 22, 0, 5, tzinfo=hk)
+    await rt._crossover(main, "sleep", datetime(2026, 10, 30, 22, 0, tzinfo=hk), catch_up=False)
+    await settle()
+    assert run("2026-10-30", "sleep") == (21.25, 23.0), run("2026-10-30", "sleep")
+    assert said("sleep") == ("Main Room -> sleep: forecast mean 21.2, max 23.0 over "
+                             "22:00-05:30 (weather.forecast_home)"), said("sleep")
+    assert len(rest.forecast_calls) == 2                  # startup, and Sleep's refetch
+    await rt.stop()
+    store.close()
+    print("outdoor: UTC forecast times matched by Hong Kong time - Day 07:00-14:00 crosses "
+          "UTC midnight but not local (mean 29.0, max 32.0 from 23:00-05:00 UTC), Sleep "
+          "22:00-05:30 crosses local midnight but not UTC (mean 21.25, max 23.0 from "
+          "14:00-21:00 UTC), Sunrise's 06:00 is 22:00 UTC the day before - OK")
 
 
 if __name__ == "__main__":

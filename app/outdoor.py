@@ -71,14 +71,15 @@ def _float(v) -> float | None:
 
 
 def _time(v, tz=None) -> datetime | None:
-    """An ISO 8601 time; a naive one is taken to be in tz."""
+    """An ISO 8601 time, in tz if given: an aware one (a forecast's, in
+    UTC) converted to it, a naive one taken to be in it."""
     try:
         t = datetime.fromisoformat(v) if isinstance(v, str) and v else None
     except ValueError:
         return None
-    if t is not None and t.tzinfo is None and tz is not None:
-        t = t.replace(tzinfo=tz)
-    return t
+    if t is None or tz is None:
+        return t
+    return t.replace(tzinfo=tz) if t.tzinfo is None else t.astimezone(tz)
 
 
 def supports_hourly(state: dict | None) -> bool:
@@ -93,9 +94,11 @@ def supports_hourly(state: dict | None) -> bool:
 
 def parse_forecast(response, entity_id: str, tz=None) -> list[Hour]:
     """The entries for entity_id in a weather.get_forecasts response
-    ({entity_id: {"forecast": [...]}}), in time order. An entry with no time
-    or no numeric temperature is skipped, so a forecast of nothing usable
-    is empty."""
+    ({entity_id: {"forecast": [...]}}), in time order, each time converted
+    to tz: Home Assistant's time zone, the one section windows are planned
+    in. (Met.no's come in UTC: 2026-10-29T04:00:00+00:00 is 12:00 in Hong
+    Kong.) An entry with no time or no numeric temperature is skipped, so a
+    forecast of nothing usable is empty."""
     body = response.get(entity_id) if isinstance(response, dict) else None
     entries = body.get("forecast") if isinstance(body, dict) else None
     hours = []
@@ -130,7 +133,9 @@ def _slots(anchor: datetime, start: datetime, end: datetime) -> int:
 
 def window_stats(hours, start: datetime, end: datetime) -> WindowStats:
     """The mean and max of the hourly entries whose times fall in
-    [start, end). A window the forecast covers only part of uses what is
+    [start, end). The entries must already be in the window's time zone
+    (parse_forecast with Home Assistant's), so a UTC entry is matched by its
+    local time. A window the forecast covers only part of uses what is
     covered (`partial`); one it doesn't reach has no values."""
     hours = list(hours)
     expected = _slots(hours[0].at, start, end) if hours else 0
