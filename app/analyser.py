@@ -56,7 +56,7 @@ setpoint changed (an `on` with a new setpoint).
 Per room, learn_margin replays the cooling block's margin M (phase 5) from
 outdoor.initial_margin, against the decisions stored on each section run
 (shadow ones included; a run in block_mode off, or with no comfort point or
-forecast max, teaches nothing), moving M at reaction_rate, within 2 to 10:
+forecast max, teaches nothing), moving M at reaction_rate, within 0 to 10:
 
   blocked    a too_hot vote, or a person turning a unit on: toward
              delta_max + 0.5, so that run would not have been blocked
@@ -472,7 +472,7 @@ COOLING_STATES = ("cool", "boost")
 
 @dataclass(frozen=True)
 class MarginConfig:
-    initial: float = 6.0
+    initial: float = 0.0
     rate: float = 0.5
 
     @classmethod
@@ -510,7 +510,9 @@ class _Run:
 
 
 def margin_step(margin: float, target: float, rate: float) -> float:
-    """M halfway (at reaction_rate) toward the target, within 2 to 10."""
+    """M halfway (at reaction_rate) toward the target, within 0 to 10: a
+    target below 0 (an unblocked section whose forecast max was above the
+    comfort point) stops it at 0, blocking at the comfort point itself."""
     return min(MARGIN_MAX, max(MARGIN_MIN, margin + rate * (target - margin)))
 
 

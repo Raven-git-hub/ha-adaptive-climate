@@ -309,6 +309,16 @@ SCENARIOS = [
     s("block: the margin is the room's", [
         conditions({"would_block": False}, comfort=24.0, mean=19.0, max=18.0, margin=6.5),
         conditions({"would_block": True}, comfort=24.0, mean=19.0, max=18.0, margin=5.5)]),
+    s("block at margin 0: the comfort point itself blocks; a max above it doesn't", [
+        conditions({"delta_max": 0.0, "would_block": True, "margin": 0.0},
+                   comfort=24.0, mean=23.0, max=24.0, margin=0.0),
+        conditions({"delta_max": -0.1, "would_block": False},
+                   comfort=24.0, mean=23.0, max=24.1, margin=0.0)]),
+    s("block hysteresis at margin 0: held until the max is a degree above the comfort point", [
+        conditions({"delta_max": -0.9, "would_block": True},
+                   comfort=24.0, mean=23.0, max=24.9, margin=0.0, was_blocked=True),
+        conditions({"delta_max": -1.0, "would_block": False},
+                   comfort=24.0, mean=23.0, max=25.0, margin=0.0, was_blocked=True)]),
     s("block hysteresis: blocked last section, it holds until delta max <= margin - 1", [
         conditions({"would_block": True}, comfort=24.0, mean=20.0, max=18.5, was_blocked=True),
         conditions({"would_block": True}, comfort=24.0, mean=20.0, max=18.99, was_blocked=True),
@@ -908,12 +918,15 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
         ("the block's hysteresis",
          {"decide_block": lambda delta_max, margin, was_blocked:
           delta_max is not None and delta_max >= margin},
-         ["block hysteresis: blocked last section, it holds until delta max <= margin - 1"]),
+         ["block hysteresis: blocked last section, it holds until delta max <= margin - 1",
+          "block hysteresis at margin 0: held until the max is a degree above the comfort "
+          "point"]),
         ("the block at the margin itself (> instead of >=)",
          {"decide_block": lambda delta_max, margin, was_blocked:
           delta_max is not None and (delta_max > margin - 1 if was_blocked
                                      else delta_max > margin)},
-         ["block: delta max at the margin blocks; just under it doesn't"]),
+         ["block: delta max at the margin blocks; just under it doesn't",
+          "block at margin 0: the comfort point itself blocks; a max above it doesn't"]),
         ("shadow mode doesn't apply the block",
          {"Conditions": type("ShadowApplied", (c.Conditions,), {
              "blocked": property(lambda self: self.would_block)})},

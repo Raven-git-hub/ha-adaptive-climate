@@ -30,6 +30,10 @@ docs/V2_DESIGN.md and docs/TRUST_MODEL.md:
   * on and off teach bands as cooler and warmer wanted, manual teaches
     nothing, and every kind resets quiet and disqualifies a window
   * the confidence curve
+  * the block margin: clamped to 0..10, so a margin learned down from 1 by
+    an unblocked section whose forecast max was above the comfort point
+    stops at 0 (blocking at the comfort point itself) rather than going
+    negative, and climbs again from a blocked one; capped at 10
   * no seed, no almanac entry
   * tools/compare_analyser.py shows v1 against v2 on the same data
 
@@ -47,9 +51,11 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.analyser import (LearningConfig, analyse_room,           # noqa: E402
-                          confidence_from_quiet, is_setpoint_moving, nearest_step,
-                          next_applied, nudge_band, wanted_direction)
+from app.analyser import (LearningConfig, MarginConfig, analyse_room,   # noqa: E402
+                          confidence_from_quiet, is_setpoint_moving, learn_margin,
+                          margin_step, nearest_step, next_applied, nudge_band,
+                          wanted_direction)
+from app.control import MARGIN_MAX, MARGIN_MIN                    # noqa: E402
 from app.store import ReactiveUnitSample, Store, UnitSample       # noqa: E402
 from tools.compare_analyser import compare                        # noqa: E402
 
@@ -531,6 +537,61 @@ def check_confidence() -> None:
     ok("a reaction resets it: only days 5 and 6 count after the day-4 reaction (0.370)")
 
 
+def check_margin() -> None:
+    print("the block margin: within 0 to 10")
+    assert (MARGIN_MIN, MARGIN_MAX) == (0.0, 10.0)
+    assert margin_step(1.0, -3.0, 0.5) == 0.0 and margin_step(0.0, -3.0, 0.5) == 0.0
+    assert margin_step(0.0, 0.9, 0.5) == 0.45
+    assert margin_step(9.0, 12.5, 0.5) == 10.0 and margin_step(10.0, 3.0, 0.5) == 6.5
+    ok("a step toward -3 from 1 (or from 0) stops at 0; toward 12.5 from 9 stops at 10; "
+       "inside the range it is halfway")
+
+    def decided(sc: Scenario, start: datetime, section: str, comfort: float, mx: float,
+                blocked: bool) -> None:
+        """A section run decided in shadow mode at its crossover."""
+        day = start.date().isoformat()
+        sc.store.record_section_run("lounge", day, section,
+                                    planned_start=start.isoformat(timespec="seconds"),
+                                    actual_start=start.isoformat(timespec="seconds"))
+        sc.store.record_section_outdoor("lounge", day, section, mx - 1.0, mx)
+        sc.store.record_section_conditions("lounge", day, section, comfort, 0.1, blocked,
+                                           "shadow")
+
+    def margin(sc: Scenario, as_of: datetime, initial: float) -> tuple[float, list]:
+        return learn_margin(sc.store._conn, ROOM, MarginConfig(initial=initial), as_of)
+
+    sc = Scenario()
+    # Day, unblocked: the forecast max 27.0 is 3 above the comfort point
+    # (delta max -3). The scene starts cooling at 08:00; a too_cold vote at
+    # 08:15 pulls M toward -3.
+    decided(sc, t(2, 8), "day", 24.0, 27.0, False)
+    sc.beat(t(2, 8, 5), state="cool")
+    sc.vote(t(2, 8, 15), "too_cold")
+    m, steps = margin(sc, t(2, 8, 16), 1.0)
+    assert m == 0.0 and [(st.before, st.target, st.after) for st in steps] == [(1.0, -3.0, 0.0)]
+    ok("learned down from 1: a too_cold vote 15 min after Day's scene started cooling, delta "
+       "max -3, would take it halfway to -1; it stops at 0, the comfort point itself")
+    sc.vote(t(2, 8, 25), "too_cold")
+    m, steps = margin(sc, t(2, 8, 26), 1.0)
+    assert m == 0.0 and steps[-1].after == 0.0
+    ok("a second one leaves it at 0, never negative")
+    # Sunset, decided blocked at M 0: the max 23.6 is 0.4 below the comfort
+    # point. A too_hot vote there pulls M back up toward 0.9.
+    decided(sc, t(2, 16), "sunset", 24.0, 23.6, True)
+    sc.vote(t(2, 16, 10), "too_hot", section="sunset")
+    m, steps = margin(sc, t(2, 16, 11), 1.0)
+    assert m == 0.45 and steps[-1].target == 0.9, (m, steps[-1])
+    ok("and it climbs again: a too_hot vote in Sunset, blocked at delta max 0.4, moves it "
+       "from 0 halfway to 0.9")
+
+    sc = Scenario()
+    decided(sc, t(3, 20, 30), "night", 24.0, 12.0, True)
+    sc.vote(t(3, 20, 40), "too_hot", section="night")
+    m, _ = margin(sc, t(3, 20, 41), 9.0)
+    assert m == 10.0
+    ok("capped at 10: from 9 toward 12.5 (a too_hot vote in a Night blocked at delta max 12)")
+
+
 def check_missing_seed() -> None:
     print("no seed, no entry")
     sc = Scenario()
@@ -559,6 +620,7 @@ def main() -> int:
     check_band_nudge()
     check_on_off_manual()
     check_confidence()
+    check_margin()
     check_missing_seed()
     print("\nALL ASSERTIONS PASSED")
     return 0

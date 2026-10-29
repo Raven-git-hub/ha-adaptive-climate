@@ -43,7 +43,9 @@ for display and tie-breaking; the quorum count itself is unweighted.
   is blocked for a section when its warmest forecast hour is at least M below
   the room comfort point. Learned per room by the replay
   (`app.analyser.learn_margin`, docs/V2_DESIGN.md, The cooling block) from
-  `outdoor.initial_margin`, within 2 to 10. It is replay output, not stored:
+  `outdoor.initial_margin` (default 0), within 0 to 10: at 0 a section is
+  blocked when its warmest forecast hour is at or below the comfort point, and
+  learning never takes it below that. It is replay output, not stored:
   the runtime adds it to the pushed attributes, and `/api/almanac/<room>`
   serves it; `store.current_almanac` has no `margin`. Control doesn't read it
   from here: the container decides each section's block and publishes it in

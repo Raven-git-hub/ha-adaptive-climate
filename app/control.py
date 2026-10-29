@@ -69,7 +69,7 @@ HEAT_BLOCK_MODES = ("shadow", "active")
 DEFAULT_BLOCK_MODE = "shadow"
 LEAN_CAP = 0.6          # each edge stays this far on its own side of comfort
 BLOCK_RELEASE = 1.0     # a block lifts only once delta_max <= margin - this
-MARGIN_MIN, MARGIN_MAX = 2.0, 10.0
+MARGIN_MIN, MARGIN_MAX = 0.0, 10.0      # 0: block at the comfort point itself, no lower
 
 
 # ---------------------------------------------------------------------
