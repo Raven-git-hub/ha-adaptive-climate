@@ -121,7 +121,7 @@ cools a unit or turns it off, apart from leak protection:
 |---|---|---|---|---|
 | **cool** | the default while a section is running | COOL | LOW | base + offset |
 | **boost** | the quorum says too warm, or you pressed **too hot** | COOL | MEDIUM | base + offset − 2°C |
-| **rest** | the quorum says too cold, you pressed **too cold**, or cooling is blocked | OFF | — | — |
+| **rest** | the quorum says too cold, you pressed **too cold**, cooling is blocked, or the section started with the room cold and the forecast cooler | OFF | — | — |
 | **user_off** | a person turned the unit off | OFF | — | — |
 | **manual** | a person chose another mode or fan | theirs | theirs | theirs |
 | **config_off** | the section's scene forces the unit off | OFF | — | — |
@@ -136,7 +136,11 @@ one heartbeat (two when resting), and a person's turn-on holds it in **cool**
 for 30 minutes. **user_off** and **manual** last until the section changes. A
 rest or boost you forced with a press (or a setpoint change on the remote) ends
 by the same rules, but returns to **cool** at the new base, without the offset
-step; until it does, further presses are ignored.
+step; until it does, further presses are ignored. A section starts in **rest**
+instead of **cool** when at least a quorum of the room's sensors are below their
+comfort readings and the section's forecast mean is below the room's comfort
+point; that rest also wakes at the base, without the +1, and a press during it
+counts.
 
 Fan speed availability and min/max range are read from each unit at runtime, so
 one generated automation adapts per unit — including units that hide their fan

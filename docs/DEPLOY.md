@@ -74,8 +74,8 @@ acts without a learned setpoint); this brought the scene automation in line.
 
 ## Starting values: no `initial`, and new units start hands off
 
-Each unit has seven control helpers (`ac_state`, `ac_base`, `ac_offset`,
-`ac_since`, `ac_grace_until`, `ac_unblocked`, `ac_forced`), and each room two
+Each unit has eight control helpers (`ac_state`, `ac_base`, `ac_offset`,
+`ac_since`, `ac_grace_until`, `ac_unblocked`, `ac_forced`, `ac_section_rest`), and each room two
 vote buttons (`input_button.ac_too_cold_<room>`, `input_button.ac_too_hot_<room>`).
 None is created with an `initial`: in Home Assistant, a helper's `initial` overrides its restored value
 at **every** restart, which would wipe a person's chosen base, a `user_off` or
@@ -91,6 +91,7 @@ starting values of the helpers **it has just created**, and only those:
 | `ac_grace_until_…` | today 00:00, in the past: no grace | HA's default |
 | `ac_unblocked_…` | off | HA's default |
 | `ac_forced_…` | off: no forced state | HA's default |
+| `ac_section_rest_…` | off: no section rest | HA's default |
 | `ac_too_cold_<room>`, `ac_too_hot_<room>` | never pressed (`unknown`); the first press counts | HA's default |
 | `ac_offset_…` | 0 | deploy sets it (its minimum is −`offset_cap`) |
 | `ac_since_…` | now, as an epoch timestamp | deploy sets it |

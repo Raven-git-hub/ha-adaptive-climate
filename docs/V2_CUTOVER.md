@@ -120,8 +120,8 @@ curl -s -X POST localhost:8098/api/deploy | python3 -m json.tool
 For the example config both reports read `"ok": true` with the same lists (the
 check's says `"dry_run": true`):
 
-- `helpers_created`: 27, seven per unit (`ac_state_`, `ac_base_`, `ac_offset_`,
-  `ac_since_`, `ac_grace_until_`, `ac_unblocked_`, `ac_forced_`) and two per room
+- `helpers_created`: 30, eight per unit (`ac_state_`, `ac_base_`, `ac_offset_`,
+  `ac_since_`, `ac_grace_until_`, `ac_unblocked_`, `ac_forced_`, `ac_section_rest_`) and two per room
   (`input_button.ac_too_cold_<room>`, `input_button.ac_too_hot_<room>`)
 - `helpers_removed`: the three `input_datetime.ac_correction_started_<room>`
 - `automations_written`: 30 (6 scenes, maintenance, watchdog and the vote
@@ -248,7 +248,9 @@ deploy code against a stub holding a v2 deployment:
   `input_boolean.ac_unblocked_*`, `input_datetime.ac_since_*` and
   `input_datetime.ac_grace_until_*`. It also re-creates
   `input_datetime.ac_correction_started_<room>`.
-- v1's deploy **also** removes the `input_boolean.ac_forced_*` markers.
+- v1's deploy **also** removes the `input_boolean.ac_forced_*` and
+  `input_boolean.ac_section_rest_*` markers (it prunes every `ac_*` helper in the
+  three domains it manages that it doesn't generate).
 - `sensor.ac_conditions_<room>` (phase 5) is no helper: v2's container pushed it,
   and it goes at Home Assistant's next restart. v1 never reads it.
 - It **does not** remove:
@@ -304,11 +306,11 @@ docker compose ps; curl -s localhost:8098/healthz; echo
 
 Then in the v1 UI: **Config** → **Deploy to Home Assistant**. Expect
 `helpers_created` to be the three `ac_correction_started_*`, `helpers_removed` the
-fifteen v2 helpers it removes (`ac_state_`, `ac_since_`, `ac_grace_until_`,
-`ac_unblocked_` and `ac_forced_` per unit), and `automations_written` 24. Settings →
+eighteen v2 helpers it removes (`ac_state_`, `ac_since_`, `ac_grace_until_`,
+`ac_unblocked_`, `ac_forced_` and `ac_section_rest_` per unit), and `automations_written` 24. Settings →
 Automations should show no `ac_manual_*` or `ac_vote_*`, and Helpers no
 `ac_state_`, `ac_base_`, `ac_offset_`, `ac_since_`, `ac_grace_until_`,
-`ac_unblocked_`, `ac_forced_`, `ac_too_cold_` or `ac_too_hot_` entries. v1's next
+`ac_unblocked_`, `ac_forced_`, `ac_section_rest_`, `ac_too_cold_` or `ac_too_hot_` entries. v1's next
 scene clears any hold.
 
 The restored database is v1's, from step 1. The reactions recorded while v2 ran

@@ -10,7 +10,9 @@ rule is a small named function, written the way a template can say it.
   evaluate_votes      positions in band widths, the pooled quorum and its
                       direction (app.trust), and the release counts
   step                one maintenance heartbeat for one unit
-  on_section_change   what the scene does to a unit at a crossover
+  on_section_change   what the scene does to a unit at a crossover: rest if
+                      cooling is blocked or the room starts cold
+                      (section_start), else cool
   on_room_vote        a person's too_cold / too_hot vote for the room (a
                       button press, or a setpoint change on a remote): one
                       per episode, forcing a rest or a boost
@@ -27,7 +29,8 @@ rule is a small named function, written the way a template can say it.
                       sensor.ac_conditions_<room> for the templates to read
 
 A unit's state lives in its helpers (phase 3b): ac_state, ac_base,
-ac_offset, ac_since, ac_grace_until, ac_unblocked and ac_forced.
+ac_offset, ac_since, ac_grace_until, ac_unblocked, ac_forced and
+ac_section_rest.
 """
 
 from __future__ import annotations
@@ -103,6 +106,7 @@ class Unit:
     grace_until: datetime | None = None  # end of a person's grace period
     unblocked: bool = False             # a person turned it on during a block
     forced: bool = False                # this rest or boost is a person's vote
+    section_rest: bool = False          # a section change began this rest: the room was cold
 
 
 @dataclass(frozen=True)
@@ -124,6 +128,7 @@ class Context:
     block_mode: str = DEFAULT_BLOCK_MODE    # outdoor.block_mode (heat sources block unless off)
     leak_on: bool = False               # the unit's leak latch
     forced_off: bool = False            # the section's scene forces this unit off
+    delta_mean: float | None = None     # comfort point - forecast mean; None: fail open
     min_delta: float = 0.5              # system.reactive_min_delta
     sensor_stale_minutes: int = DEFAULT_STALE_MINUTES   # system.sensor_stale_minutes
     config: ControlConfig = ControlConfig()
@@ -254,9 +259,10 @@ def released(side_count: int, required: int) -> bool:
 
 def release_offset(unit: Unit, change: int) -> int:
     """The offset a boost or rest returns to cool with: a system one moves
-    it a step (change, -1 or +1); one a person's vote forced goes back to
-    cool at its base."""
-    return 0 if unit.forced else unit.offset + change
+    it a step (change, -1 or +1); one a person's vote forced, or a rest the
+    section started in because the room was cold (nobody said too cold),
+    goes back to cool at its base."""
+    return 0 if unit.forced or unit.section_rest else unit.offset + change
 
 
 def capped_offset(offset: int, cap: int) -> int:
@@ -283,9 +289,9 @@ def command_for(state: str, base: float | None, offset: int, ctx: Context) -> Co
 def _go(unit: Unit, state: str, now: datetime, ctx: Context,
         offset: int | None = None) -> tuple[Unit, Command | None]:
     """A transition: new state, since = now, and its command. It ends any
-    forced state: only a vote forces one."""
+    forced state (only a vote forces one) and any section-start rest."""
     offset = unit.offset if offset is None else capped_offset(offset, ctx.config.offset_cap)
-    new = replace(unit, state=state, offset=offset, since=now, forced=False)
+    new = replace(unit, state=state, offset=offset, since=now, forced=False, section_rest=False)
     return new, command_for(state, target_base(new, ctx), offset, ctx)
 
 
@@ -294,13 +300,14 @@ def _stay(unit: Unit, ctx: Context) -> tuple[Unit, Command | None]:
     return unit, None
 
 
-def _leak_step(unit: Unit, now: datetime, ctx: Context) -> tuple[Unit, Command | None] | None:
+def _leak_step(unit: Unit, votes: Votes, now: datetime,
+               ctx: Context) -> tuple[Unit, Command | None] | None:
     """Leak beats everything, minimum times and grace included. Returns
     None when the leak latch has nothing to do with this heartbeat."""
     if ctx.leak_on:
         return _stay(unit, ctx) if unit.state == "leak" else _go(unit, "leak", now, ctx)
     if unit.state == "leak":                 # fixed and confirmed: as at a section change
-        return on_section_change(unit, ctx, ctx.forced_off, now)
+        return on_section_change(unit, ctx, ctx.forced_off, now, votes)
     return None
 
 
@@ -424,7 +431,7 @@ def on_person_vote(direction: str, unit: Unit, now: datetime, ctx: Context,
     base = vote_base(direction, unit, ctx, chosen)
     if base is None:
         return _stay(unit, ctx)
-    voted = replace(unit, base=base, offset=0, grace_until=None)
+    voted = replace(unit, base=base, offset=0, grace_until=None, section_rest=False)
     if direction == TOO_COLD:
         if unit.state == "user_off":
             return voted, None               # the person's off stands
@@ -564,7 +571,7 @@ def section_conditions(section: str, comfort: float | None, outdoor_mean: float 
 def step(unit: Unit, votes: Votes, now: datetime, ctx: Context) -> tuple[Unit, Command | None]:
     """One maintenance heartbeat. Returns the unit's new record and the
     command to send, which is None unless it changed state."""
-    leak = _leak_step(unit, now, ctx)
+    leak = _leak_step(unit, votes, now, ctx)
     if leak is not None:
         return leak
     if unit.state in HANDS_OFF:
@@ -605,16 +612,47 @@ def step(unit: Unit, votes: Votes, now: datetime, ctx: Context) -> tuple[Unit, C
     return _stay(unit, ctx)
 
 
-def on_section_change(unit: Unit, ctx: Context, forced_off: bool,
-                      now: datetime) -> tuple[Unit, Command | None]:
+START_BLOCKED, START_HEAT_SOURCE, START_COLD = "blocked", "heat_source", "cold"
+START_FAIL_OPEN, START_NOT_COOLER, START_NOT_COLD = "fail_open", "not_cooler_outside", "not_cold"
+
+
+def starts_cold(votes: Votes | None, ctx: Context) -> bool:
+    """The room starts the section cold: at least a quorum (counted as at
+    least 1) of the usable sensors below their comfort readings in the new
+    section's almanac, so a rest started now wouldn't release at once, and
+    the section's forecast mean below the room comfort point (delta_mean >
+    0). No forecast or no comfort point (delta_mean None) fails open."""
+    return (votes is not None and ctx.delta_mean is not None and ctx.delta_mean > 0
+            and not released(votes.cold_side, votes.required))
+
+
+def section_start(votes: Votes | None, ctx: Context) -> tuple[str, str]:
+    """The state a section starts a unit in, once a leak, the scene's
+    forced off and a missing almanac are out of the way, and why: rest if
+    cooling is blocked (the section's block, or a heat source), rest if the
+    room starts cold (starts_cold), else cool (why not rest: fail open, not
+    cooler outside, or not cold)."""
+    if room_blocked(ctx):
+        return "rest", START_BLOCKED if ctx.blocked else START_HEAT_SOURCE
+    if starts_cold(votes, ctx):
+        return "rest", START_COLD
+    if ctx.delta_mean is None:
+        return "cool", START_FAIL_OPEN
+    return "cool", START_NOT_COOLER if ctx.delta_mean <= 0 else START_NOT_COLD
+
+
+def on_section_change(unit: Unit, ctx: Context, forced_off: bool, now: datetime,
+                      votes: Votes | None) -> tuple[Unit, Command | None]:
     """The scene at a crossover (and a confirmed leak release). Resets the
     section-scoped fields, then: leak if the latch is on (off is re-sent),
-    else config_off if the scene forces the unit off, else rest if cooling
-    is blocked (room_blocked: the section's block or a heat source), else
-    cool. user_off, manual and a forced state end here. Minimum times don't
-    apply."""
+    else config_off if the scene forces the unit off, else section_start:
+    rest if cooling is blocked (the section's block or a heat source), or if
+    the room starts cold (votes: the room's, against the new section's
+    almanac), else cool. A rest the room's cold start began is marked
+    section_rest, so it wakes at the base. user_off, manual, a forced state
+    and a section rest end here. Minimum times don't apply."""
     reset = replace(unit, offset=0, base=ctx.setpoint_applied, unblocked=False,
-                    grace_until=None, since=now, forced=False)
+                    grace_until=None, since=now, forced=False, section_rest=False)
     if ctx.leak_on:
         state = "leak"
     elif forced_off:
@@ -626,7 +664,8 @@ def on_section_change(unit: Unit, ctx: Context, forced_off: bool,
         # leaves it off, and wakes it once there is a setpoint to cool to.
         return replace(reset, state="rest"), None
     else:
-        state = "rest" if room_blocked(ctx) else "cool"
+        state, why = section_start(votes, ctx)
+        reset = replace(reset, section_rest=why == START_COLD)
     new = replace(reset, state=state)
     return new, command_for(state, target_base(new, ctx), 0, ctx)
 
@@ -636,18 +675,18 @@ def on_person_change(kind: str, unit: Unit, new_setpoint: float | None, now: dat
     """What a person turning the unit on or off, or changing its mode or
     fan, does to the unit's record. No command: the person already moved
     the unit. kind as the reaction detector records it: on, off, manual (a
-    setpoint change is a vote, on_room_vote). Each ends a forced state; a
-    latched leak keeps its state."""
+    setpoint change is a vote, on_room_vote). Each ends a forced state and
+    a section-start rest; a latched leak keeps its state."""
     if unit.state == "leak":
         return unit
     if kind == "on":
         return replace(unit, state="cool", base=new_setpoint, offset=0, unblocked=True,
-                       since=now, forced=False,
+                       since=now, forced=False, section_rest=False,
                        grace_until=now + timedelta(minutes=ctx.config.person_grace_minutes))
     if kind == "off":
-        return replace(unit, state="user_off", since=now, forced=False)
+        return replace(unit, state="user_off", since=now, forced=False, section_rest=False)
     if kind == "manual":
-        return replace(unit, state="manual", since=now, forced=False)
+        return replace(unit, state="manual", since=now, forced=False, section_rest=False)
     return unit
 
 

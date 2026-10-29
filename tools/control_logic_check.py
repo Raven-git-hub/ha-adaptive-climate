@@ -350,6 +350,7 @@ def _seed(ha: HA, unit: control.Unit, ctx: control.Context, uid: str = UNIT) -> 
             ha.set(entity_id, when.strftime("%Y-%m-%d %H:%M:%S"), timestamp=_epoch(when))
     ha.set(g.unblocked_id(ROOM, uid), "on" if unit.unblocked else "off")
     ha.set(g.forced_id(ROOM, uid), "on" if unit.forced else "off")
+    ha.set(g.section_rest_id(ROOM, uid), "on" if unit.section_rest else "off")
     implied = control.implied_command(unit, ctx)
     mode = "fan_only" if implied is None else implied.hvac_mode
     ha.set(entity_of(uid), mode, temperature=(implied and implied.temperature) or 22.0,
@@ -417,7 +418,8 @@ def _view(ha: HA, now: datetime, uid: str = UNIT) -> dict:
             "since": at(g.since_id(ROOM, uid)),
             "grace_until": grace if grace is not None and grace > table._secs(now) else None,
             "unblocked": ha.states(g.unblocked_id(ROOM, uid)) == "on",
-            "forced": ha.states(g.forced_id(ROOM, uid)) == "on"}
+            "forced": ha.states(g.forced_id(ROOM, uid)) == "on",
+            "section_rest": ha.states(g.section_rest_id(ROOM, uid)) == "on"}
 
 
 def _control_view(unit: control.Unit, now: datetime) -> dict:
@@ -719,7 +721,8 @@ class Replay:
                 return f"{uid} sent {sent}, control {wanted}"
             unit_helpers = [h(ROOM, uid) for h in (g.state_id, g.offset_id, g.base_id,
                                                    g.since_id, g.grace_until_id,
-                                                   g.unblocked_id, g.forced_id)]
+                                                   g.unblocked_id, g.forced_id,
+                                                   g.section_rest_id)]
             if news[uid] == olds[uid] and not automation["id"].startswith("ac_scene_") and any(
                     e in unit_helpers for _, e, _, _ in ha.calls):
                 return f"{uid} helpers written without a transition"
@@ -1021,18 +1024,30 @@ def _extra_cases() -> int:
                    "vote": g.build_vote_automation(config, room),
                    "manual change": g.build_manual_change_automation(config, room,
                                                                      room["units"][0])}
+    counting = ("maintenance", "scene", "leak release")      # count votes: edges too
     one_place = []
     for name, a in automations.items():
         want = g._conditions_variables(config, room, sections_of[name],
-                                       edges=name == "maintenance")
+                                       edges=name in counting)
         text = repr(a)
         one_place.append({k: a["variables"].get(k) for k in want} == want
                          and text.count(g.conditions_id(ROOM)) == 1
                          and text.count(HEATER) == 1)
-    expect(all(one_place) and "cold_edge" not in automations["scene"]["variables"],
+    expect(all(one_place) and "cold_edge" not in automations["vote"]["variables"],
            "blocked and the edges come from one place (_conditions_variables), in every "
            "automation that reads them; the conditions entity and the heat source are read "
            "nowhere else")
+    votes_expr = g._votes_variables(config, room, g.SENSORS_LIVE)["votes"]
+    expect(all(automations[n]["variables"].get("votes") == votes_expr for n in counting)
+           and all("votes" not in automations[n]["variables"]
+                   for n in ("vote", "manual change"))
+           and list(automations["scene"]["variables"])[:6] == [
+               "now_ts", "conditions", "blocked", "cold_edge", "warm_edge", "sensor_data"],
+           "the votes come from one place (_votes_variables): maintenance's, the scene's and "
+           "a leak release's are the same expression, read after the edges")
+    scene_sensors = automations["scene"]["variables"]["sensor_data"]
+    expect(f".get('{SECTION}')" in scene_sensors and "secs" not in scene_sensors,
+           "the scene counts the votes against its own section's almanac, not the select's")
 
     manual = g.build_manual_change_automation(config, room, room["units"][0])
     expect(manual["trigger"] == manual_triggers(ENTITY),

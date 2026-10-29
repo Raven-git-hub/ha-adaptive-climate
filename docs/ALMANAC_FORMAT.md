@@ -169,7 +169,8 @@ not a helper deploy creates. Decided once per section and locked for it
 - **outdoor_mean / outdoor_max** — the forecast over the section's window;
   **delta_mean / delta_max** — comfort point minus each (positive: colder
   outside); **lean** — `outdoor.lean_per_degree` × delta_mean, before the
-  caps. All null when failing open for want of them.
+  caps. All null when failing open for want of them. The scene also reads
+  delta_mean: above 0, with the room cold, a section starts resting.
 - **fail_open** — null, or why there is no lean and no block:
   `no_outdoor` (no forecast, `outdoor.source` none, or the placeholder
   published while the forecast is fetched) or `no_comfort_point`.

@@ -108,6 +108,8 @@ from app.generator import SECTIONS                               # noqa: E402
 SCHEMA = Path(__file__).resolve().parent.parent / "schema" / "storage.schema.sql"
 CONFIG = json.loads((Path(__file__).resolve().parent.parent /
                      "examples" / "config.example.json").read_text())
+LIVING = [s["entity_id"] for r in CONFIG["rooms"] if r["id"] == "main_room"
+          for s in r["sensors"]]            # Main Room's sensors, in order
 
 
 def _build_states():
@@ -1293,6 +1295,10 @@ async def check_conditions() -> None:
         return [e["message"] for e in reversed(store.recent_events(
             limit=1000, room_id="main_room", category="block"))]
 
+    def crossovers() -> list[dict]:
+        return list(reversed(store.recent_events(limit=1000, room_id="main_room",
+                                                 category="crossover")))
+
     def pushes(rest) -> list[tuple[str, dict]]:
         return [(e[2].get("section"), e[2]) for e in rest.log
                 if e[0] == "set_state" and e[1] == "sensor.ac_conditions_main_room"]
@@ -1414,7 +1420,23 @@ async def check_conditions() -> None:
           "to 7.4: 6.0 -> 6.7, logged and pushed in the almanac - OK")
 
     # --- hysteresis: blocked last section, held while delta max > margin - 1 ---
+    # The room is cold at 22:00 (each sensor 0.4 under its comfort reading)
+    # and so is the forecast: Sleep starts resting. Warm again after it.
+    living = {s["entity_id"]: s for s in states if s["entity_id"] in LIVING}
+    warm = {e: s["state"] for e, s in living.items()}
+    for (e, s), cold in zip(living.items(), ("23.0", "23.5", "24.0")):
+        s["state"] = cold
     await cross(rt, "sleep", 3, 22)
+    for e, s in living.items():
+        s["state"] = rt._cache[e] = warm[e]
+    sleep_start = crossovers()[-1]
+    assert sleep_start["message"] == (
+        "Main Room -> sleep: starts in rest: 3 of 3 sensors below their comfort readings "
+        "(2 needed), and the forecast mean 17.8 is below the comfort point 23.9"), sleep_start
+    assert {k: sleep_start["detail"][k] for k in ("start", "why", "cold_side", "needed",
+                                                  "delta_mean")} == {
+        "start": "rest", "why": "cold", "cold_side": 3, "needed": 2, "delta_mean": 6.08}, \
+        sleep_start["detail"]
     assert order(rest, "sleep") == ["conditions", "scene"], order(rest, "sleep")
     assert run("2026-08-03", "sleep")[1:] == (18.0, 23.9, 0.608, 1, "shadow"), run("2026-08-03", "sleep")
     assert block_events()[-1].startswith(
@@ -1437,6 +1459,24 @@ async def check_conditions() -> None:
           "a person's on in it moves the margin to 6.55; Sunrise (5.5 <= 5.55) lifts the block; "
           "Day (5.9, above margin - 1 but below the margin) isn't blocked, since Sunrise "
           "wasn't - OK")
+    starts = [e["message"] for e in crossovers()]
+    assert starts[-6:] == [
+        "Main Room -> sunset: starts in cool: the forecast mean 29.6 is not below the comfort "
+        "point 23.9",
+        "Main Room -> night: starts in cool: no forecast yet (fetching it), so no cold start: "
+        "fail open",
+        "Main Room -> night (catch-up): starts in cool: 0 of 3 sensors below their comfort "
+        "readings (2 needed)",
+        sleep_start["message"],
+        "Main Room -> sunrise: starts in cool: no forecast yet (fetching it), so no cold start: "
+        "fail open",
+        "Main Room -> day: starts in cool: no forecast yet (fetching it), so no cold start: "
+        "fail open"], starts[-6:]
+    print("section start: each crossover event says how the scene starts the room and why - "
+          "Sleep, cold (3 of 3 sensors under comfort) with the forecast mean 17.8 under the "
+          "comfort point 23.9, in rest; Sunset, the forecast warmer, in cool; Night caught up, "
+          "warm (0 of 3), in cool; Night, Sunrise and Day, the forecast still being fetched, "
+          "in cool (fail open) - OK")
 
     # --- margin: too_cold 20 min after the scene started cooling, unblocked ---
     await beat(rt, 4, 8, 5, "cool")

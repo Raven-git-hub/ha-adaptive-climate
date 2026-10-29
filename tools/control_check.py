@@ -92,6 +92,8 @@ def votes(readings, expect: dict, **extra) -> dict:
 
 
 def section(expect_unit: dict, command, at: int = 0, **extra) -> dict:
+    """A section change: the scene, with the room's sensors at `readings`
+    (default settled_warm) against the almanac and the conditions' edges."""
     return {"do": "section_change", "at": at,
             "expect": {"unit": expect_unit, "command": command}, **extra}
 
@@ -423,6 +425,10 @@ SCENARIOS = [
       unit={"state": "leak", "offset": -2, "base": 24.0, "unblocked": True, "since": -m(10)}),
     s("leak release while blocked rests", [step("hot", {"state": "rest"}, OFF)],
       unit={"state": "leak", "since": -m(10)}, ctx={"blocked": True}),
+    s("leak release in a cold room with a cooler forecast: a section rest", [
+        conditions({"delta_mean": 6.0}, comfort=24.0, mean=18.0, max=19.0),
+        step("cold", {"state": "rest", "section_rest": True, "since": 0}, OFF)],
+      unit={"state": "leak", "since": -m(10)}),
     s("leak release in a forced-off section", [step("hot", {"state": "config_off"}, OFF)],
       unit={"state": "leak", "since": -m(10)}, ctx={"forced_off": True}),
     s("leak turns the unit off, not dry", [
@@ -479,6 +485,78 @@ SCENARIOS = [
     s("section change clamps to the baby room's 18", [
         section({"state": "cool"}, cmd("cool", "low", 18.0))],
       ctx={**BABY, "setpoint_applied": 17.0}),
+
+    # --- section start: a cold room with a cooler forecast starts resting -------
+    # Comfort 24, forecast mean 18 (delta_mean +6, max 19: no block).
+    s("section start: a cold room with a cooler forecast rests, and wakes at its base, "
+      "offset 0", [
+        conditions({"delta_mean": 6.0, "would_block": False, "blocked": False},
+                   comfort=24.0, mean=18.0, max=19.0),
+        section({"state": "rest", "section_rest": True, "offset": 0, "base": 22.0,
+                 "since": 0}, OFF, readings="cold"),
+        step("cold", {"state": "rest", "section_rest": True}, None, at=m(10)),
+        step("settled_warm", {"state": "cool", "offset": 0, "section_rest": False,
+                              "since": m(20)}, cmd("cool", "low", 22.0), at=m(20))],
+      unit={"offset": 1, "since": -m(60)}),
+    s("section start: a quorum just under comfort, voting or not, is a cold room", [
+        conditions({"delta_mean": 6.0}, comfort=24.0, mean=18.0, max=19.0),
+        section({"state": "rest", "section_rest": True}, OFF, readings="settled_cool")]),
+    s("section start: a cold room with a forecast mean at or above comfort starts in cool", [
+        conditions({"delta_mean": -3.0}, comfort=24.0, mean=27.0, max=29.0),
+        section({"state": "cool", "section_rest": False}, cmd("cool", "low", 22.0),
+                readings="cold"),
+        conditions({"delta_mean": 0.0}, comfort=24.0, mean=24.0, max=26.0),
+        section({"state": "cool", "section_rest": False}, cmd("cool", "low", 22.0),
+                readings="cold", at=m(10))]),
+    s("section start: a warm room with a cooler forecast starts in cool, ending a section "
+      "rest", [
+        conditions({"delta_mean": 6.0}, comfort=24.0, mean=18.0, max=19.0),
+        section({"state": "cool", "section_rest": False}, cmd("cool", "low", 22.0),
+                readings="settled_warm")],
+      unit={"state": "rest", "section_rest": True, "since": -m(5)}),
+    s("section start: no conditions, no outdoor value or no comfort point starts a cold room "
+      "in cool (fail open)", [
+        section({"state": "cool", "section_rest": False}, cmd("cool", "low", 22.0),
+                readings="cold"),
+        conditions({"fail_open": "no_outdoor", "delta_mean": None}, comfort=24.0, mean=None,
+                   max=None),
+        section({"state": "cool", "section_rest": False}, cmd("cool", "low", 22.0),
+                readings="cold", at=m(10)),
+        conditions({"fail_open": "no_comfort_point", "delta_mean": None}, comfort=None,
+                   mean=18.0, max=19.0),
+        section({"state": "cool", "section_rest": False}, cmd("cool", "low", 22.0),
+                readings="cold", at=m(20))]),
+    s("section start: blocked, a cold room rests for the block, not as a section rest", [
+        conditions({"blocked": True, "delta_mean": 7.0}, comfort=24.0, mean=17.0, max=17.0,
+                   block_mode="active"),
+        section({"state": "rest", "section_rest": False}, OFF, readings="cold")]),
+    s("section start: a heat source's rest wakes at +1 once it is off, as before", [
+        conditions({"delta_mean": 6.0}, comfort=24.0, mean=18.0, max=19.0),
+        section({"state": "rest", "section_rest": False}, OFF, readings="cold"),
+        step("settled_warm", {"state": "cool", "offset": 1}, cmd("cool", "low", 23.0),
+             at=m(20), ctx={"heat_source_on": False})],
+      ctx={"heat_source_on": True}),
+    s("section start: a too_hot vote in a section rest is taken: a forced boost, then cool "
+      "at the voted base", [
+        conditions({"delta_mean": 6.0}, comfort=24.0, mean=18.0, max=19.0),
+        section({"state": "rest", "section_rest": True}, OFF, readings="cold"),
+        press("too_hot", {"state": "boost", "forced": True, "section_rest": False,
+                          "base": 21.0, "offset": 0, "since": m(5)},
+              cmd("cool", "medium", 19.0), at=m(5)),
+        step("settled_cool", {"state": "cool", "offset": 0, "forced": False, "base": 21.0},
+             cmd("cool", "low", 21.0), at=m(15))]),
+    s("section start: a too_cold vote in a section rest is taken: forced, since kept, "
+      "nothing sent", [
+        conditions({"delta_mean": 6.0}, comfort=24.0, mean=18.0, max=19.0),
+        section({"state": "rest", "section_rest": True}, OFF, readings="cold"),
+        press("too_cold", {"state": "rest", "forced": True, "section_rest": False,
+                           "base": 23.0, "since": 0}, None, at=m(5)),
+        step("settled_warm", {"state": "cool", "offset": 0, "base": 23.0},
+             cmd("cool", "low", 23.0), at=m(20))]),
+    s("section start: a person's on ends a section rest", [
+        conditions({"delta_mean": 6.0}, comfort=24.0, mean=18.0, max=19.0),
+        section({"state": "rest", "section_rest": True}, OFF, readings="cold"),
+        person("on", {"state": "cool", "section_rest": False}, setpoint=23.0, at=m(5))]),
 
     # --- a person's change ----------------------------------------------------------
     s("person off: user_off", [person("off", {"state": "user_off", "since": 0})]),
@@ -697,13 +775,15 @@ def _unit(d: dict) -> control.Unit:
     return control.Unit(state=d.get("state", "cool"), offset=d.get("offset", 0),
                         base=d.get("base", 0.0), since=_time(d.get("since", -m(60))),
                         grace_until=_time(d.get("grace_until")),
-                        unblocked=d.get("unblocked", False), forced=d.get("forced", False))
+                        unblocked=d.get("unblocked", False), forced=d.get("forced", False),
+                        section_rest=d.get("section_rest", False))
 
 
 def _view(unit: control.Unit) -> dict:
     return {"state": unit.state, "offset": unit.offset, "base": unit.base or None,
             "since": _secs(unit.since), "grace_until": _secs(unit.grace_until),
-            "unblocked": unit.unblocked, "forced": unit.forced}
+            "unblocked": unit.unblocked, "forced": unit.forced,
+            "section_rest": unit.section_rest}
 
 
 def _ctx(*layers: dict) -> control.Context:
@@ -753,8 +833,9 @@ def _conditions(st: dict, now: datetime = T0,
 
 def under(cond: control.Conditions | None) -> dict:
     """The context the steps after a conditions step run under: the block
-    and block_mode as control sees them."""
-    return {} if cond is None else {"blocked": cond.blocked, "block_mode": cond.block_mode}
+    and block_mode as control sees them, and delta_mean (a section start's)."""
+    return {} if cond is None else {"blocked": cond.blocked, "block_mode": cond.block_mode,
+                                    "delta_mean": cond.delta_mean}
 
 
 def with_edges(st: dict, cond: control.Conditions | None) -> dict:
@@ -783,7 +864,8 @@ def apply(st: dict, units: dict[str, control.Unit], now: datetime, ctx: control.
         results = {uid: control.step(u, v, now, ctxs[uid]) for uid, u in units.items()}
     elif do == "section_change":
         forced = st.get("forced_off", ctx.forced_off)
-        results = {uid: control.on_section_change(u, ctxs[uid], forced and uid == MAIN, now)
+        v = _votes(st, now, ctx.sensor_stale_minutes)
+        results = {uid: control.on_section_change(u, ctxs[uid], forced and uid == MAIN, now, v)
                    for uid, u in units.items()}
     elif do == "person":
         new = control.on_person_change(st["kind"], units[MAIN], st.get("setpoint"), now, ctx)
@@ -865,21 +947,29 @@ def run(scenario: dict) -> list[str]:
 _VOTE_BASE = control.vote_base
 _SECTION_CHANGE = control.on_section_change
 _PERSON_CHANGE = control.on_person_change
+_PERSON_VOTE = control.on_person_vote
 _COMFORT_POINT = control.comfort_point
 _SECTION_CONDITIONS = control.section_conditions
+_SECTION_START = control.section_start
 
 
 def _mutants() -> list[tuple[str, dict, list[str]]]:
     c = control
     leak_step = c._leak_step
 
-    def leak_waits(unit, now, ctx):              # leak queued behind hands-off, grace, min time
+    def leak_waits(unit, votes, now, ctx):       # leak queued behind hands-off, grace, min time
         if ctx.leak_on and unit.state != "leak" and (
                 unit.state in c.HANDS_OFF or c.in_grace(unit, now)
                 or not c.min_time_met(unit, now, ctx.config.cool_min_heartbeats,
                                       ctx.heartbeat_interval)):
             return None
-        return leak_step(unit, now, ctx)
+        return leak_step(unit, votes, now, ctx)
+
+    def cold_room(votes):                        # a rest started now wouldn't release at once
+        return votes is not None and not c.released(votes.cold_side, votes.required)
+
+    def cooler(ctx):
+        return ctx.delta_mean is not None and ctx.delta_mean > 0
 
     def resend(unit, ctx):                       # re-send the state's command every heartbeat
         base = c.target_base(unit, ctx)
@@ -1014,9 +1104,9 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
           "a remote setpoint down is too_hot, with the chosen value as the base",
           "a remote setpoint up while user_off keeps the unit off, at the chosen base"]),
         ("a section change ends a forced state",
-         {"on_section_change": lambda unit, ctx, forced_off, now: (lambda r: (
+         {"on_section_change": lambda unit, ctx, forced_off, now, votes: (lambda r: (
              dataclasses.replace(r[0], forced=unit.forced), r[1]))(
-                 _SECTION_CHANGE(unit, ctx, forced_off, now))},
+                 _SECTION_CHANGE(unit, ctx, forced_off, now, votes))},
          ["a section change during a forced state ends it, and the next press counts"]),
         ("a person's on, off or manual ends a forced state",
          {"on_person_change": lambda kind, unit, new_setpoint, now, ctx: dataclasses.replace(
@@ -1043,6 +1133,59 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
          {"is_stale": lambda last_reported, now, stale_minutes: last_reported is not None
           and (now - last_reported).total_seconds() >= stale_minutes * 60},
          ["votes: 90 minutes since the last report is not stale yet"]),
+        ("a cold room with a cooler forecast starts the section resting",
+         {"starts_cold": lambda votes, ctx: False},
+         ["section start: a cold room with a cooler forecast rests, and wakes at its base, "
+          "offset 0",
+          "section start: a quorum just under comfort, voting or not, is a cold room",
+          "section start: a too_hot vote in a section rest is taken: a forced boost, then cool "
+          "at the voted base",
+          "section start: a too_cold vote in a section rest is taken: forced, since kept, "
+          "nothing sent",
+          "leak release in a cold room with a cooler forecast: a section rest"]),
+        ("a section rest wakes at its base, not +1",
+         {"release_offset": lambda unit, change: 0 if unit.forced else unit.offset + change},
+         ["section start: a cold room with a cooler forecast rests, and wakes at its base, "
+          "offset 0"]),
+        ("the cold start needs a cooler forecast",
+         {"starts_cold": lambda votes, ctx: cold_room(votes)},
+         ["section start: a cold room with a forecast mean at or above comfort starts in cool",
+          "section start: no conditions, no outdoor value or no comfort point starts a cold "
+          "room in cool (fail open)"]),
+        ("the cold start needs delta_mean above 0 (>= instead)",
+         {"starts_cold": lambda votes, ctx: cold_room(votes) and ctx.delta_mean is not None
+          and ctx.delta_mean >= 0},
+         ["section start: a cold room with a forecast mean at or above comfort starts in cool"]),
+        ("the cold start needs a cold room", {"starts_cold": lambda votes, ctx: cooler(ctx)},
+         ["section start: a warm room with a cooler forecast starts in cool, ending a section "
+          "rest"]),
+        ("the cold room is a quorum below comfort (votes past the cold edge instead)",
+         {"starts_cold": lambda votes, ctx: cooler(ctx) and votes.met
+          and votes.direction == c.TOO_COLD},
+         ["section start: a quorum just under comfort, voting or not, is a cold room"]),
+        ("a block's rest is the block's, not a section rest",
+         {"section_start": lambda votes, ctx: ("rest", c.START_COLD)
+          if c.starts_cold(votes, ctx) else _SECTION_START(votes, ctx)},
+         ["section start: blocked, a cold room rests for the block, not as a section rest",
+          "section start: a heat source's rest wakes at +1 once it is off, as before"]),
+        ("a vote ends a section rest",
+         {"on_person_vote": lambda direction, unit, now, ctx, chosen=None: (lambda r: (
+             dataclasses.replace(r[0], section_rest=unit.section_rest), r[1]))(
+                 _PERSON_VOTE(direction, unit, now, ctx, chosen))},
+         ["section start: a too_hot vote in a section rest is taken: a forced boost, then cool "
+          "at the voted base",
+          "section start: a too_cold vote in a section rest is taken: forced, since kept, "
+          "nothing sent"]),
+        ("a person's on, off or manual ends a section rest",
+         {"on_person_change": lambda kind, unit, new_setpoint, now, ctx: dataclasses.replace(
+             _PERSON_CHANGE(kind, unit, new_setpoint, now, ctx), section_rest=unit.section_rest)},
+         ["section start: a person's on ends a section rest"]),
+        ("a section rest is no episode",
+         {"in_episode": lambda units: any(c.forced_now(u) or u.section_rest for u in units)},
+         ["section start: a too_hot vote in a section rest is taken: a forced boost, then cool "
+          "at the voted base",
+          "section start: a too_cold vote in a section rest is taken: forced, since kept, "
+          "nothing sent"]),
         ("the reactive_min_delta tolerance (exact setpoint instead)",
          {"_same_setpoint": lambda shown, commanded, min_delta: shown == commanded},
          ["a setpoint within reactive_min_delta of our command is ours"]),

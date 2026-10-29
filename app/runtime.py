@@ -905,6 +905,9 @@ class Runtime:
                 await self._safe_service("input_select", "select_option",
                                          {"entity_id": scene_select_id(room_id), "option": section})
 
+        start, start_detail = await self._section_start(rs, section, cond, pending) \
+            if refire else ("", None)
+
         self.store.record_section_run(
             room_id, run_date, section,
             planned_start=started.isoformat(timespec="seconds") if started else None,
@@ -914,9 +917,10 @@ class Runtime:
         if not refire:
             note = " (catch-up, already in section - not re-fired)"
         self.store.log_event(ts, ts_utc, "info", "crossover",
-                             f"{rs.room['name']} -> {section}{note}", room_id=room_id)
+                             f"{rs.room['name']} -> {section}{note}{start}", room_id=room_id,
+                             detail=start_detail)
         rs.section, rs.section_started = section, started
-        log.info("crossover %s -> %s%s", room_id, section, note)
+        log.info("crossover %s -> %s%s%s", room_id, section, note, start)
         if pending:
             # After the scene has fired, so the forecast never holds it up.
             task = asyncio.create_task(
@@ -926,6 +930,56 @@ class Runtime:
             task.add_done_callback(self._followups.discard)
         else:
             self._settle_section(rs, run_date, ov, cond, kept=decided)
+
+    async def _section_start(self, rs: RoomState, section: str, cond: control.Conditions,
+                             pending: bool) -> tuple[str, dict]:
+        """How the scene starts the room's units, for the crossover event:
+        control.section_start from what the scene reads - the sensors now,
+        against the section's almanac and the conditions just published
+        (their edges and delta_mean), and the heat sources. The scene decides
+        it again in Home Assistant from the same values; a unit the scene
+        forces off, latched by a leak or with no almanac yet starts as
+        before. (": starts in rest: why", detail)."""
+        room = rs.room
+        try:
+            states = {s["entity_id"]: s for s in await self.rest.states()}
+        except Exception as e:
+            log.warning("section start for %s: states fetch failed (%s); using the cache",
+                        room["id"], e)
+            states = {}
+        for eid, s in states.items():
+            self._cache[eid] = s.get("state")
+        readings = {s["id"]: self._sensor_reading(s, room, states) for s in room["sensors"]}
+        alm = self.store.current_almanac(room["id"], as_of=self._today())["sections"].get(section)
+        votes = control.evaluate_votes(readings, alm, cond.cold_edge, cond.warm_edge)
+        heat = [e for e in room.get("heat_sources") or [] if self._cache.get(e) == "on"]
+        ctx = control.Context(setpoint_applied=None, blocked=cond.blocked,
+                              heat_source_on=bool(heat), block_mode=cond.block_mode,
+                              delta_mean=cond.delta_mean)
+        state, why = control.section_start(votes, ctx)
+        usable = sum(p is not None for p in votes.positions.values())
+        need = max(votes.required, 1)
+        sensors = f"{votes.cold_side} of {usable} sensors below their comfort readings " \
+                  f"({need} needed)"
+        mean = None if cond.outdoor_mean is None else \
+            f"the forecast mean {cond.outdoor_mean:.1f}"
+        cp = None if cond.comfort_point is None else f"the comfort point {cond.comfort_point:.1f}"
+        reason = {
+            control.START_BLOCKED: "cooling is blocked",
+            control.START_HEAT_SOURCE: f"{', '.join(heat)} {'is' if len(heat) == 1 else 'are'} on",
+            control.START_COLD: f"{sensors}, and {mean} is below {cp}",
+            control.START_NOT_COOLER: f"{mean} is not below {cp}",
+            control.START_NOT_COLD: sensors,
+            control.START_FAIL_OPEN:
+                "no forecast yet (fetching it), so no cold start: fail open" if pending
+                else "no comfort point, so no cold start: fail open"
+                if cond.fail_open == control.NO_COMFORT_POINT
+                else "no outdoor value, so no cold start: fail open"}[why]
+        return f": starts in {state}: {reason}", {
+            "section": section, "start": state, "why": why, "cold_side": votes.cold_side,
+            "usable": usable, "needed": need, "delta_mean": cond.delta_mean,
+            "comfort_point": cond.comfort_point, "outdoor_mean": cond.outdoor_mean,
+            "heat_sources_on": heat}
 
     # ---- outdoor and conditions -----------------------------------
 

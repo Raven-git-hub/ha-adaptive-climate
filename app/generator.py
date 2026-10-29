@@ -16,8 +16,8 @@ foreign automation. Conflict handling lives in deploy, not here: this
 module never looks at what is already in HA.
 
 The control logic is app/control.py's, rendered as Jinja (docs/V2_DESIGN.md,
-Control: cool or rest): the scene runs on_section_change, maintenance runs
-evaluate_votes and step, the vote automation runs on_button, the
+Control: cool or rest): the scene runs evaluate_votes and on_section_change,
+maintenance runs evaluate_votes and step, the vote automation runs on_button, the
 manual-change automation runs on_climate_change, and the leak automations
 run step's leak rules. Each reads the section's outdoor conditions (phase 5:
 the cooling block and the leaned vote edges) from sensor.ac_conditions_<room>,
@@ -108,6 +108,9 @@ def unblocked_id(room: str, unit: str) -> str:
 
 def forced_id(room: str, unit: str) -> str:
     return f"input_boolean.ac_forced_{room}_{unit}"
+
+def section_rest_id(room: str, unit: str) -> str:
+    return f"input_boolean.ac_section_rest_{room}_{unit}"
 
 # A person's vote: one button per direction per room. Anything may press
 # them (a dashboard, a physical button's automation, the knob); a remote's
@@ -208,6 +211,7 @@ def build_helpers(config: dict) -> list[dict]:
             specs.append(spec(grace_until_id(r, u), has_date=True, has_time=True))
             specs.append(spec(unblocked_id(r, u)))
             specs.append(spec(forced_id(r, u)))
+            specs.append(spec(section_rest_id(r, u)))
         for unit in _leak_units(room):
             specs.append(spec(leak_id(r, unit["id"])))
             specs.append(spec(leak_confirm_id(r, unit["id"])))
@@ -220,7 +224,7 @@ def build_helpers(config: dict) -> list[dict]:
 # Each per-unit template reads the unit's helpers once (_read_unit), runs
 # one entry point of app.control, and renders one dict:
 #
-#   {go, state, offset, base, since, grace, unb, forced, cmd}
+#   {go, state, offset, base, since, grace, unb, forced, srest, cmd}
 #
 # go: write the helpers, and send cmd if there is one. base 0 means unset;
 # since and grace are epoch seconds (whole seconds, as input_datetime keeps
@@ -256,10 +260,11 @@ def _conditions_variables(config: dict, room: dict, section: str,
     """The one place `blocked` and the vote edges come from (decision 62):
     sensor.ac_conditions_<room>, read only while its state is `section` (a
     Jinja expression). Missing, unknown, unavailable or another section's
-    falls back to edges -1/+1 and no block (fail open). Any of the room's
-    heat sources on blocks too, checked live, unless block_mode is off: the
-    conditions' own block_mode, or the config's while there are none.
-    edges: also cold_edge and warm_edge, which only maintenance votes with."""
+    falls back to edges -1/+1, no block and no delta_mean (fail open). Any
+    of the room's heat sources on blocks too, checked live, unless
+    block_mode is off: the conditions' own block_mode, or the config's while
+    there are none. edges: also cold_edge and warm_edge, for the automations
+    that count votes (_votes_variables)."""
     domain, obj = _split(conditions_id(room["id"]))
     mode = (config.get("outdoor") or {}).get("block_mode", control.DEFAULT_BLOCK_MODE)
     heat = " or ".join(f"states('{e}') == 'on'" for e in room.get("heat_sources") or [])
@@ -273,6 +278,7 @@ def _conditions_variables(config: dict, room: dict, section: str,
             "'cold_edge': (a.get('cold_edge') | float(-1.0)) if live else -1.0, "
             "'warm_edge': (a.get('warm_edge') | float(1.0)) if live else 1.0, "
             "'blocked': live and a.get('blocked') == true, "
+            "'delta_mean': (a.get('delta_mean') | float(none)) if live else none, "
             "'block_mode': a.get('block_mode') if a.get('block_mode') in <<MODES>> "
             "else '<<MODE>>'} }}",
             D=domain, O=obj, S=section, MODES=list(control.BLOCK_MODES), MODE=mode),
@@ -286,14 +292,33 @@ def _conditions_variables(config: dict, room: dict, section: str,
     return variables
 
 
+def _votes_variables(config: dict, room: dict, sensors: str) -> dict:
+    """The room's pooled votes (control.evaluate_votes), in one place for
+    every automation that counts them: maintenance at a heartbeat, and the
+    scene and a leak release at a section change (control.starts_cold).
+    sensor_data is the section's learned sensors (`sensors`, a Jinja
+    expression); the vote edges come from _conditions_variables(edges=True),
+    which must come first."""
+    stale = config.get("system", {}).get("sensor_stale_minutes", control.DEFAULT_STALE_MINUTES)
+    return {"sensor_data": f"{{{{ {sensors} }}}}", "votes": _votes_expr(room, stale)}
+
+
 def _sa_live(unit: dict) -> str:
     return f"(unit_data.get('{unit['id']}') or {{}}).get('setpoint_applied')"
 
 
+SENSORS_LIVE = "sect.get('sensors') or {}"      # with _live_section_variables
+
+
+def _sections_literal(room: dict, section: str) -> str:
+    """The almanac's section `section`, for an automation that knows it."""
+    return _fill("((state_attr('<<ALM>>','sections') or {}).get('<<S>>') or {})",
+                 ALM=almanac_id(room["id"]), S=section)
+
+
 def _sa_literal(room: dict, section: str, unit: dict) -> str:
-    return _fill("((((state_attr('<<ALM>>','sections') or {}).get('<<S>>') or {})"
-                 ".get('units') or {}).get('<<U>>') or {}).get('setpoint_applied')",
-                 ALM=almanac_id(room["id"]), S=section, U=unit["id"])
+    return _fill("((<<SECT>>.get('units') or {}).get('<<U>>') or {}).get('setpoint_applied')",
+                 SECT=_sections_literal(room, section), U=unit["id"])
 
 
 def _leak_on(room: dict, unit: dict) -> str:
@@ -304,8 +329,9 @@ def _leak_on(room: dict, unit: dict) -> str:
 
 def _read_unit(room: dict, unit: dict, sa: str, leak: str) -> str:
     """The unit's record and context: st, off, b (0 = unset), since, grace,
-    unb, frc (forced), leak, sa (setpoint_applied), tb (target base), lo and
-    hi (its range), and r, the result namespace, starting as the unit is."""
+    unb, frc (forced), srest (section rest), leak, sa (setpoint_applied), tb
+    (target base), lo and hi (its range), and r, the result namespace,
+    starting as the unit is."""
     r, u = room["id"], unit["id"]
     return _fill(
         "{%- set st = states('<<STATE>>') -%}"
@@ -315,23 +341,24 @@ def _read_unit(room: dict, unit: dict, sa: str, leak: str) -> str:
         "{%- set grace = state_attr('<<GRACE>>', 'timestamp') -%}"
         "{%- set unb = states('<<UNB>>') == 'on' -%}"
         "{%- set frc = states('<<FRC>>') == 'on' -%}"
+        "{%- set srest = states('<<SREST>>') == 'on' -%}"
         "{%- set leak = <<LEAK>> -%}"
         "{%- set sa = <<SA>> -%}"
         "{%- set tb = b if b else sa -%}"
         "{%- set lo = state_attr('<<E>>', 'min_temp') or <<LO>> -%}"
         "{%- set hi = state_attr('<<E>>', 'max_temp') or <<HI>> -%}"
         "{%- set r = namespace(go=false, state=st, offset=off, base=b, since=since, "
-        "grace=grace, unb=unb, forced=frc, cmd=none) -%}",
+        "grace=grace, unb=unb, forced=frc, srest=srest, cmd=none) -%}",
         STATE=state_id(r, u), OFFSET=offset_id(r, u), BASE=base_id(r, u),
         SINCE=since_id(r, u), GRACE=grace_until_id(r, u), UNB=unblocked_id(r, u),
-        FRC=forced_id(r, u),
+        FRC=forced_id(r, u), SREST=section_rest_id(r, u),
         LEAK=leak, SA=sa, E=unit["entity_id"],
         LO=repr(control.DEFAULT_MIN_TEMP), HI=repr(control.DEFAULT_MAX_TEMP))
 
 
 _RESULT = ("{{ {'go': r.go, 'state': r.state, 'offset': r.offset, 'base': r.base, "
            "'since': r.since, 'grace': r.grace, 'unb': r.unb, 'forced': r.forced, "
-           "'cmd': r.cmd} }}")
+           "'srest': r.srest, 'cmd': r.cmd} }}")
 
 
 def _clamp(value: str) -> str:
@@ -355,13 +382,13 @@ def _command(state: str, base: str, offset: str, boost: float) -> str:
 
 def _go(state: str, cfg: control.ControlConfig, offset: str | None = None) -> str:
     """control._go: a transition to `state` (offset capped if given), since
-    = now, and its command. It ends any forced state."""
+    = now, and its command. It ends any forced state and section rest."""
     capped = "" if offset is None else _fill(
         "{%- set r.offset = [[<<O>>, -<<CAP>>] | max, <<CAP>>] | min -%}",
         O=offset, CAP=cfg.offset_cap)
     return capped + _fill(
         "{%- set r.state = '<<S>>' -%}{%- set r.since = now_ts -%}{%- set r.go = true -%}"
-        "{%- set r.forced = false -%}{%- set r.cmd = <<CMD>> -%}",
+        "{%- set r.forced = false -%}{%- set r.srest = false -%}{%- set r.cmd = <<CMD>> -%}",
         S=state, CMD=_command(f"'{state}'", "tb", "r.offset", cfg.boost_degrees))
 
 
@@ -376,16 +403,21 @@ def _leak_trip(cfg: control.ControlConfig) -> str:
 
 
 def _section_change(cfg: control.ControlConfig, forced_off: str) -> str:
-    """control.on_section_change. A cleared grace is written as now, which
-    is no longer in the future."""
+    """control.on_section_change, with control.section_start's rest when
+    `blocked` or when the room starts cold (control.starts_cold: `votes`,
+    and the conditions' delta_mean), marked srest. A cleared grace is
+    written as now, which is no longer in the future."""
     return _fill(
         "{%- set r.offset = 0 -%}{%- set r.base = sa if sa is not none else 0 -%}"
         "{%- set r.unb = false -%}{%- set r.grace = now_ts -%}{%- set r.since = now_ts -%}"
-        "{%- set r.forced = false -%}{%- set r.go = true -%}"
+        "{%- set r.forced = false -%}{%- set r.srest = false -%}{%- set r.go = true -%}"
         "{%- if leak -%}{%- set r.state = 'leak' -%}"
         "{%- elif <<FORCED>> -%}{%- set r.state = 'config_off' -%}"
         "{%- elif sa is none -%}{%- if st == 'leak' -%}{%- set r.state = 'rest' -%}{%- endif -%}"
-        "{%- else -%}{%- set r.state = 'rest' if blocked else 'cool' -%}"
+        "{%- else -%}"
+        "{%- set r.srest = not blocked and conditions.delta_mean is not none and "
+        "conditions.delta_mean > 0 and votes.cold_side >= [votes.required, 1] | max -%}"
+        "{%- set r.state = 'rest' if blocked or r.srest else 'cool' -%}"
         "{%- endif -%}"
         "{%- if leak or <<FORCED>> or sa is not none -%}{%- set r.cmd = <<CMD>> -%}"
         "{%- endif -%}",
@@ -398,8 +430,8 @@ def _forced_off_live(room: dict, unit: dict) -> str:
 
 def _release_offset(change: int) -> str:
     """control.release_offset: a system boost or rest moves the offset a
-    step; a forced one returns to cool at its base."""
-    return f"(0 if frc else off {'+' if change > 0 else '-'} {abs(change)})"
+    step; a forced one, or a section rest, returns to cool at its base."""
+    return f"(0 if frc or srest else off {'+' if change > 0 else '-'} {abs(change)})"
 
 
 def _step(config: dict, room: dict, unit: dict) -> str:
@@ -445,7 +477,7 @@ def _vote(config: dict, direction: str, chosen: str) -> str:
         "{%- else -%}"
         "{%- set nb = <<CLAMP>> -%}"
         "{%- set r.base = nb -%}{%- set r.offset = 0 -%}{%- set r.grace = now_ts -%}"
-        "{%- set r.go = true -%}"
+        "{%- set r.srest = false -%}{%- set r.go = true -%}"
         "{%- if vd == 'too_hot' and blocked -%}{%- set r.unb = true -%}{%- endif -%}"
         "{%- set into = 'rest' if vd == 'too_cold' else 'boost' -%}"
         "{%- if not (vd == 'too_cold' and st == 'user_off') -%}"
@@ -496,7 +528,7 @@ def _change_kind(config: dict) -> str:
 
 def _person_change(config: dict) -> str:
     """control.on_person_change for change.kind: on, off or manual. Each
-    ends a forced state; a latched leak keeps its state."""
+    ends a forced state and a section rest; a latched leak keeps its state."""
     cfg = control.ControlConfig.from_config(config)
     return _fill(
         "{%- set g = now_ts + <<GRACE>> -%}"
@@ -505,13 +537,14 @@ def _person_change(config: dict) -> str:
         "{%- set r.state = 'cool' -%}"
         "{%- set r.base = after.temperature if after.temperature is not none else 0 -%}"
         "{%- set r.offset = 0 -%}{%- set r.unb = true -%}{%- set r.since = now_ts -%}"
-        "{%- set r.grace = g -%}{%- set r.forced = false -%}{%- set r.go = true -%}"
+        "{%- set r.grace = g -%}{%- set r.forced = false -%}{%- set r.srest = false -%}"
+        "{%- set r.go = true -%}"
         "{%- elif change.kind == 'off' -%}"
         "{%- set r.state = 'user_off' -%}{%- set r.since = now_ts -%}"
-        "{%- set r.forced = false -%}{%- set r.go = true -%}"
+        "{%- set r.forced = false -%}{%- set r.srest = false -%}{%- set r.go = true -%}"
         "{%- elif change.kind == 'manual' -%}"
         "{%- set r.state = 'manual' -%}{%- set r.since = now_ts -%}"
-        "{%- set r.forced = false -%}{%- set r.go = true -%}"
+        "{%- set r.forced = false -%}{%- set r.srest = false -%}{%- set r.go = true -%}"
         "{%- endif -%}",
         GRACE=cfg.person_grace_minutes * 60)
 
@@ -554,6 +587,8 @@ def _write_unit(room: dict, unit: dict) -> dict:
               [_set("input_boolean.turn_off", unblocked_id(r, u))]),
         _when(f"{{{{ {v}.forced }}}}", [_set("input_boolean.turn_on", forced_id(r, u))],
               [_set("input_boolean.turn_off", forced_id(r, u))]),
+        _when(f"{{{{ {v}.srest }}}}", [_set("input_boolean.turn_on", section_rest_id(r, u))],
+              [_set("input_boolean.turn_off", section_rest_id(r, u))]),
     ])
 
 
@@ -623,8 +658,12 @@ def build_scene_automation(config: dict, room: dict, section: dict) -> dict:
     scenes = room.get("scenes", {})
     transition = int(scenes.get(sid, {}).get("transition_seconds", 0) or 0)
 
-    variables: dict[str, str] = {"now_ts": NOW_TS,
-                                 **_conditions_variables(config, room, repr(sid))}
+    # The room's votes against the new section's almanac and edges: a cold
+    # room starts the section resting (control.starts_cold).
+    variables: dict[str, str] = {
+        "now_ts": NOW_TS, **_conditions_variables(config, room, repr(sid), edges=True),
+        **_votes_variables(config, room,
+                           f"{_sections_literal(room, sid)}.get('sensors') or {{}}")}
     for unit in room["units"]:
         forced = "true" if sid in _forced_off_sections(room, unit) else "false"
         variables[_unit_var(unit)] = (
@@ -715,7 +754,8 @@ def build_leak_release_automation(config: dict, room: dict, unit: dict) -> dict:
         "condition": condition,
         "variables": {
             **_live_section_variables(room), "now_ts": NOW_TS,
-            **_conditions_variables(config, room, "section"),
+            **_conditions_variables(config, room, "section", edges=True),
+            **_votes_variables(config, room, SENSORS_LIVE),
             # the latch is being released, so it reads as off
             _unit_var(unit): _read_unit(room, unit, _sa_live(unit), "false")
                              + "{%- if st == 'leak' -%}"
@@ -836,12 +876,9 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
     interval = config.get("system", {}).get("heartbeat_interval_minutes", 10)
 
     variables = {
-        **_live_section_variables(room),
-        "sensor_data": "{{ sect.get('sensors') or {} }}",
-        "now_ts": NOW_TS,
+        **_live_section_variables(room), "now_ts": NOW_TS,
         **_conditions_variables(config, room, "section", edges=True),
-        "votes": _votes_expr(room, config.get("system", {}).get(
-            "sensor_stale_minutes", control.DEFAULT_STALE_MINUTES)),
+        **_votes_variables(config, room, SENSORS_LIVE),
     }
     for unit in room["units"]:
         variables[_unit_var(unit)] = (
