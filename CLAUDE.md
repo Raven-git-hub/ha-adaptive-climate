@@ -67,9 +67,10 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
 | `app/deploy.py` | Reconciles generated helpers/automations into HA; owns the `ac_*` namespace; manifest-based automation pruning |
 | `app/runtime.py` | Observer + control loop: scheduler, reactive detector (on/off/manual), HA's `ac_person_vote` events as votes, replay triggers, almanac push, the outdoor forecast (cached, fetched hourly; each section run's mean/max; failing open) |
 | `app/store.py` | CSV + SQLite storage, event log, almanac persistence |
-| `app/main.py` | FastAPI app, lifespan wiring |
+| `app/nowview.py` | The Now view's data, pure: HA states + config + almanac in, one `/api/now` payload out, read as the templates read it (through `app.control`) |
+| `app/main.py` | FastAPI app, lifespan wiring; `/api/now`, the vote and leak-fixed buttons' endpoints |
 | `app/config.py` | Config loading: v1 → v2 migration, v2 defaults, schema validation, unique room ids and unit/sensor ids within a room (other cross-reference checks still to come — Roadmap Phase 9) |
-| `app/static/` | Vanilla-JS UI (no build step) — Now / Analysis / Almanac / Config / Log tabs |
+| `app/static/` | Vanilla-JS UI (no build step) — Now (`now.js`: SVG donut, correction scale, sensor table, buttons) / Analysis / Almanac / Config / Log tabs; light and dark via CSS tokens |
 
 ### Key docs
 
@@ -129,13 +130,17 @@ python tools/control_logic_check.py         # the generated automations replayed
 python tools/deploy_reconcile_check.py      # deploy create / reuse / update / prune
 python tools/runtime_check.py               # runtime observer + control loop
 python tools/leak_response_check.py         # leak detection / OFF / release automations
+python tools/now_api_check.py               # /api/now's shape and values; the vote and leak-fixed endpoints
+python tools/now_render_check.py            # the Now view in headless Chromium (Node Playwright): every state, screenshots
 ```
 
 Run `PYTHONPATH=.` before these if invoking from outside the repo root (most
 scripts also self-insert the repo root via `sys.path`). These harnesses are
 the test suite in the absence of a live HA instance — run the relevant ones
 after touching `app/generator.py`, `app/trust.py`, `app/control.py`, `app/deploy.py`,
-`app/scheduler.py`, `app/store.py`, `app/outdoor.py`, or `app/runtime.py`.
+`app/scheduler.py`, `app/store.py`, `app/outdoor.py`, or `app/runtime.py`; the two
+`now_*` checks after touching `app/nowview.py`, `app/main.py` or `app/static/` (the
+render check refreshes `docs/screenshots/`; commit them with the change).
 
 ## Local dev / Docker
 

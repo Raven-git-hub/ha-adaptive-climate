@@ -31,7 +31,12 @@ like the config and the database.
 Both reconciliation paths only ever create, update, or delete entities whose
 id starts with `ac_` — our namespace, derived from the room's stable id
 (docs/DESIGN.md 13). Deploy never enumerates or deletes anything outside that
-prefix. This is the ownership model from the Phase 5 design discussion:
+prefix. The Now view's buttons (phase 6) stay inside it too: **Too cold** /
+**Too hot** call `input_button.press` on the room's own
+`input_button.ac_too_cold_<room>` / `ac_too_hot_<room>`, and **Leak fixed**
+calls `input_boolean.turn_on` on the unit's own
+`input_boolean.ac_leak_confirmed_<room>_<unit>`. They add no helper or
+automation, so the Now view needs a rebuild and restart, not a deploy. This is the ownership model from the Phase 5 design discussion:
 free-prune our own artifacts, never touch the user's or another integration's.
 
 **Not implemented yet:** detecting a *foreign* automation that also drives one

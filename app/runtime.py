@@ -150,6 +150,12 @@ def _deg(value: float) -> str:
     return text + "0" if text.endswith(".") else text
 
 
+def _accepted(data: dict) -> bool:
+    """ac_person_vote's accepted flag, which a template may render as a
+    string."""
+    return data.get("accepted") is True or str(data.get("accepted")).lower() == "true"
+
+
 def _number(state: str | None, default: float | None = 0.0) -> float | None:
     """An input_number's state string as a float, or default."""
     try:
@@ -261,6 +267,8 @@ class Runtime:
         self._forecast_failed_at: datetime | None = None     # the last failed attempt
         self._forecast_failing = False                       # in a failure streak, as last logged
         self._margins: dict[str, float] = {}                 # room -> the replay's block margin
+        self.last_votes: dict[str, dict] = {}                # room -> HA's latest ac_person_vote
+        self._vote_seq = 0                                   # counts them, for the vote endpoint
         self._stopping = False
 
     # ---- config helpers -------------------------------------------
@@ -528,7 +536,15 @@ class Runtime:
 
     def _on_person_vote(self, event: dict) -> None:
         """An ac_person_vote event from Home Assistant's vote or
-        manual-change automation."""
+        manual-change automation. The latest per room is kept (numbered) for
+        the Now view, which shows a press's outcome."""
+        data = event.get("data") or {}
+        if data.get("room") in self.rooms:
+            self._vote_seq += 1
+            self.last_votes[data["room"]] = {
+                "seq": self._vote_seq, "direction": data.get("direction"),
+                "accepted": _accepted(data), "source": data.get("source"),
+                "unit": data.get("unit"), "at": self._now()[0]}
         task = asyncio.create_task(self._record_vote(event))
         self._followups.add(task)
         task.add_done_callback(self._followups.discard)
@@ -540,7 +556,7 @@ class Runtime:
         data = event.get("data") or {}
         room_id, direction = data.get("room"), data.get("direction")
         source, unit_id, chosen = data.get("source"), data.get("unit"), data.get("chosen")
-        accepted = data.get("accepted") is True or str(data.get("accepted")).lower() == "true"
+        accepted = _accepted(data)
         ts, ts_utc, local_date, now = self._now()
         rs = self.rooms.get(room_id)
         if rs is None or direction not in control.PERSON_VOTES:

@@ -204,11 +204,20 @@ foreign automation:
 
 ## The web UI
 
-Served by the container at `http://<host>:8098`. Dark, desktop-oriented, no
-login (it lives on your LAN). All five views are built:
+Served by the container at `http://<host>:8098`. Phone and desktop, dark and
+light (it follows the device), no login (it lives on your LAN). All five views
+are built:
 
-- **Now** — live per room: each thermostat's state, current temperature and
-  setpoint, each sensor's reading, and the guard/hold/scene status.
+- **Now** — per room, refreshed every 15 s: a donut with fixed arcs (blue rest,
+  green comfortable, amber cool) and one numbered pointer per sensor, placed by
+  its place in its own band so the leaned edges sit on the arc boundaries; the
+  unit's fan and state in the middle; a lock when cooling is blocked (dashed,
+  "would block", in shadow mode; "heater on" for a heat source); a correction
+  scale with the applied setpoint, the section offset, what the unit is driven
+  to now and the forecast; the sensor table, warmest first; **Too cold** and
+  **Too hot** buttons (the room's vote buttons in Home Assistant, which still
+  judges each vote) and **Leak fixed** while a leak is latched; and a status
+  strip for anything needing attention. Screenshots: `docs/screenshots/`.
 - **Analysis** — a three-day chart per room (vendored uPlot): each sensor's
   measured temperature, the learned comfort band per section as a shaded region,
   each unit's setpoint, section boundaries, and a red mark wherever you

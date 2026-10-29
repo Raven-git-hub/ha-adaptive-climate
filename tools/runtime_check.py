@@ -336,6 +336,9 @@ async def main() -> int:
     assert c.execute("SELECT COUNT(*) FROM reactive").fetchone()[0] == 0
     ws.subscribed["ac_person_vote"](vote_event("main_room", "too_cold", source="remote",
                                                chosen=24.0, unit="main_room_ac"))
+    latest = rt.last_votes["main_room"]
+    assert (latest["seq"], latest["direction"], latest["accepted"], latest["source"],
+            latest["unit"]) == (1, "too_cold", True, "remote", "main_room_ac"), latest
     await eventually(lambda: replays(store, "main_room", "vote"), "the vote's replay")
     hold_calls = [c for c in rest.service_calls
                   if c[2].get("entity_id", "").startswith("input_boolean.ac_hold_")]

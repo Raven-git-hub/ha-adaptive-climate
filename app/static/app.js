@@ -1,6 +1,5 @@
 // Adaptive Climate - UI shell (vanilla JS, no build step).
-// Almanac view is built (Phase 15 first slice); Now / Analysis / Config /
-// Log remain placeholders until their data paths land.
+// Views: Now (now.js), Analysis, Almanac, Config and Log.
 
 const view = document.getElementById("view");
 const strip = document.getElementById("status-strip");
@@ -20,6 +19,7 @@ document.querySelectorAll("#tabs button").forEach((b) => {
   b.addEventListener("click", () => {
     document.querySelectorAll("#tabs button").forEach((x) => x.classList.remove("active"));
     b.classList.add("active");
+    NowView.stop();             // the Now view polls only while it is open
     (views[b.dataset.view] || (() => placeholder(b.dataset.view)))();
   });
 });
@@ -115,61 +115,7 @@ poll();
 setInterval(poll, 15000);
 
 // ---- Now --------------------------------------------------------
-
-async function renderNow() {
-  view.innerHTML = `<p class="placeholder">Loading live state\u2026</p>`;
-  let data;
-  try {
-    const r = await fetch("/api/now");
-    if (r.status === 503) {
-      view.innerHTML = `<p class="placeholder">Not connected to Home Assistant yet
-        \u2014 set AC_HA_URL / AC_HA_TOKEN and restart the container.</p>`;
-      return;
-    }
-    data = await r.json();
-  } catch {
-    view.innerHTML = `<p class="placeholder">Could not reach the API.</p>`;
-    return;
-  }
-  if (!data.rooms.length) {
-    view.innerHTML = `<p class="placeholder">No rooms configured yet.</p>`;
-    return;
-  }
-  view.innerHTML = data.rooms.map(renderNowRoom).join("");
-}
-
-function pill(label, on) {
-  return `<span class="pill ${on ? "on" : "off"}">${label}</span>`;
-}
-
-function renderNowRoom(room) {
-  const guardOn = room.guard === "on", holdOn = room.hold === "on";
-  const units = room.units.map((u) => `
-    <tr>
-      <td>${u.name}</td>
-      <td>${u.state ?? "\u2014"}</td>
-      <td>${fmt(u.current_temperature)}\u00b0</td>
-      <td>${fmt(u.setpoint)}\u00b0</td>
-      <td>${u.fan_mode ?? "\u2014"}</td>
-    </tr>`).join("");
-  const sensors = room.sensors.map((s) => `
-    <tr><td>${s.name}</td><td>${s.reading ?? "\u2014"} ${s.unit ?? ""}</td></tr>`).join("");
-
-  return `<section class="room">
-    <h2>${room.name}
-      <span class="muted">scene: ${room.scene ?? "\u2014"}</span>
-      ${pill("active", guardOn)} ${pill("hold", holdOn)}
-    </h2>
-    <table class="now">
-      <tr><th>Unit</th><th>State</th><th>Current</th><th>Setpoint</th><th>Fan</th></tr>
-      ${units || `<tr class="empty"><td colspan="5">no units</td></tr>`}
-    </table>
-    <table class="now sensors">
-      <tr><th>Sensor</th><th>Reading</th></tr>
-      ${sensors || `<tr class="empty"><td colspan="2">no sensors</td></tr>`}
-    </table>
-  </section>`;
-}
+// The Now view lives in now.js (NowView, renderNow).
 
 // ---- Config -------------------------------------------------------
 
@@ -989,3 +935,5 @@ async function loadLog() {
     });
   });
 }
+
+renderNow();                    // the Now tab is the one open at load

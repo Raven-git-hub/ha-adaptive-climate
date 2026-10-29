@@ -340,80 +340,138 @@ async def api_deploy() -> dict:
     return report.as_dict()
 
 
+def _outdoor_failing() -> str | None:
+    """The outdoor warning in force, if the latest outdoor streak event
+    says the forecast (or the source) is failing."""
+    if not state.store:
+        return None
+    for e in state.store.recent_events(limit=200, category="outdoor"):
+        detail = e.get("detail") or {}
+        if "failing" in detail:
+            return e["message"] if detail["failing"] else None
+    return None
+
+
+def _enabled_room(config: dict, room_id: str) -> dict:
+    room = next((r for r in config.get("rooms", [])
+                 if r.get("id") == room_id and r.get("enabled", True)), None)
+    if room is None:
+        raise HTTPException(404, f"no enabled room {room_id!r}")
+    return room
+
+
 @app.get("/api/now")
 async def api_now() -> dict:
-    """Live state for the Now view: per room, the guard/hold/scene helpers
-    plus each unit's and sensor's current reading from Home Assistant."""
-    rest, _ = _ha_clients()
+    """Everything the Now view draws, in one poll (app/nowview.py): per
+    room the section, each unit's control helpers and what it is driven to,
+    the almanac section, each sensor's reading, staleness and place in its
+    band, the conditions entity, the block, leak latches and holds, the
+    margin and the latest vote; and the status strip's warnings. With Home
+    Assistant out of reach it still answers, with that as the warning."""
+    from zoneinfo import ZoneInfo
+    from app import nowview
+    cfg = _raw_config()
+    try:
+        validate(cfg)
+        config_error = None
+    except ConfigError as e:
+        config_error = str(e)
+    runtime = state.runtime
+    try:
+        rest, _ = _ha_clients()
+    except HTTPException as e:
+        return {"connected": False, "rooms": [], "warnings": [
+            {"level": "error", "room": None, "kind": "connection", "text": e.detail}]}
     try:
         states = {s["entity_id"]: s for s in await rest.states()}
+        tz = getattr(runtime, "tz", None) or ZoneInfo(
+            (await rest.config()).get("time_zone") or "UTC")
+    except Exception as e:
+        return {"connected": False, "rooms": [], "warnings": [
+            {"level": "error", "room": None, "kind": "connection",
+             "text": f"Home Assistant can't be reached: {e}"}]}
     finally:
         await rest.close()
+    now = datetime.now(tz)
+    rooms = [r for r in cfg.get("rooms", []) if r.get("enabled", True)]
+    almanacs = {r["id"]: state.store.current_almanac(r["id"], as_of=now.date())
+                for r in rooms} if state.store else {}
+    if runtime is not None:
+        margins = {r["id"]: runtime.margin(r["id"]) for r in rooms  # type: ignore[attr-defined]
+                   if r["id"] in runtime.rooms}                      # type: ignore[attr-defined]
+        last_votes = dict(runtime.last_votes)                        # type: ignore[attr-defined]
+    else:
+        margins = {r["id"]: learn_margin(state.store._conn, r, MarginConfig.from_config(cfg),
+                                         now)[0] for r in rooms} if state.store else {}
+        last_votes = {}
+    return nowview.build_now(cfg, states, almanacs, now, margins, last_votes,
+                             _outdoor_failing(), config_error)
 
-    from app.generator import guard_id, hold_id, scene_select_id
 
-    cfg = _raw_config()
-    rooms_out = []
-    for room in cfg.get("rooms", []):
-        if not room.get("enabled", True):
-            continue
-        r = room["id"]
+VOTE_WAIT_SECONDS = 4.0
 
-        def st(entity_id: str) -> dict | None:
-            s = states.get(entity_id)
-            if not s:
-                return None
-            return {"state": s.get("state"), "attributes": s.get("attributes", {})}
 
-        units_out = []
-        for u in room.get("units", []):
-            s = st(u["entity_id"])
-            attrs = (s or {}).get("attributes", {})
-            units_out.append({
-                "id": u["id"], "name": u.get("name", u["id"]), "entity_id": u["entity_id"],
-                "state": (s or {}).get("state"),
-                "current_temperature": attrs.get("current_temperature"),
-                "setpoint": attrs.get("temperature"),
-                "fan_mode": attrs.get("fan_mode"),
-            })
-        sensors_out = []
-        for sconf in room.get("sensors", []):
-            source = sconf.get("source") or {}
-            if source.get("type") == "unit_attribute":
-                # virtual: read the referenced unit's current_temperature
-                uid = source.get("unit_id")
-                unit = next((u for u in room.get("units", []) if u["id"] == uid), None)
-                reading = None
-                if unit:
-                    ua = st(unit["entity_id"]) or {}
-                    reading = (ua.get("attributes") or {}).get(
-                        source.get("attribute", "current_temperature"))
-                sensors_out.append({
-                    "id": sconf["id"], "name": sconf.get("name", sconf["id"]),
-                    "entity_id": f"(from {unit['entity_id']})" if unit else "(virtual)",
-                    "reading": reading, "unit": "\u00b0C",
-                })
-            else:
-                s = st(sconf["entity_id"])
-                sensors_out.append({
-                    "id": sconf["id"], "name": sconf.get("name", sconf["id"]),
-                    "entity_id": sconf["entity_id"],
-                    "reading": (s or {}).get("state"),
-                    "unit": ((s or {}).get("attributes", {}) or {}).get("unit_of_measurement"),
-                })
+@app.post("/api/rooms/{room_id}/vote")
+async def api_vote(room_id: str, body: dict) -> dict:
+    """Press the room's too_cold or too_hot button in Home Assistant, as a
+    dashboard would. Home Assistant's vote automation decides whether the
+    vote is accepted (one correction per episode) and reports it in
+    ac_person_vote; with the runtime live, this waits up to
+    VOTE_WAIT_SECONDS for that report and returns it as `outcome` (None:
+    not heard in time, which the UI shows as "sent")."""
+    import asyncio
+    from app import control
+    from app.generator import button_id
+    _enabled_room(_raw_config(), room_id)
+    direction = (body or {}).get("direction")
+    if direction not in control.PERSON_VOTES:
+        raise HTTPException(400, f"direction must be one of {', '.join(control.PERSON_VOTES)}")
+    entity = button_id(room_id, direction)
+    runtime = state.runtime
+    votes = getattr(runtime, "last_votes", None)
+    seq = ((votes or {}).get(room_id) or {}).get("seq", 0)
+    rest, _ = _ha_clients()
+    try:
+        await rest.call_service("input_button", "press", {"entity_id": entity})
+    except Exception as e:
+        raise HTTPException(502, f"Home Assistant didn't take the press: {e}")
+    finally:
+        await rest.close()
+    outcome = None
+    if votes is not None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + VOTE_WAIT_SECONDS
+        while loop.time() < deadline:
+            latest = votes.get(room_id)
+            if latest and latest["seq"] > seq:
+                outcome = latest
+                break
+            await asyncio.sleep(0.1)
+    return {"pressed": entity, "direction": direction, "outcome": outcome}
 
-        guard = st(guard_id(r))
-        hold = st(hold_id(r))
-        scene = st(scene_select_id(r))
-        rooms_out.append({
-            "id": r, "name": room.get("name", r),
-            "guard": (guard or {}).get("state"),
-            "hold": (hold or {}).get("state"),
-            "scene": (scene or {}).get("state"),
-            "units": units_out,
-            "sensors": sensors_out,
-        })
-    return {"rooms": rooms_out}
+
+@app.post("/api/rooms/{room_id}/units/{unit_id}/leak-fixed")
+async def api_leak_fixed(room_id: str, unit_id: str) -> dict:
+    """A person confirms a latched leak is fixed: turns on the unit's
+    input_boolean.ac_leak_confirmed_<room>_<unit>. Home Assistant's leak
+    release automation then releases the latch, if the leak sensor no
+    longer reads wet, and treats the unit as at a section change."""
+    from app.generator import leak_confirm_id
+    room = _enabled_room(_raw_config(), room_id)
+    unit = next((u for u in room.get("units", []) if u["id"] == unit_id), None)
+    if unit is None:
+        raise HTTPException(404, f"no unit {unit_id!r} in {room_id!r}")
+    if not unit.get("leak_detection", {}).get("enabled"):
+        raise HTTPException(400, f"{unit_id!r} has no leak detection")
+    entity = leak_confirm_id(room_id, unit_id)
+    rest, _ = _ha_clients()
+    try:
+        await rest.call_service("input_boolean", "turn_on", {"entity_id": entity})
+    except Exception as e:
+        raise HTTPException(502, f"Home Assistant didn't take it: {e}")
+    finally:
+        await rest.close()
+    return {"confirmed": entity}
 
 
 @app.middleware("http")
