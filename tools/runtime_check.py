@@ -35,6 +35,23 @@ Store (no Home Assistant, no network). Verifies:
   * a sleep section run crossing midnight closes against its start date
   * on restart, comfort-window replays are re-armed for recent setpoint-moving
     reactions only
+  * outdoor input (phase 4), with outdoor.source 'forecast' and a stubbed
+    weather.get_forecasts: fetched once at startup (the rooms' catch-up
+    crossovers and the hourly loop share it) and again by the loop only
+    once the cache is an hour old; at a crossover the cache is reused when
+    under 2 hours old and refetched otherwise; a section run records the
+    mean and max of the hours in [planned start, next section's planned
+    start) - a normal window, sleep across midnight, and a window the
+    forecast covers only part of, said so in the event - and a catch-up
+    inside a run that has them keeps them; a service error, an unavailable
+    entity, an empty forecast and a timeout each fail open (no value, the
+    crossover not held up), with exactly one warning per failure streak
+    (not repeated after a restart) and one info event on recovery, and
+    rooms crossing together make one attempt; heartbeats and reactions
+    record the weather entity's temperature, null when it is unavailable
+    or last updated more than 3 hours ago; with source 'none', null; the
+    real REST client posts to ?return_response, returns service_response,
+    and raises its own timeout as HATimeoutError
 
     PYTHONPATH=. python tools/runtime_check.py
 """
@@ -51,6 +68,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app.runtime as runtime_mod                               # noqa: E402
+from app.ha import HAError                                       # noqa: E402
 from app.runtime import Runtime                                  # noqa: E402
 from app.store import Store, UnitSample                          # noqa: E402
 from app.generator import SECTIONS                               # noqa: E402
@@ -228,6 +246,7 @@ async def main() -> int:
     hbu = c.execute("SELECT setpoint, is_on, ac_state FROM heartbeat_unit").fetchone()
     assert hb == 1 and hbs == 3, (hb, hbs)
     assert hbu[0] == 22.0 and hbu[1] == 1 and hbu[2] == "normal", tuple(hbu)
+    assert c.execute("SELECT outdoor_temp FROM heartbeat").fetchone()[0] is None   # source none
     print(f"heartbeat: recorded 1 heartbeat, 3 sensors, unit setpoint 22 state 'normal' - OK")
 
     # --- the first heartbeat in an unseeded section replays and pushes ---
@@ -591,6 +610,7 @@ async def main() -> int:
     store.close()
     await check_startup_race()
     await check_stale_sensor()
+    await check_outdoor()
     print("\nALL RUNTIME CHECKS PASSED")
     return 0
 
@@ -731,6 +751,323 @@ async def check_stale_sensor() -> None:
           "unavailable and is left out of a vote's and a window's reaction snapshot; one "
           "warning when it went "
           "stale, none repeated after a restart, one event when it reported again - OK")
+
+
+# Forecast temperatures by local hour (any other hour: 26.0). Sunset,
+# 16:00-20:30, holds 16..20: mean 24.1, max 25.3. Sleep, 22:00-05:30, holds
+# 22..05: mean 21.25, max 23.0. 21:00 and 06:00 sit just outside them.
+TEMPS = {15: 27.0, 16: 25.3, 17: 24.6, 18: 24.0, 19: 23.5, 20: 23.1, 21: 30.0,
+         22: 23.0, 23: 22.5, 0: 22.0, 1: 21.5, 2: 21.0, 3: 20.5, 4: 20.0, 5: 19.5, 6: 25.0}
+
+
+class ForecastRest(StubRest):
+    """StubRest with weather.get_forecasts: 48 hourly entries from the
+    current hour, as Home Assistant returns them, or a failure as `mode`
+    says (error, timeout, empty)."""
+    def __init__(self, states, clock, mode="ok"):
+        super().__init__(states)
+        self.clock, self.mode, self.forecast_calls = clock, mode, []
+
+    async def call_service(self, domain, service, data=None, *, return_response=False):
+        if (domain, service) != ("weather", "get_forecasts"):
+            return await super().call_service(domain, service, data)
+        assert return_response and data == {"entity_id": "weather.home", "type": "hourly"}, data
+        self.forecast_calls.append(self.clock["t"])
+        if self.mode == "error":
+            raise HAError("500: Internal Server Error")
+        if self.mode == "timeout":
+            await asyncio.sleep(5)
+        if self.mode == "empty":
+            return {"weather.home": {"forecast": []}}
+        first = self.clock["t"].replace(minute=0, second=0, microsecond=0)
+        hours = [first + timedelta(hours=k) for k in range(48)]
+        return {"weather.home": {"forecast": [
+            {"datetime": h.astimezone(timezone.utc).isoformat(), "condition": "sunny",
+             "temperature": TEMPS.get(h.hour, 26.0)} for h in hours]}}
+
+
+async def check_outdoor() -> None:
+    """Phase 4: the forecast fetch and cache, the section run's mean and
+    max, failures failing open, and the point value on heartbeats and
+    reactions."""
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+    tmp = Path(tempfile.mkdtemp())
+    store = Store(tmp, SCHEMA)
+    config = json.loads(json.dumps(CONFIG))
+    config["outdoor"].update(source="forecast", weather_entity="weather.home")
+    clock = {"t": datetime(2026, 8, 3, 15, 50, 0, tzinfo=hk)}
+    states = _build_states()
+    weather = {"entity_id": "weather.home", "state": "sunny",
+               "attributes": {"temperature": 30.5, "supported_features": 3},
+               "last_updated": clock["t"].astimezone(utc).isoformat()}
+    states.append(weather)
+    c = store._conn
+
+    def runtime(rest) -> Runtime:
+        rt = Runtime(config, store, rest, StubWS(), tmp)
+        rt._now = lambda: (clock["t"].isoformat(timespec="seconds"),
+                           clock["t"].astimezone(utc).isoformat(timespec="seconds"),
+                           clock["t"].date().isoformat(), clock["t"])
+        return rt
+
+    async def settle(rt) -> None:
+        """Let the crossovers' outdoor follow-ups finish."""
+        await asyncio.sleep(0)
+        await asyncio.gather(*[t for t in list(rt._followups)
+                               if t.get_name().startswith("ac-outdoor-")])
+
+    def run(room: str, day: str, section: str) -> tuple:
+        return tuple(c.execute("SELECT outdoor_mean, outdoor_max FROM section_run WHERE "
+                               "room_id = ? AND local_date = ? AND section = ?",
+                               (room, day, section)).fetchone())
+
+    def said(room: str, section: str) -> list[str]:
+        return [e["message"] for e in reversed(store.recent_events(
+            limit=1000, room_id=room, category="outdoor"))
+            if (e.get("detail") or {}).get("section") == section]
+
+    def streak_events() -> list[tuple]:
+        return [(e["severity"], e["detail"]["failing"], e["detail"].get("kind")) for e in
+                reversed(store.recent_events(limit=1000, category="outdoor"))
+                if "failing" in (e.get("detail") or {})]
+
+    def set_weather(state: str) -> None:
+        weather["state"] = state
+        rt._on_state_change({"event_type": "state_changed", "context": {},
+                             "data": {"entity_id": "weather.home", "old_state": {},
+                                      "new_state": {"state": state}}})
+
+    # --- startup: one fetch, shared by three catch-up crossovers and the loop ---
+    rest = ForecastRest(states, clock)
+    rt = runtime(rest)
+    await rt.start()
+    await settle(rt)
+    await asyncio.sleep(0.1)                         # the forecast loop's first pass
+    assert rest.forecast_calls == [clock["t"]], rest.forecast_calls
+    # 15:50, inside Afternoon (14:00-16:00); the forecast starts at 15:00
+    assert run("main_room", "2026-08-03", "afternoon") == (27.0, 27.0)
+    assert said("main_room", "afternoon") == [
+        "Main Room -> afternoon: forecast mean 27.0, max 27.0 over 15:00-16:00 only "
+        "(weather.home): the forecast covers 1 of the 2 hours in 14:00-16:00"], \
+        said("main_room", "afternoon")
+    print("outdoor: startup fetched the forecast once for three catch-up crossovers and the "
+          "hourly loop; Afternoon, which it covers only from 15:00, records what is covered "
+          "and says so - OK")
+
+    # --- a normal window, from the cache (10 minutes old) ---
+    main = rt.rooms["main_room"]
+    clock["t"] = datetime(2026, 8, 3, 16, 0, 5, tzinfo=hk)
+    await rt._crossover(main, "sunset", datetime(2026, 8, 3, 16, 0, tzinfo=hk), catch_up=False)
+    await settle(rt)
+    assert len(rest.forecast_calls) == 1, "a 10-minute-old forecast was fetched again"
+    assert run("main_room", "2026-08-03", "sunset") == (24.1, 25.3), \
+        run("main_room", "2026-08-03", "sunset")
+    assert said("main_room", "sunset") == [
+        "Main Room -> sunset: forecast mean 24.1, max 25.3 over 16:00-20:30 (weather.home)"]
+    # --- sleep across midnight, refetched (the cache is 6 hours old) ---
+    clock["t"] = datetime(2026, 8, 3, 22, 0, 5, tzinfo=hk)
+    await rt._crossover(main, "sleep", datetime(2026, 8, 3, 22, 0, tzinfo=hk), catch_up=False)
+    await settle(rt)
+    assert rest.forecast_calls[1:] == [clock["t"]], rest.forecast_calls
+    assert run("main_room", "2026-08-03", "sleep") == (21.25, 23.0), \
+        run("main_room", "2026-08-03", "sleep")
+    assert said("main_room", "sleep") == [
+        "Main Room -> sleep: forecast mean 21.2, max 23.0 over 22:00-05:30 (weather.home)"]
+    print("outdoor: Sunset 16:00-20:30 from the 10-minute-old cache (mean 24.1, max 25.3); "
+          "Sleep 22:00-05:30 across midnight, refetched (mean 21.25, max 23.0); the hours "
+          "just outside each window left out - OK")
+
+    # --- the cache: under 2 hours reused, over refetched ---
+    fetched = clock["t"]
+    clock["t"] = fetched + timedelta(hours=1, minutes=59)
+    assert await rt._forecast_for(runtime_mod.outdoor.CACHE_MAX_AGE) is rt._forecast
+    assert len(rest.forecast_calls) == 2
+    clock["t"] = fetched + timedelta(hours=2, minutes=1)
+    await rt._forecast_for(runtime_mod.outdoor.CACHE_MAX_AGE)
+    assert rest.forecast_calls[2:] == [clock["t"]] and rt._forecast.fetched_at == clock["t"]
+    print("outdoor: a crossover reuses a forecast 1 h 59 min old and refetches one 2 h 01 "
+          "min old - OK")
+    await rt.stop()
+
+    # --- a restart inside Sleep: the run keeps the values decided at 22:00 ---
+    clock["t"] = datetime(2026, 8, 4, 1, 0, 0, tzinfo=hk)
+    rest = ForecastRest(states, clock)
+    rt = runtime(rest)
+    await rt.start()
+    await settle(rt)
+    await asyncio.sleep(0.1)
+    assert rest.forecast_calls == [clock["t"]], rest.forecast_calls
+    assert run("main_room", "2026-08-03", "sleep") == (21.25, 23.0)
+    assert len(said("main_room", "sleep")) == 1, said("main_room", "sleep")
+    # a room with no Sleep run yet gets what the forecast still covers, 01..05
+    assert run("baby_room", "2026-08-03", "sleep") == (20.5, 21.5)
+    assert "covers 5 of the 8 hours in 22:00-05:30" in said("baby_room", "sleep")[0]
+    print("outdoor: a 01:00 restart inside Sleep keeps the values recorded at 22:00; a room "
+          "starting its Sleep run then records the 5 of 8 hours still forecast - OK")
+
+    # --- failures fail open: one warning per streak, one event on recovery ---
+    saved_timeout = runtime_mod.FORECAST_TIMEOUT_SECONDS
+    runtime_mod.FORECAST_TIMEOUT_SECONDS = 0.3
+    try:
+        for i, mode in enumerate(("error", "unavailable", "empty", "timeout")):
+            day = datetime(2026, 8, 5 + i, 8, 0, tzinfo=hk)
+            clock["t"] = day + timedelta(seconds=5)
+            if mode == "unavailable":
+                set_weather("unavailable")
+            else:
+                rest.mode = mode
+            calls, before = len(rest.forecast_calls), streak_events()
+            loop = asyncio.get_running_loop()
+            began = loop.time()
+            for rs in rt.rooms.values():                 # three rooms cross together
+                await rt._crossover(rs, "day", day, catch_up=False)
+            assert loop.time() - began < 0.2, "a failing forecast held up the crossovers"
+            assert all(("automation", "trigger", {"entity_id": f"automation.ac_{r}_day"})
+                       in rest.service_calls for r in rt.rooms), mode
+            await settle(rt)
+            assert len(rest.forecast_calls) == calls + (mode != "unavailable"), \
+                (mode, rest.forecast_calls[calls:])
+            for r in rt.rooms:
+                assert run(r, day.date().isoformat(), "day") == (None, None), (mode, r)
+            assert said("main_room", "day")[-1] == ("Main Room -> day: no forecast from "
+                                                    "weather.home, so no outdoor value for "
+                                                    "08:00-14:00"), said("main_room", "day")
+            clock["t"] += timedelta(minutes=10)          # the next try fails too
+            assert await rt._forecast_for(runtime_mod.FORECAST_REFRESH) is None
+            assert streak_events()[len(before):] == [("warning", True, mode)], \
+                (mode, streak_events())
+            clock["t"] += timedelta(minutes=10)          # and then it works again
+            if mode == "unavailable":
+                set_weather("sunny")
+            else:
+                rest.mode = "ok"
+            assert await rt._forecast_for(runtime_mod.FORECAST_REFRESH) is rt._forecast
+            assert streak_events()[len(before):] == [("warning", True, mode),
+                                                      ("info", False, None)], streak_events()
+        warning = next(e["message"] for e in store.recent_events(
+            limit=1000, category="outdoor", severity="warning")
+            if (e.get("detail") or {}).get("kind") == "timeout")
+        assert warning.startswith("Outdoor forecast from weather.home failed: no answer "
+                                  "within 0.3 s. Section runs get no forecast values until it "
+                                  "works again"), warning
+        print("outdoor: a service error, an unavailable entity, an empty forecast and a "
+              "timeout each fail open - the crossovers fire at once, three rooms share one "
+              "attempt, their runs keep no value - with one warning per streak, not "
+              "repeated by the next failed try, and one info event on recovery - OK")
+
+        # a restart inside a streak doesn't warn again
+        clock["t"] = datetime(2026, 8, 10, 12, 0, tzinfo=hk)
+        rest.mode = "error"
+        assert await rt._forecast_for(runtime_mod.FORECAST_REFRESH) is None
+        n = len(streak_events())
+        await rt.stop()
+        clock["t"] += timedelta(minutes=5)
+        rest = ForecastRest(states, clock, mode="error")
+        rt = runtime(rest)
+        await rt.start()
+        await settle(rt)
+        await asyncio.sleep(0.1)
+        assert rest.forecast_calls and len(streak_events()) == n, streak_events()[n - 1:]
+        clock["t"] += timedelta(minutes=5)
+        rest.mode = "ok"
+        await rt._forecast_for(runtime_mod.FORECAST_REFRESH)
+        assert streak_events()[n:] == [("info", False, None)], streak_events()[n - 1:]
+        print("outdoor: a restart inside a failure streak doesn't repeat its warning; the "
+              "recovery is still logged once - OK")
+    finally:
+        runtime_mod.FORECAST_TIMEOUT_SECONDS = saved_timeout
+
+    # --- heartbeats and reactions record the weather entity's temperature ---
+    main = rt.rooms["main_room"]
+
+    def outdoor_temps(table: str) -> list:
+        return [r[0] for r in c.execute(
+            f"SELECT outdoor_temp FROM {table} WHERE room_id = 'main_room' ORDER BY id")]
+    beats = len(outdoor_temps("heartbeat"))
+    for age, state in ((timedelta(0), "sunny"), (timedelta(hours=3), "sunny"),
+                       (timedelta(hours=3, minutes=1), "sunny"), (timedelta(0), "unavailable")):
+        clock["t"] += timedelta(minutes=10)
+        weather["last_updated"] = (clock["t"] - age).astimezone(utc).isoformat()
+        weather["state"] = state
+        await rt._do_heartbeat(main)
+    assert outdoor_temps("heartbeat")[beats:] == [30.5, 30.5, None, None], \
+        outdoor_temps("heartbeat")[beats:]
+    weather.update(state="sunny", last_updated=clock["t"].astimezone(utc).isoformat())
+    await rt._record_vote(vote_event("main_room", "too_cold"))               # a vote
+    clock["t"] += timedelta(seconds=5)
+    rt._on_state_change(_state_changed("climate.lounge_lounge", 22.0, 22.0, state="cool",
+                                       new_state="off"))
+    await rt._flush_reactive(main)                                            # a window
+    clock["t"] += timedelta(hours=3, minutes=1)              # the entity hasn't updated since
+    await rt._record_vote(vote_event("main_room", "too_hot"))
+    reactions = [tuple(r) for r in c.execute(
+        "SELECT kind, outdoor_temp FROM reactive WHERE room_id = 'main_room' ORDER BY id")]
+    assert reactions[-3:] == [("too_cold", 30.5), ("off", 30.5), ("too_hot", None)], reactions
+    print("outdoor: heartbeats, a vote and a window record the weather entity's 30.5; null "
+          "when it is unavailable or last updated more than 3 hours ago (exactly 3 is still "
+          "fresh) - OK")
+    await rt.stop()
+
+    # --- the hourly loop refetches only once the cache is an hour old ---
+    saved_refresh = runtime_mod.FORECAST_REFRESH
+    runtime_mod.FORECAST_REFRESH = timedelta(seconds=0.3)    # the loop's sleep and its age
+    try:
+        rest = ForecastRest(states, clock)
+        rt = runtime(rest)
+        await rt.start()
+        await settle(rt)
+        await asyncio.sleep(0.7)                  # two more passes; the clock hasn't moved
+        assert len(rest.forecast_calls) == 1, rest.forecast_calls
+        clock["t"] += timedelta(hours=1)
+        await eventually(lambda: len(rest.forecast_calls) == 2, "the hourly refetch")
+        await rt.stop()
+    finally:
+        runtime_mod.FORECAST_REFRESH = saved_refresh
+    print("outdoor: the forecast loop refetches once the cached forecast is FORECAST_REFRESH "
+          "old, not before - OK")
+
+    # --- the real REST client: asks for the response, maps its own timeout ---
+    import httpx
+    from app.ha import HARest, HATimeoutError
+    seen = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.url.query.decode(),
+                     json.loads(request.content)))
+        if mode["timeout"]:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json={"changed_states": [], "service_response": {
+            "weather.home": {"forecast": [{"datetime": "2026-08-12T08:00:00+00:00",
+                                           "temperature": 29.0}]}}})
+    mode = {"timeout": False}
+    client = HARest("http://ha.test:8123", "token")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    got = await client.call_service("weather", "get_forecasts",
+                                    {"entity_id": "weather.home", "type": "hourly"},
+                                    return_response=True)
+    assert seen == [("POST", "/api/services/weather/get_forecasts", "return_response",
+                     {"entity_id": "weather.home", "type": "hourly"})], seen
+    assert list(got) == ["weather.home"] and \
+        runtime_mod.outdoor.parse_forecast(got, "weather.home")[0].temperature == 29.0
+    mode["timeout"] = True
+    try:
+        await client.call_service("weather", "get_forecasts", {}, return_response=True)
+    except HATimeoutError as e:
+        assert str(e) == "weather.get_forecasts: no answer within 10 s", e
+    else:
+        raise AssertionError("an httpx timeout wasn't raised as HATimeoutError")
+    clock["t"] += timedelta(hours=3)                 # through the runtime: a timeout warning
+    rt = runtime(client)
+    rt._cache["weather.home"] = "sunny"
+    n = len(streak_events())
+    assert await rt._fetch_forecast() is None
+    assert streak_events()[n:] == [("warning", True, "timeout")], streak_events()[n:]
+    assert "failed: weather.get_forecasts: no answer within 10 s." in store.recent_events(
+        category="outdoor", severity="warning")[0]["message"]
+    await client.close()
+    store.close()
+    print("outdoor: the REST client posts to ?return_response and returns service_response; "
+          "its own timeout is an HATimeoutError, logged as a timeout failure - OK")
 
 
 if __name__ == "__main__":

@@ -86,3 +86,13 @@ def active_section_at(profile: dict, when: datetime,
     yesterday = compute_day(profile, today - timedelta(days=1), tzinfo)
     active = yesterday[-1]
     return active.section, active.planned
+
+
+def section_window(profile: dict, section: str, started: datetime,
+                   tzinfo=None) -> tuple[datetime, datetime]:
+    """A section run's window, [its planned start, the next section's
+    planned start), given the start active_section_at returned. The day's
+    last section (sleep) ends at the next day's first, across midnight."""
+    run = next(b for b in compute_day(profile, started.date(), tzinfo)
+               if b.section == section)
+    return run.planned, run.ends

@@ -54,7 +54,8 @@ HEARTBEAT_CSV = ["ts", "ts_utc", "section", "occupied", "any_unit_on",
 REACTIVE_CSV = ["ts", "ts_utc", "section", "window_seconds", "occupied",
                 "suspended_maint", "units", "sensors",
                 "kind", "outdoor_temp"]                             # v2
-# One row when a section run starts and one when it closes. Re-ingest
+# One row when a section run starts, one when its forecast has been read
+# (outdoor_mean and outdoor_max only) and one when it closes. Re-ingest
 # merges a day file's rows per section in order; a blank field leaves the
 # earlier value, matching record_section_run's upsert.
 SECTION_RUN_CSV = ["section", "planned_start", "actual_start", "ended_at",
@@ -522,6 +523,22 @@ class Store:
             self._conn.commit()
         return run["local_date"], run["section"]
 
+    def record_section_outdoor(self, room_id: str, local_date: str, section: str,
+                               outdoor_mean: float | None,
+                               outdoor_max: float | None) -> None:
+        """Set a section run's forecast mean and max, decided just after its
+        crossover fired. Its CSV row carries only those two (re-ingest merges
+        the blanks into the run's start row), and the SQLite row is updated
+        in place."""
+        self._append_csv(room_id, local_date, "section_run", SECTION_RUN_CSV,
+                         [section] + [None] * 5 + [outdoor_mean, outdoor_max] + [None] * 4)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE section_run SET outdoor_mean=?, outdoor_max=? "
+                "WHERE room_id=? AND local_date=? AND section=?",
+                (outdoor_mean, outdoor_max, room_id, local_date, section))
+            self._conn.commit()
+
     def log_event(self, ts: str, ts_utc: str, severity: str, category: str,
                   message: str, room_id: str | None = None,
                   detail: dict | None = None) -> int:
@@ -555,6 +572,17 @@ class Store:
         raise NotImplementedError("CSV re-ingest (recovery path) - required before Gate A")
 
     # --- reads -----------------------------------------------------
+    def section_run_outdoor(self, room_id: str, local_date: str,
+                            section: str) -> tuple[float | None, float | None] | None:
+        """(outdoor_mean, outdoor_max) of one section run, or None if there
+        is no such run."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT outdoor_mean, outdoor_max FROM section_run "
+                "WHERE room_id=? AND local_date=? AND section=?",
+                (room_id, local_date, section)).fetchone()
+        return None if row is None else (row["outdoor_mean"], row["outdoor_max"])
+
     def reactions_since(self, room_id: str, since_utc: str) -> list[tuple[str, str | None, dict]]:
         """(ts_utc, kind, {unit_id: (setpoint_before, setpoint_after)}) of the
         room's reactions at or after since_utc, oldest first. The runtime uses

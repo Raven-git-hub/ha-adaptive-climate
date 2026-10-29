@@ -105,6 +105,15 @@ the current section's scene automation in HA to start a room at once).
 
 - **For the v1 → v2 cutover, follow `docs/V2_CUTOVER.md`**, including
   `tools/doctor.py --v2-preflight` and the rollback steps.
+- **Check the weather entity with the doctor before setting the outdoor
+  source.** Its outdoor step (step 7, run with or without `--v2-preflight`,
+  which is now step 8) lists every `weather.*` entity with its current
+  temperature and whether it offers an hourly forecast, and shows the
+  configured `outdoor.weather_entity`'s next 6 hourly entries. With
+  `outdoor.source: forecast`, a configured entity that is missing, has no
+  hourly forecast or returns an empty one fails the doctor; with another
+  source it is a warning. The outdoor input adds no helper or automation:
+  changing `outdoor.*` needs a restart, not a deploy.
 - **Run `/api/deploy/check` (or the Config page's "Check deploy" button)
   first.** It is the dry run: it verifies entity existence, names any hold
   that is on, and lists exactly what Deploy would create, reuse, update,

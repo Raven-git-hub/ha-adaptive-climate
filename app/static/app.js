@@ -918,7 +918,7 @@ function hexToRgba(hex, a) {
 const logState = { room: "", category: "", severity: "" };
 const CATEGORIES = ["crossover", "maintenance", "quorum", "correction", "reactive",
   "hold", "heartbeat", "analysis", "almanac", "leak", "connection", "deploy",
-  "config", "validation"];
+  "config", "validation", "control", "block", "outdoor", "storage"];
 const SEVERITIES = ["debug", "info", "warning", "error"];
 
 async function renderLog() {

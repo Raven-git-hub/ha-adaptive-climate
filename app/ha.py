@@ -3,7 +3,7 @@ Adaptive Climate - Home Assistant client (REST + WebSocket).
 
 Plumbing only, no business logic. REST for state pushes (the almanac
 sensor) and service calls (climate.set_temperature / set_hvac_mode /
-set_fan_mode); WebSocket for the auth handshake, helper creation, and
+set_fan_mode, and weather.get_forecasts with its response); WebSocket for the auth handshake, helper creation, and
 the state-change stream that will drive reactive detection (Phase 10).
 
 Two hard-won rules from the Light cutover:
@@ -37,6 +37,7 @@ log = logging.getLogger("adaptive_climate.ha")
 class HAError(Exception): ...
 class HAAuthError(HAError): ...
 class HAConnectionError(HAError): ...
+class HATimeoutError(HAError): ...
 
 
 # ---------------------------------------------------------------------
@@ -97,8 +98,20 @@ class HARest:
         return await self._post(f"/api/states/{entity_id}",
                                 {"state": state, "attributes": attributes or {}})
     async def call_service(self, domain: str, service: str,
-                           data: dict | None = None) -> Any:
-        return await self._post(f"/api/services/{domain}/{service}", data or {})
+                           data: dict | None = None, *, return_response: bool = False) -> Any:
+        """Call a service. With return_response, for a service that returns
+        data (weather.get_forecasts), ask for it (?return_response, Home
+        Assistant 2024.8 and later) and return its service_response; a
+        timeout then raises HATimeoutError."""
+        if not return_response:
+            return await self._post(f"/api/services/{domain}/{service}", data or {})
+        try:
+            body = await self._post(f"/api/services/{domain}/{service}?return_response",
+                                    data or {})
+        except httpx.TimeoutException as e:
+            raise HATimeoutError(f"{domain}.{service}: no answer within "
+                                 f"{self._timeout:g} s") from e
+        return (body or {}).get("service_response") if isinstance(body, dict) else None
 
     async def fire_event(self, event_type: str, data: dict | None = None) -> Any:
         """Fire an event on HA's bus (POST /api/events/<type>); the doctor

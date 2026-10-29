@@ -292,7 +292,8 @@ The harnesses run without Docker or Home Assistant (the doctor needs a live HA).
 Each one cross-checks a real part of the system:
 
 ```bash
-python tools/doctor.py                     # check a real Home Assistant (6-step)
+python tools/doctor.py                     # check a real Home Assistant (7 steps, the weather entities included)
+python tools/doctor_check.py               # the doctor against a stub Home Assistant
 python tools/sweep.py                       # a year of section boundaries
 python tools/store_check.py                 # store writes + reads, into the analyser
 python tools/analyser_demo.py               # the trust-model worked example

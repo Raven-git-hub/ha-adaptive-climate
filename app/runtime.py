@@ -45,6 +45,23 @@ Control (active):
     attributes; API-set states do not survive an HA restart, so re-push on
     a timer and on homeassistant_start.
 
+Outdoor input (docs/V2_DESIGN.md, Outdoor temperature; phase 4 records it,
+nothing in control reads it until phase 5):
+  * with outdoor.source 'forecast', weather.get_forecasts (hourly) for
+    outdoor.weather_entity is fetched at startup and then hourly, and the
+    latest result cached with its fetch time;
+  * after each crossover has fired, a follow-up task takes the forecast
+    (the cache if under 2 hours old, else a fetch first), records the
+    section run's mean and max over [planned start, next section's planned
+    start) and logs them, so a slow or failed fetch never holds up a
+    crossover;
+  * every heartbeat and reaction records the weather entity's current
+    temperature as outdoor_temp (None if unavailable or not updated for 3
+    hours);
+  * a failure fails open, with no value: one `outdoor` warning per failure
+    streak and one info event when the forecast works again.
+  The probe source isn't read yet.
+
 Automation-caused changes are told apart from user ones primarily by
 context.parent_id (our service calls carry it), backed by the guard boolean,
 configured external_guards, and the same check HA's manual-change
@@ -62,12 +79,13 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from app import control
+from app import control, outdoor
 from app.analyser import LearningConfig, analyse_room, is_setpoint_moving
 from app.config import ConfigError, validate
 from app.generator import (PERSON_VOTE_EVENT, almanac_id, base_id, guard_id, offset_id,
                            scene_automation_id, scene_select_id, state_id)
-from app.scheduler import active_section_at
+from app.ha import HATimeoutError
+from app.scheduler import active_section_at, section_window
 from app.store import ReactiveUnitSample, UnitSample
 
 log = logging.getLogger("adaptive_climate.runtime")
@@ -78,6 +96,12 @@ GUARD_DEFER_POLL_SECONDS = 2
 GUARD_DEFER_MAX_SECONDS = 60
 # The comfort window closes 60 minutes after a reaction; replay 5 later.
 COMFORT_REPLAY_DELAY = timedelta(minutes=65)
+# The forecast loop fetches when the cached forecast is this old: hourly.
+FORECAST_REFRESH = timedelta(hours=1)
+FORECAST_TIMEOUT_SECONDS = 20
+# An attempt this soon after a failed one shares its failure, so rooms
+# crossing together make one attempt between them.
+FORECAST_SHARED = timedelta(seconds=60)
 OFFISH = ("off", "unavailable", "unknown", None)
 NO_STATE = ("unavailable", "unknown", None)     # the unit isn't reporting at all
 
@@ -194,6 +218,10 @@ class Runtime:
         self._followups: set[asyncio.Task] = set()          # pending comfort-window replays
         self._dropouts: dict[str, dict] = {}                 # unit entity -> state when it dropped out
         self._stale: dict[tuple[str, str], bool] = {}        # (room, sensor) -> stale, as last logged
+        self._forecast: outdoor.Forecast | None = None       # the latest forecast fetched
+        self._forecast_lock = asyncio.Lock()                 # one fetch at a time
+        self._forecast_failed_at: datetime | None = None     # the last failed attempt
+        self._forecast_failing = False                       # in a failure streak, as last logged
         self._stopping = False
 
     # ---- config helpers -------------------------------------------
@@ -204,6 +232,13 @@ class Runtime:
     @property
     def _sys(self) -> dict:
         return self.config.get("system", {})
+
+    @property
+    def _weather_entity(self) -> str | None:
+        """outdoor.weather_entity when the outdoor source is the forecast,
+        else None (no forecast is read)."""
+        out = self.config.get("outdoor") or {}
+        return out.get("weather_entity") if out.get("source") == "forecast" else None
 
     # ---- time -----------------------------------------------------
 
@@ -265,6 +300,17 @@ class Runtime:
             d = e.get("detail") or {}
             if "stale" in d and "sensor" in d:
                 self._stale[(e["room_id"], d["sensor"])] = bool(d["stale"])
+        # Whether the forecast was last logged as failing, likewise.
+        for e in reversed(self.store.recent_events(limit=1000, category="outdoor")):
+            d = e.get("detail") or {}
+            if "failing" in d:
+                self._forecast_failing = bool(d["failing"])
+        if (self.config.get("outdoor") or {}).get("source") == "probe":
+            ts, ts_utc, _, _ = self._now()
+            self.store.log_event(ts, ts_utc, "warning", "outdoor",
+                                 "outdoor.source is 'probe', which this build doesn't read yet "
+                                 "(only the forecast is): no outdoor value is recorded",
+                                 detail={"source": "probe"})
 
         # Replay every room and push its almanac before any crossover can
         # fire, catch-up included: after a migration the almanac is empty,
@@ -298,6 +344,10 @@ class Runtime:
             asyncio.create_task(self._almanac_push_loop(), name="ac-almanac-push"),
             asyncio.create_task(self._nightly_loop(), name="ac-nightly"),
         ]
+        if self._weather_entity:
+            # The catch-up crossovers' follow-ups may be fetching already;
+            # the loop's first pass then finds that forecast and waits.
+            self._tasks.append(asyncio.create_task(self._forecast_loop(), name="ac-forecast"))
         log.info("runtime started: %d room(s), tz=%s", len(self.rooms), tzname)
 
     async def stop(self) -> None:
@@ -450,7 +500,8 @@ class Runtime:
                                                 kind=direction)
         try:
             self.store.record_reactive(room_id, ts, ts_utc, local_date, rs.section or "day",
-                                       0, units, sensors, kind=direction)
+                                       0, units, sensors, kind=direction,
+                                       outdoor_temp=self._outdoor_temp(states))
         except sqlite3.IntegrityError as e:
             self.store.log_event(ts, ts_utc, "warning", "reactive",
                                  f"{name}: a {direction} vote from {via} came in the same second "
@@ -543,7 +594,8 @@ class Runtime:
         units = {uid: w.sample() for uid, w in windows.items()}
         kind = room_kind(u.kind for u in units.values())
         self.store.record_reactive(room_id, ts, ts_utc, local_date, rs.section or "day",
-                                   window, units, sensors, kind=kind)
+                                   window, units, sensors, kind=kind,
+                                   outdoor_temp=self._outdoor_temp(states))
 
         def told(uid: str, w: UnitWindow) -> str:
             if w.kind in ("on", "off"):
@@ -695,7 +747,8 @@ class Runtime:
         section = rs.section or "day"
         self.store.record_heartbeat(room_id, ts, ts_utc, local_date,
                                     section, sensors, units,
-                                    deferred_ms=deferred_ms)
+                                    deferred_ms=deferred_ms,
+                                    outdoor_temp=self._outdoor_temp(states))
         reason = self._seed_reason(room_id, section, sensors, units)
         if reason:
             await self.replay_room(room_id, reason)
@@ -759,6 +812,146 @@ class Runtime:
                              f"{rs.room['name']} -> {section}{note}", room_id=room_id)
         rs.section, rs.section_started = section, started
         log.info("crossover %s -> %s%s", room_id, section, note)
+        if self._weather_entity and started is not None:
+            # After the scene has fired, so the forecast never holds it up.
+            task = asyncio.create_task(
+                self._section_outdoor(rs, run_date, section, started, catch_up),
+                name=f"ac-outdoor-{room_id}")
+            self._followups.add(task)
+            task.add_done_callback(self._followups.discard)
+
+    # ---- outdoor --------------------------------------------------
+
+    def _outdoor_temp(self, states: dict) -> float | None:
+        """The outdoor value a heartbeat or reaction records: the weather
+        entity's current temperature, or None (no forecast source, or the
+        entity unavailable or not updated for 3 hours)."""
+        entity = self._weather_entity
+        return outdoor.current_temperature(states.get(entity), self._now()[3]) if entity else None
+
+    async def _section_outdoor(self, rs: RoomState, run_date: str, section: str,
+                               started: datetime, catch_up: bool) -> None:
+        """Record a section run's forecast mean and max over its window,
+        [planned start, next section's planned start), and log them. A
+        window the forecast covers only part of uses what is covered and
+        says so; with no forecast, or none of the window, the run keeps no
+        outdoor value. A catch-up inside a run that already has its values
+        keeps them: they were decided at its start, and the forecast no
+        longer holds the hours already past."""
+        room_id, entity = rs.room["id"], self._weather_entity
+        if catch_up and any(v is not None for v in
+                            self.store.section_run_outdoor(room_id, run_date, section) or ()):
+            return
+        start, end = section_window(rs.profile, section, started, self.tz)
+        window = outdoor.span_text(start, end, self.tz)
+        head = f"{rs.room['name']} -> {section}"
+        forecast = await self._forecast_for(outdoor.CACHE_MAX_AGE)
+        ts, ts_utc, _, _ = self._now()
+        detail = {"section": section, "entity_id": entity,
+                  "window": [start.isoformat(), end.isoformat()]}
+        if forecast is None:
+            self.store.log_event(ts, ts_utc, "info", "outdoor",
+                                 f"{head}: no forecast from {entity}, so no outdoor value for "
+                                 f"{window}", room_id=room_id,
+                                 detail={**detail, "mean": None, "max": None})
+            return
+        stats = outdoor.window_stats(forecast.hours, start, end)
+        detail.update(mean=stats.mean, max=stats.max, hours=stats.hours,
+                      expected=stats.expected, partial=stats.partial,
+                      fetched_at=forecast.fetched_at.isoformat(timespec="seconds"))
+        if stats.hours == 0:
+            self.store.log_event(ts, ts_utc, "warning", "outdoor",
+                                 f"{head}: the forecast from {entity} has no hours in {window}, "
+                                 "so no outdoor value", room_id=room_id, detail=detail)
+            return
+        self.store.record_section_outdoor(room_id, run_date, section, stats.mean, stats.max)
+        values = f"forecast mean {stats.mean:.1f}, max {stats.max:.1f}"
+        if stats.partial:
+            covered = outdoor.span_text(stats.first, min(stats.last + outdoor.HOUR, end), self.tz)
+            message = (f"{head}: {values} over {covered} only ({entity}): the forecast covers "
+                       f"{stats.hours} of the {stats.expected} hours in {window}")
+        else:
+            message = f"{head}: {values} over {window} ({entity})"
+        self.store.log_event(ts, ts_utc, "info", "outdoor", message, room_id=room_id,
+                             detail=detail)
+
+    async def _forecast_for(self, max_age: timedelta) -> outdoor.Forecast | None:
+        """The cached forecast if it is younger than max_age, else a fresh
+        one, or None if that fails. One fetch at a time; an attempt within
+        FORECAST_SHARED of a failed one shares its failure."""
+        async with self._forecast_lock:
+            now = self._now()[3]
+            if self._forecast is not None and now - self._forecast.fetched_at < max_age:
+                return self._forecast
+            if self._forecast_failed_at is not None and \
+                    now - self._forecast_failed_at < FORECAST_SHARED:
+                return None
+            return await self._fetch_forecast()
+
+    async def _fetch_forecast(self) -> outdoor.Forecast | None:
+        """weather.get_forecasts (hourly) for the weather entity. A missing
+        or unavailable entity, a service error, a timeout or an empty
+        forecast fails open: None, the cache left as it was."""
+        entity = self._weather_entity
+        state = self._cache.get(entity)
+        hours, kind, reason = [], None, None
+        if state is None:
+            kind, reason = "missing", f"{entity} isn't in Home Assistant"
+        elif state in outdoor.NO_STATE:
+            kind, reason = "unavailable", f"{entity} is {state}"
+        else:
+            try:
+                response = await asyncio.wait_for(
+                    self.rest.call_service("weather", "get_forecasts",
+                                           {"entity_id": entity, "type": "hourly"},
+                                           return_response=True),
+                    FORECAST_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                kind, reason = "timeout", f"no answer within {FORECAST_TIMEOUT_SECONDS} s"
+            except HATimeoutError as e:                  # the REST client's own timeout
+                kind, reason = "timeout", str(e)
+            except Exception as e:
+                kind, reason = "error", f"weather.get_forecasts failed ({type(e).__name__}: {e})"
+            else:
+                hours = outdoor.parse_forecast(response, entity, self.tz)
+                if not hours:
+                    kind = "empty"
+                    reason = ("the hourly forecast is empty"
+                              if isinstance(response, dict) and entity in response
+                              else f"the response has no forecast for {entity}")
+        now = self._now()[3]
+        if kind is not None:
+            self._forecast_failed_at = now
+            self._note_forecast(kind, reason)
+            return None
+        self._forecast = outdoor.Forecast(entity, now, tuple(hours))
+        self._forecast_failed_at = None
+        self._note_forecast(None, None, len(hours))
+        return self._forecast
+
+    def _note_forecast(self, kind: str | None, reason: str | None, hours: int = 0) -> None:
+        """One warning when the forecast starts failing (kind says how), one
+        info event when it works again. What was last logged survives a
+        restart (start() reads it back), so a restart inside a failure
+        streak doesn't repeat the warning."""
+        failing = kind is not None
+        if failing == self._forecast_failing:
+            return
+        self._forecast_failing = failing
+        entity = self._weather_entity
+        ts, ts_utc, _, _ = self._now()
+        if failing:
+            self.store.log_event(
+                ts, ts_utc, "warning", "outdoor",
+                f"Outdoor forecast from {entity} failed: {reason}. Section runs get no "
+                "forecast values until it works again (a cached one under 2 hours old is still "
+                "used); it is retried hourly and at each section change",
+                detail={"failing": True, "kind": kind, "reason": reason, "entity_id": entity})
+        else:
+            self.store.log_event(
+                ts, ts_utc, "info", "outdoor",
+                f"Outdoor forecast from {entity} is working again ({hours} hourly entries)",
+                detail={"failing": False, "entity_id": entity, "hours": hours})
 
     # ---- almanac push ---------------------------------------------
 
@@ -846,6 +1039,16 @@ class Runtime:
                 except Exception as e:
                     log.warning("almanac push error for %s: %s", room_id, e)
             await asyncio.sleep(ALMANAC_PUSH_SECONDS)
+
+    async def _forecast_loop(self) -> None:
+        """Fetch the forecast at startup, then hourly: whenever the cached
+        one is FORECAST_REFRESH old (a crossover's own fetch counts)."""
+        while not self._stopping:
+            try:
+                await self._forecast_for(FORECAST_REFRESH)
+            except Exception as e:
+                log.warning("forecast refresh error: %s", e)
+            await asyncio.sleep(FORECAST_REFRESH.total_seconds())
 
     async def _nightly_loop(self) -> None:
         while not self._stopping:

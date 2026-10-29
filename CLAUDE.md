@@ -61,10 +61,11 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
 | `app/control.py` | Pure-function control core: votes, the cool/boost/rest state machine, section changes, a person's too_cold/too_hot vote (one per episode, forced rest/boost), person reactions, the "is this ours" check (rendered as Jinja by the generator) |
 | `app/analyser.py` | Deterministic replay of reactions from a seed: setpoints, applied setpoints, per-sensor comfort/band (nudged per reaction)/trust, confidence |
 | `app/generator.py` | Builds HA helpers (seven per-unit control helpers, two vote buttons per room) and automations (scene, maintenance, vote, manual change, leak, watchdog) from config, rendering `app/control.py` as Jinja |
-| `app/scheduler.py` | Clock-only section-boundary computation (no sun-based triggers) |
+| `app/outdoor.py` | Pure-function outdoor input: a weather entity's hourly forecast parsed, a section window's mean/max and coverage, the point value (current temperature, stale after 3 h) |
+| `app/scheduler.py` | Clock-only section-boundary computation (no sun-based triggers), and a section run's window |
 | `app/ha.py` | Home Assistant REST + WebSocket client |
 | `app/deploy.py` | Reconciles generated helpers/automations into HA; owns the `ac_*` namespace; manifest-based automation pruning |
-| `app/runtime.py` | Observer + control loop: scheduler, reactive detector (on/off/manual), HA's `ac_person_vote` events as votes, replay triggers, almanac push |
+| `app/runtime.py` | Observer + control loop: scheduler, reactive detector (on/off/manual), HA's `ac_person_vote` events as votes, replay triggers, almanac push, the outdoor forecast (cached, fetched hourly; each section run's mean/max; failing open) |
 | `app/store.py` | CSV + SQLite storage, event log, almanac persistence |
 | `app/main.py` | FastAPI app, lifespan wiring |
 | `app/config.py` | Config loading: v1 → v2 migration, v2 defaults, schema validation, unique room ids and unit/sensor ids within a room (other cross-reference checks still to come — Roadmap Phase 9) |
@@ -114,8 +115,9 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
 ## Running validation (no Docker or live HA required, except `doctor.py`)
 
 ```bash
-python tools/doctor.py                     # check a real Home Assistant (6-step diagnostic; needs live HA)
+python tools/doctor.py                     # check a real Home Assistant (7-step diagnostic, weather entities included; needs live HA)
 python tools/doctor.py --v2-preflight      # ...plus v2's helper/template behaviour, on throwaway ac_preflight_* helpers
+python tools/doctor_check.py                # the doctor against a stub HA: weather entities, hourly forecast, flags
 python tools/sweep.py                       # a year of section-boundary computation
 python tools/store_check.py                 # store writes + reads, into the analyser; migrations
 python tools/config_check.py                # config v1 -> v2 migration, defaults, validation
@@ -133,7 +135,7 @@ Run `PYTHONPATH=.` before these if invoking from outside the repo root (most
 scripts also self-insert the repo root via `sys.path`). These harnesses are
 the test suite in the absence of a live HA instance — run the relevant ones
 after touching `app/generator.py`, `app/trust.py`, `app/control.py`, `app/deploy.py`,
-`app/scheduler.py`, `app/store.py`, or `app/runtime.py`.
+`app/scheduler.py`, `app/store.py`, `app/outdoor.py`, or `app/runtime.py`.
 
 ## Local dev / Docker
 

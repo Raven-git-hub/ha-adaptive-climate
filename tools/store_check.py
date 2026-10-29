@@ -203,6 +203,47 @@ def check_fresh_store() -> None:
                    "FROM section_run WHERE room_id='baby_room'").fetchone()
     assert tuple(sr) == (29.0, 32.0, 24.1, -0.49, 0, "shadow"), tuple(sr)
 
+    # --- outdoor values (phase 4) round-trip through the CSV as well ---
+    def csv_rows(kind: str, room: str = "baby_room") -> list[dict]:
+        return list(csvmod.DictReader((tmp / "csv" / room / f"{rd}_{kind}.csv").open()))
+    assert csv_rows("heartbeat")[-1]["outdoor_temp"] == "31.5"
+    assert csv_rows("reactive")[-1]["outdoor_temp"] == "31.4"
+    assert (csv_rows("section_run")[-1]["outdoor_mean"],
+            csv_rows("section_run")[-1]["outdoor_max"]) == ("29.0", "32.0")
+    # no outdoor value: a blank CSV field and a NULL column (another room,
+    # so the reaction counts below stay as they are)
+    store.record_heartbeat("spare_room", f"{rd}T15:01:00+08:00", f"{rd}T07:01:00+00:00", rd,
+                           "day", sensors={"spare": 26.0}, units={}, outdoor_temp=None)
+    store.record_reactive("spare_room", f"{rd}T15:06:00+08:00", f"{rd}T07:06:00+00:00", rd,
+                          "day", window_seconds=0, kind="too_hot", units={},
+                          sensors={"spare": 26.1}, outdoor_temp=None)
+    assert csv_rows("heartbeat", "spare_room")[-1]["outdoor_temp"] == ""
+    assert csv_rows("reactive", "spare_room")[-1]["outdoor_temp"] == ""
+    assert c.execute("SELECT outdoor_temp FROM heartbeat WHERE room_id='spare_room'"
+                     ).fetchone()[0] is None
+    assert c.execute("SELECT outdoor_temp FROM reactive WHERE room_id='spare_room'"
+                     ).fetchone()[0] is None
+    # a run's forecast, set after its crossover: a CSV row carrying only the
+    # two values (the start row's fields blank, for re-ingest to merge) and
+    # the SQLite row updated in place, the rest of it untouched
+    store.record_section_run("baby_room", rd, "sunset", planned_start=f"{rd}T16:00:00+08:00",
+                             actual_start=f"{rd}T16:00:02+08:00", outcome="ran")
+    assert store.section_run_outdoor("baby_room", rd, "sunset") == (None, None)
+    assert store.section_run_outdoor("baby_room", rd, "night") is None
+    store.record_section_outdoor("baby_room", rd, "sunset", 24.1, 25.3)
+    assert store.section_run_outdoor("baby_room", rd, "sunset") == (24.1, 25.3)
+    assert tuple(c.execute(
+        "SELECT planned_start, actual_start, outcome, outdoor_mean, outdoor_max FROM section_run "
+        "WHERE room_id='baby_room' AND section='sunset'").fetchone()) == (
+        f"{rd}T16:00:00+08:00", f"{rd}T16:00:02+08:00", "ran", 24.1, 25.3)
+    start_row, outdoor_row = csv_rows("section_run")[-2:]
+    assert start_row["outdoor_mean"] == "" and start_row["actual_start"] != ""
+    assert outdoor_row == {**{k: "" for k in SECTION_RUN_CSV}, "section": "sunset",
+                           "outdoor_mean": "24.1", "outdoor_max": "25.3"}, outdoor_row
+    print("outdoor values: a heartbeat's and a reaction's outdoor_temp, and a section run's "
+          "forecast mean and max (also set after its crossover, in a row of their own), "
+          "round-trip through the CSV and SQLite; no value is a blank field and NULL - OK")
+
     # --- every reaction kind round-trips through CSV and SQLite ---
     kinds = {  # minute -> (room kind, setpoint before/after, changed, power before/after)
         20: ("off", 22.0, 22.0, False, True, False),

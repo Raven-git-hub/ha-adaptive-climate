@@ -14,6 +14,8 @@ sections).
     PYTHONPATH=. python tools/doctor.py
     PYTHONPATH=. python tools/doctor.py --v2-preflight    # before the v2 cutover
 
+    PYTHONPATH=. python tools/doctor_check.py             # this script against a stub HA
+
 Checks, in order:
   1. REST /api/ reachable, token accepted
   2. REST /api/config (HA version, timezone, temperature unit)
@@ -26,7 +28,15 @@ Checks, in order:
      last_reported is older than system.sensor_stale_minutes is flagged as
      stale (the runtime and maintenance treat it as unavailable)
 
-  7. (--v2-preflight) the Home Assistant behaviour v2's generated helpers
+  7. Outdoor input, with or without --v2-preflight: every weather.* entity
+     with its current temperature and whether it offers an hourly forecast
+     (supported_features bit 2), and for the configured
+     outdoor.weather_entity (AC_CONFIG) the next 6 hourly entries from
+     weather.get_forecasts. A configured entity that is missing, has no
+     hourly forecast or returns an empty one is a hard failure when
+     outdoor.source is 'forecast', a warning otherwise.
+
+  8. (--v2-preflight) the Home Assistant behaviour v2's generated helpers
      and templates rely on, tried for real on throwaway ac_preflight_*
      helpers created and deleted through the same helper API deploy uses:
        - input_datetime.set_datetime with a timestamp round-trips through
@@ -55,12 +65,15 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import control                                       # noqa: E402
 from app import generator as g                                 # noqa: E402
+from app import outdoor                                        # noqa: E402
 from app.ha import HARest, HAWebSocket, HAAuthError, HAError  # noqa: E402
 
 REQUIRED_HVAC = ("cool", "off")          # cool and boost; rest, the off states and leak
@@ -68,6 +81,8 @@ REQUIRED_FAN = ("low", "medium")         # cool / boost
 
 GREEN, RED, YELLOW, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[0m"
 OK, FAIL, WARN = f"{GREEN}\u2713{RESET}", f"{RED}\u2717{RESET}", f"{YELLOW}!{RESET}"
+INFO = "\u00b7"
+FORECAST_SHOWN = 6           # hourly entries shown for the configured weather entity
 
 def line(marker, msg):  print(f"  {marker} {msg}")
 
@@ -87,6 +102,73 @@ def _stale_for(last_reported: str | None, stale_minutes: int) -> str | None:
     ago = f"{hours * 60:.0f} min" if hours < 2 else (f"{hours:.0f} h" if hours < 48
                                                        else f"{hours / 24:.1f} days")
     return f"{ago} ago ({when.astimezone().strftime('%Y-%m-%d %H:%M')})"
+
+
+# ---------------------------------------------------------------------
+# Outdoor input
+# ---------------------------------------------------------------------
+
+async def outdoor_check(rest, states: list[dict], outdoor_cfg: dict | None,
+                        tz=None) -> list[tuple[str, str]]:
+    """Step 7, as (marker, message) lines: every weather.* entity with its
+    current temperature and whether it offers an hourly forecast; then, for
+    the configured outdoor.weather_entity, its next FORECAST_SHOWN hourly
+    entries. A configured entity that is missing, has no hourly forecast or
+    returns an empty one is FAIL when outdoor.source is 'forecast' (the
+    runtime would record no outdoor value), WARN otherwise."""
+    out: list[tuple[str, str]] = []
+    cfg = outdoor_cfg or {}
+    source, configured = cfg.get("source", "none"), cfg.get("weather_entity")
+    bad = FAIL if source == "forecast" else WARN
+    weathers = sorted((s for s in states if s["entity_id"].startswith("weather.")),
+                      key=lambda s: s["entity_id"])
+    if not weathers:
+        out.append((WARN, "no weather.* entities: outdoor.source 'forecast' has nothing to read"))
+    for s in weathers:
+        attrs = s.get("attributes") or {}
+        hourly = outdoor.supports_hourly(s)
+        tag = " (configured)" if s["entity_id"] == configured else ""
+        out.append((OK if hourly else INFO,
+                    f"{s['entity_id']}{tag}: {attrs.get('temperature')} "
+                    f"{attrs.get('temperature_unit') or ''}, {s.get('state')}; hourly forecast: "
+                    f"{'yes' if hourly else 'no'}"))
+    if not configured:
+        if source == "forecast":
+            out.append((FAIL, "outdoor.source is 'forecast' but outdoor.weather_entity isn't set"))
+        elif source == "probe":
+            out.append((WARN, "outdoor.source is 'probe', which this build doesn't read yet; "
+                              "no outdoor value is recorded"))
+        else:
+            out.append((INFO, "outdoor.source is 'none': nothing is read. To record the outdoor "
+                              "value set outdoor.source 'forecast' and outdoor.weather_entity "
+                              "to one above with hourly forecast: yes"))
+        return out
+    note = "" if source == "forecast" else f" (outdoor.source is '{source}', so it isn't read)"
+    state = next((s for s in weathers if s["entity_id"] == configured), None)
+    if state is None:
+        return out + [(bad, f"outdoor.weather_entity {configured} not found{note}")]
+    if not outdoor.supports_hourly(state):
+        return out + [(bad, f"outdoor.weather_entity {configured} has no hourly forecast "
+                            f"(supported_features bit 2 not set){note}; pick one with hourly "
+                            "forecast: yes")]
+    try:
+        response = await rest.call_service("weather", "get_forecasts",
+                                           {"entity_id": configured, "type": "hourly"},
+                                           return_response=True)
+    except Exception as e:
+        return out + [(bad, f"weather.get_forecasts for {configured} failed: "
+                            f"{type(e).__name__}: {e}{note}")]
+    now = datetime.now(timezone.utc)
+    hours = [h for h in outdoor.parse_forecast(response, configured, tz)
+             if h.at + outdoor.HOUR > now][:FORECAST_SHOWN]
+    if not hours:
+        return out + [(bad, f"{configured} returned an empty hourly forecast{note}")]
+    unit = (state.get("attributes") or {}).get("temperature_unit") or ""
+    out.append((OK, f"{configured}: next {len(hours)} hourly entries{note}:"))
+    for h in hours:
+        when = (h.at.astimezone(tz) if tz else h.at.astimezone()).strftime("%a %H:%M")
+        out.append((INFO, f"  {when}  {h.temperature:g} {unit}  {h.condition or ''}".rstrip()))
+    return out
 
 
 # ---------------------------------------------------------------------
@@ -291,10 +373,12 @@ async def _run(url: str, token: str, verify_ssl: bool,
         line(FAIL, f"REST unreachable: {e}"); return 2
 
     # --- 2. HA config -----------------------------------------------
+    tz = None
     try:
         cfg = await rest.config()
         line(OK, f"HA {cfg.get('version')}  tz={cfg.get('time_zone')}  "
                  f"unit={cfg.get('unit_system', {}).get('temperature')}")
+        tz = ZoneInfo(cfg["time_zone"]) if cfg.get("time_zone") else None
     except Exception as e:
         line(FAIL, f"REST /api/config failed: {e}"); hard_failures += 1
 
@@ -355,6 +439,7 @@ async def _run(url: str, token: str, verify_ssl: bool,
         states = []
 
     # --- 6. Configured units + sensors ------------------------------
+    config = None
     if config_path:
         print(f"\nchecking against {config_path}")
         try:
@@ -435,7 +520,15 @@ async def _run(url: str, token: str, verify_ssl: bool,
                         unit = e.get("attributes", {}).get("unit_of_measurement")
                         line(OK, f"    {label} = {e['state']} {unit or ''}")
 
-    # --- 7. v2 preflight (opt-in) ----------------------------------
+    # --- 7. Outdoor input (always) ----------------------------------
+    print("\noutdoor input (weather entities)")
+    outdoor_cfg = (config or {}).get("outdoor") if isinstance(config, dict) else None
+    for marker, msg in await outdoor_check(rest, states, outdoor_cfg, tz):
+        line(marker, msg)
+        hard_failures += marker == FAIL
+        warnings += marker == WARN
+
+    # --- 8. v2 preflight (opt-in) ----------------------------------
     if preflight:
         print("\nv2 preflight (throwaway ac_preflight_* helpers)")
         for item, passed, detail in await v2_preflight(rest, ws):
