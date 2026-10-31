@@ -27,10 +27,90 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import automation_diff       # noqa: E402
 from app import control      # noqa: E402
 from app import deploy as d  # noqa: E402
 from app import generator as g  # noqa: E402
+
+WATCHDOG = "ac_watchdog_main_room"
+
+
+# ---------------------------------------------------------------------
+# Home Assistant's copy, shaped as HA might hand it back: the same
+# automation, every difference one app.deploy.normalised must see through
+# ---------------------------------------------------------------------
+
+def _bare_if_one(items):
+    """A list of one stored as the item itself."""
+    return items[0] if isinstance(items, list) and len(items) == 1 else items
+
+
+def _reshape_trigger(t: dict) -> dict:
+    t = dict(reversed(list(t.items())))                         # keys in another order
+    t["trigger"] = t.pop("platform")                            # 2024.10: platform -> trigger
+    return t
+
+
+def _reshape_actions(steps: list):
+    return _bare_if_one([_reshape_action(s) for s in steps])
+
+
+def _reshape_action(s: dict) -> dict:
+    s = dict(reversed(list(s.items())))
+    if "service" in s:
+        s["action"] = s.pop("service")                          # 2024.8: service -> action
+    if "choose" in s:
+        s["choose"] = [{"sequence": _reshape_actions(o["sequence"]),
+                        "conditions": _bare_if_one(o["conditions"])} for o in s["choose"]]
+    if s.get("default"):
+        s["default"] = _reshape_actions(s["default"])
+    return s
+
+
+def _reshape_scalars(v):
+    """Numbers as strings; a template refolded the way YAML can fold it (a
+    space turned into a line break and indent, a run of spaces, a trailing
+    line break), never touching anything but whitespace."""
+    if isinstance(v, dict):
+        return {k: _reshape_scalars(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_reshape_scalars(x) for x in v]
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, str) and ("{{" in v or "{%" in v) and " " in v:
+        head, _, tail = v.partition(" ")
+        return f"{head}\n    {tail.replace(' ', '   ', 2)}\n"
+    return v
+
+
+def ha_shaped(a: dict) -> dict:
+    body = {k: v for k, v in a.items() if k != "id"}
+    out = {"id": a["id"], "alias": body.pop("alias"), "description": "",
+           "triggers": _bare_if_one([_reshape_trigger(t) for t in body.pop("trigger")]),
+           "conditions": _bare_if_one(body.pop("condition")),
+           "actions": _reshape_actions(body.pop("action"))}
+    for k in reversed(list(body)):
+        out[k] = body[k]
+    if out.get("mode") == "single":
+        del out["mode"]                                         # HA's default
+    elif out.get("max") == 10:
+        del out["max"]                                          # HA's default when queued
+    out["max_exceeded"] = "warning"
+    out.setdefault("variables", {})
+    return _reshape_scalars(out)
+
+
+def _walk(steps):
+    """Every action step, through bare items, choose options and defaults."""
+    for s in [steps] if isinstance(steps, dict) else steps or []:
+        yield s
+        for o in s.get("choose", []):
+            yield from _walk(o.get("sequence"))
+        yield from _walk(s.get("default"))
 
 
 class StubRest:
@@ -232,6 +312,85 @@ async def main() -> int:
           f"manifest lost ({unrecorded}) are written again, and only those (changes 3); the "
           "next check finds nothing to change - OK")
 
+    # Home Assistant's copy shaped differently but meaning the same: every
+    # stored automation reshaped as HA might hand it back, then read again
+    shaped = {aid: ha_shaped(a) for aid, a in rest.automations.items()}
+    for aid, a in shaped.items():
+        assert automation_diff._as_is(a) != automation_diff._as_is(rest.automations[aid]), aid
+    rest.automations = copy.deepcopy(shaped)
+    writes = len(rest.set_calls)
+    r2d = await check_then_deploy(cfg, rest, ws, tmp)
+    assert r2d.automations_written == [] and r2d.changes == 0, r2d.automations_why
+    assert len(r2d.automations_unchanged) == n_automations and len(rest.set_calls) == writes
+    print(f"all {n_automations} automations stored as Home Assistant might hand them back - id "
+          "and defaults added (description, mode, max_exceeded, variables), keys reordered, "
+          "triggers/conditions/actions, trigger: for platform:, action: for service:, one "
+          "item for a list of one, numbers as strings, templates' whitespace refolded - are "
+          "unchanged (changes 0), though none of them is equal as-is - OK")
+
+    lines = await automation_diff.diagnose(cfg, rest, d.load_manifest(tmp), WATCHDOG)
+    assert any(line.startswith("  as-is (JSON, id dropped): first difference") for line in lines)
+    assert "  normalised (what deploy compares): equal" in lines, lines
+    assert lines[-1] == "  verdict: unchanged - a deploy leaves it as it is", lines
+
+    # ...while a real change still counts: one character of a template, a
+    # trigger, a condition and an action, each in Home Assistant's copy
+    vote = next(a for a in shaped if a.startswith("ac_vote_"))
+    manual = next(a for a in shaped if a.startswith("ac_manual_"))
+    ha = rest.automations
+    unit_var = next(k for k in ha[maint]["variables"] if k.startswith("unit_") and k != "unit_data")
+    assert "'too_warm'" in ha[maint]["variables"][unit_var]
+    ha[maint]["variables"][unit_var] = ha[maint]["variables"][unit_var].replace(
+        "'too_warm'", "'too_warn'", 1)
+    ha[WATCHDOG]["triggers"]["to"] = "off"                       # a bare trigger, as shaped
+    guard = next(c for c in ha[manual]["conditions"] if c.get("condition") == "state")
+    guard["state"] = "on"
+    tap = next(s for s in _walk(ha[vote]["actions"]) if s.get("action") == "input_boolean.turn_off")
+    tap["action"] = "input_boolean.turn_on"
+    changed = sorted([maint, WATCHDOG, manual, vote])
+    r2e = await check_then_deploy(cfg, rest, ws, tmp)
+    assert sorted(r2e.automations_written) == changed, r2e.automations_written
+    assert r2e.changes == 4 and len(r2e.automations_unchanged) == n_automations - 4
+    why = r2e.automations_why
+    assert "'too_warn'" in why[maint] and why[maint].startswith(
+        f"Home Assistant's copy differs at .variables.{unit_var}: "), why[maint]
+    assert why[WATCHDOG] == ("Home Assistant's copy differs at .triggers[0].to: ours \"on\", "
+                             "Home Assistant's \"off\""), why[WATCHDOG]
+    assert '.state: ours "off", Home Assistant\'s "on"' in why[manual], why[manual]
+    assert '.action: ours "input_boolean.turn_off", Home Assistant\'s "input_boolean.turn_on"' \
+        in why[vote], why[vote]
+    assert (await d.check(cfg, rest, ws, tmp)).changes == 0
+    print(f"a one-character template change ({maint}: 'too_warm' -> 'too_warn'), a trigger's "
+          f"({WATCHDOG}: to on -> off), a condition's ({manual}: the guard off -> on) and an "
+          f"action's ({vote}: turn_off -> turn_on) in Home Assistant's reshaped copies are "
+          "written, and only those (changes 4), each with where it differs; the next check "
+          "finds nothing to change - OK")
+
+    # the diagnostic tool, on a differing copy and on a read that fails
+    ha[WATCHDOG] = ha_shaped(ha[WATCHDOG])
+    ha[WATCHDOG]["triggers"]["for"]["minutes"] = "6"
+    lines = await automation_diff.diagnose(cfg, rest, d.load_manifest(tmp), WATCHDOG)
+    assert lines[1:3] == ["  in our deploy manifest: yes",
+                          "  read from Home Assistant: a copy with keys " + repr(list(ha[WATCHDOG]))]
+    assert lines[4] == ("  normalised (what deploy compares): first difference "
+                        ".triggers[0].for.minutes: ours 5.0, Home Assistant's 6.0"), lines[4]
+    assert lines[5].startswith("  verdict: a deploy would write it: Home Assistant's copy "
+                               "differs at .triggers[0].for.minutes"), lines[5]
+
+    class Failing(StubRest):
+        async def get_automation(self, aid):
+            raise RuntimeError("401 token rejected")
+    lines = await automation_diff.diagnose(cfg, Failing(entities), d.load_manifest(tmp),
+                                           WATCHDOG, show=True)
+    assert lines[2] == "  read from Home Assistant: FAILED (RuntimeError: 401 token rejected)"
+    assert lines[3] == ("  verdict: a deploy would write it: reading Home Assistant's copy "
+                        "failed: RuntimeError: 401 token rejected"), lines
+    assert json.loads(lines[5])["id"] == WATCHDOG and lines[-1] == "null", lines
+    print("tools/automation_diff.py: for the watchdog it reports the manifest, the read, the "
+          "first difference as-is and normalised (for:minutes 5 vs \"6\") and the verdict; a "
+          "read that fails is named, as deploy's reason now names it - OK")
+    await check_then_deploy(cfg, rest, ws, tmp)                  # back as rendered
+
     # deploy 3: a wider offset cap updates the offset helpers in place
     cfg3 = json.loads(json.dumps(cfg))
     cfg3["system"]["control"]["offset_cap"] = cap + 1
@@ -295,7 +454,8 @@ async def main() -> int:
     print("a heat source that isn't in Home Assistant is a missing entity: the deploy aborts "
           "without writing anything - OK")
 
-    print(f"check (the dry run) before each of the 4 deploys wrote nothing and listed exactly "
+    print(f"check (the dry run) before each of the {len(dry_runs)} deploys wrote nothing and "
+          f"listed exactly "
           f"what the deploy then did: {[r['helpers_created'] for r in dry_runs]} created, "
           f"{[r['helpers_removed'] for r in dry_runs]} removed, "
           f"{[r['automations_written'] for r in dry_runs]} written - OK")

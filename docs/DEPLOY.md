@@ -37,6 +37,36 @@ says whether a deploy would change Home Assistant at all, which is what the
 Config page's Apply needs (below), and one of our automations edited or deleted
 by hand in Home Assistant is put back by the next deploy.
 
+The comparison is between **normalised** copies (`app.deploy.normalised`,
+decision 140). Home Assistant's copy can come back shaped differently while
+meaning the same thing, and both sides are brought to one shape first:
+- the id dropped and key order ignored;
+- defaults left out: description `""`, mode `single`, `max` 10 when queued,
+  `max_exceeded` warning, empty variables;
+- the 2024.8 and 2024.10 renames read as one: `trigger`/`condition`/`action`
+  as `triggers`/`conditions`/`actions`, `platform` as `trigger`, `service` as
+  `action`;
+- a single trigger, condition or action counted as a list of one;
+- numbers and numeric strings read as numbers;
+- runs of whitespace in a template collapsed to one space.
+
+Any other change to a template, trigger, condition or action still counts. The
+report's `automations_why` says, for each automation it writes, why: "not in
+our deploy manifest", "Home Assistant has no copy", "reading Home Assistant's
+copy failed: ...", or "Home Assistant's copy differs at <path>: ours ...,
+Home Assistant's ...". `GET /api/deploy/check` shows it.
+
+To see one automation's comparison on a live install (nothing is written):
+
+```bash
+docker compose run --rm -e AC_HA_URL -e AC_HA_TOKEN -e AC_HA_VERIFY_SSL \
+  adaptive-climate python tools/automation_diff.py ac_watchdog_main_room
+```
+
+It prints whether the manifest records the id, what the read returned, the
+first difference as-is and after normalising, and the verdict. `--show` prints
+both copies in full, and `--all` gives one line per automation.
+
 ## Apply: one button saves, reloads and deploys
 
 The Config page has one **Apply** button (phase 7, docs/V2_DESIGN.md, Usability

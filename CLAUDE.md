@@ -128,6 +128,7 @@ python tools/render_generated.py            # render helpers + automations
 python tools/control_check.py               # control state machine and vote scenarios; each rule removed must fail
 python tools/control_logic_check.py         # the generated automations replayed against app/control.py
 python tools/deploy_reconcile_check.py      # deploy create / reuse / update / prune
+python tools/automation_diff.py [ID]        # one deployed automation vs our render, normalised (needs live HA; --all, --show)
 python tools/runtime_check.py               # runtime observer + control loop
 python tools/leak_response_check.py         # leak detection / OFF / release automations
 python tools/now_api_check.py               # /api/now's shape and values; the vote and leak-fixed endpoints

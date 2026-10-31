@@ -74,6 +74,8 @@ class DeployReport:
     automations_written: list[str] = field(default_factory=list)
     automations_unchanged: list[str] = field(default_factory=list)
     automations_removed: list[str] = field(default_factory=list)
+    # why each written automation is written (ha_copy_differs), for /api/deploy/check
+    automations_why: dict[str, str] = field(default_factory=dict)
     missing_entities: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -102,6 +104,7 @@ class DeployReport:
             "automations_written": self.automations_written,
             "automations_unchanged": self.automations_unchanged,
             "automations_removed": self.automations_removed,
+            "automations_why": self.automations_why,
             "changes": self.changes,
             "missing_entities": self.missing_entities,
             "problems": self.problems,
@@ -248,29 +251,172 @@ async def _reconcile_helpers(rendered_helpers: list[dict], ws: HAWebSocket,
                 report.problems.append(f"could not remove stale helper {label}: {err}")
 
 
-def _normalised(automation: dict) -> Any:
-    """An automation's config as Home Assistant stores it, without its id
-    (the body we post has none; HA adds it), through JSON so tuples and
-    lists, ints and floats compare as HA's copy reads back."""
-    return json.loads(json.dumps({k: v for k, v in automation.items() if k != "id"}))
+# ---------------------------------------------------------------------
+# Comparing an automation with Home Assistant's copy
+# ---------------------------------------------------------------------
+#
+# Home Assistant's config editor keeps what we post in automations.yaml and
+# hands it back from there, but the copy can come back shaped differently
+# without meaning anything different: the id added and keys reordered;
+# defaults (description "", mode single, max 10, max_exceeded warning, empty
+# variables); the 2024.8 and 2024.10 renames (trigger/condition/action ->
+# triggers/conditions/actions, platform -> trigger, service -> action); one
+# trigger, condition or action as a bare item rather than a list of one;
+# a number as a string; a template's whitespace (line breaks, runs of
+# spaces). Both sides are brought to one shape before comparing, so an
+# identical deploy compares equal while any other change to a template,
+# trigger, condition or action still counts.
+
+_PLURAL = {"trigger": "triggers", "condition": "conditions", "action": "actions"}
+_DEFAULTS = {"description": "", "mode": "single", "max_exceeded": "warning",
+             "variables": {}, "trigger_variables": {}}
+_QUEUE_MAX = 10              # HA's default `max` for a queued or parallel automation
+_TEMPLATE = re.compile(r"\{\{|\{%|\{#")
+_NUMBER = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
 
 
-async def _unchanged_in_ha(aid: str, desired: dict, rest: HARest, manifest: dict) -> bool:
-    """Does Home Assistant already hold exactly this automation, written by
-    us? Only then is writing it again no change. Anything we can't confirm -
-    an id our manifest doesn't record, no copy in HA, a copy that differs, a
-    read that fails or a client that can't read - counts as a change, so
-    the plan errs toward writing."""
+def _as_list(value: Any) -> list:
+    return [] if value is None else value if isinstance(value, list) else [value]
+
+
+def _trigger(t: Any) -> Any:
+    if not isinstance(t, dict):
+        return t
+    t = dict(t)
+    if "platform" in t and "trigger" not in t:
+        t["trigger"] = t.pop("platform")
+    return t
+
+
+def _condition(c: Any) -> Any:
+    if not isinstance(c, dict):
+        return c                                     # a template shorthand
+    c = dict(c)
+    if "conditions" in c:                            # and / or / not
+        c["conditions"] = [_condition(x) for x in _as_list(c["conditions"])]
+    return c
+
+
+def _actions(value: Any) -> list:
+    return [_action(s) for s in _as_list(value)]
+
+
+def _action(s: Any) -> Any:
+    if not isinstance(s, dict):
+        return s
+    s = dict(s)
+    if "service" in s and "action" not in s:
+        s["action"] = s.pop("service")
+    if "choose" in s:
+        s["choose"] = [
+            {**o, "conditions": [_condition(c) for c in _as_list(o.get("conditions"))],
+             "sequence": _actions(o.get("sequence"))} if isinstance(o, dict) else o
+            for o in _as_list(s["choose"])]
+    for key in ("default", "then", "else", "sequence", "parallel"):
+        if key in s:
+            s[key] = _actions(s[key])
+    for key in ("if", "conditions"):
+        if key in s:
+            s[key] = [_condition(c) for c in _as_list(s[key])]
+    if isinstance(s.get("repeat"), dict):
+        s["repeat"] = _action(s["repeat"])
+    return s
+
+
+def _scalars(value: Any) -> Any:
+    """Numbers as floats (a numeric string too), a template's whitespace
+    collapsed to single spaces; everything else as it is."""
+    if isinstance(value, dict):
+        return {k: _scalars(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scalars(v) for v in value]
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        if _TEMPLATE.search(value):
+            return " ".join(value.split())
+        if _NUMBER.match(value.strip()):
+            return float(value)
+    return value
+
+
+def normalised(automation: dict) -> dict:
+    """An automation in the one shape both sides are compared in (see
+    above): no id, plural top-level keys, `trigger` and `action` for the
+    platform and the service, lists throughout, defaults left out, numbers
+    as floats and templates' whitespace collapsed."""
+    a = json.loads(json.dumps(automation))
+    top = {_PLURAL.get(k, k): v for k, v in a.items() if k != "id"}
+    top["triggers"] = [_trigger(t) for t in _as_list(top.get("triggers"))]
+    top["conditions"] = [_condition(c) for c in _as_list(top.get("conditions"))]
+    top["actions"] = _actions(top.get("actions"))
+    top = _scalars(top)
+    for key, default in _DEFAULTS.items():
+        if key in top and top[key] in (default, None):
+            del top[key]
+    if top.get("mode") in ("queued", "parallel") and top.get("max") == float(_QUEUE_MAX):
+        del top["max"]
+    return top
+
+
+def first_difference(ours: Any, theirs: Any, path: str = "") -> str | None:
+    """Where two configs first differ, as a path and both values; None if
+    they are equal."""
+    def show(v: Any) -> str:
+        text = json.dumps(v, ensure_ascii=False)
+        return text if len(text) <= 160 else text[:157] + "..."
+    if isinstance(ours, dict) and isinstance(theirs, dict):
+        for key in list(ours) + [k for k in theirs if k not in ours]:
+            if key not in theirs:
+                return f"{path}.{key}: ours {show(ours[key])}, Home Assistant's missing"
+            if key not in ours:
+                return f"{path}.{key}: ours missing, Home Assistant's {show(theirs[key])}"
+            found = first_difference(ours[key], theirs[key], f"{path}.{key}")
+            if found:
+                return found
+        return None
+    if isinstance(ours, list) and isinstance(theirs, list):
+        for i, (a, b) in enumerate(zip(ours, theirs)):
+            found = first_difference(a, b, f"{path}[{i}]")
+            if found:
+                return found
+        if len(ours) != len(theirs):
+            return f"{path}: ours has {len(ours)} items, Home Assistant's {len(theirs)}"
+        return None
+    if ours == theirs and type(ours) is type(theirs):
+        return None
+    where = ""
+    if isinstance(ours, str) and isinstance(theirs, str) and max(len(ours), len(theirs)) > 60:
+        at = next((i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b),
+                  min(len(ours), len(theirs)))
+        lo = max(0, at - 20)
+        where = f" (around character {at}: ours {show(ours[lo:at + 40])}, " \
+                f"Home Assistant's {show(theirs[lo:at + 40])})"
+    return f"{path or '.'}: ours {show(ours)}, Home Assistant's {show(theirs)}{where}"
+
+
+async def ha_copy_differs(aid: str, desired: dict, rest: HARest,
+                          manifest: dict) -> tuple[str | None, dict | None]:
+    """Why writing this automation would change Home Assistant, or None if
+    HA already holds exactly it, written by us; with HA's copy, if read.
+    Anything we can't confirm - an id our manifest doesn't record, no copy
+    in HA, a copy that differs, a read that fails or a client that can't
+    read - is a reason, so the plan errs toward writing."""
     if aid not in set(manifest.get("automations", [])):
-        return False
+        return "not in our deploy manifest", None
     read = getattr(rest, "get_automation", None)
     if read is None:
-        return False
+        return "this client can't read automations back", None
     try:
         current = await read(aid)
-    except Exception:
-        return False
-    return current is not None and _normalised(current) == _normalised(desired)
+    except Exception as e:
+        return f"reading Home Assistant's copy failed: {type(e).__name__}: {e}", None
+    if current is None:
+        return "Home Assistant has no copy", None
+    diff = first_difference(normalised(desired), normalised(current))
+    return (None if diff is None else f"Home Assistant's copy differs at {diff}"), current
 
 
 async def _reconcile_automations(rendered_automations: list[dict], rest: HARest,
@@ -282,13 +428,15 @@ async def _reconcile_automations(rendered_automations: list[dict], rest: HARest,
     desired = {a["id"]: a for a in rendered_automations}
 
     for aid, cfg in desired.items():
-        if await _unchanged_in_ha(aid, cfg, rest, manifest):
+        why, _ = await ha_copy_differs(aid, cfg, rest, manifest)
+        if why is None:
             report.automations_unchanged.append(aid)
             continue
         try:
             if apply:
                 await rest.set_automation(aid, cfg)
             report.automations_written.append(aid)
+            report.automations_why[aid] = why
         except Exception as e:
             report.problems.append(f"could not write automation {aid}: {e}")
 
