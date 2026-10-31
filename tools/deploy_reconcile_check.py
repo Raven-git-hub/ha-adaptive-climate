@@ -4,11 +4,15 @@ Adaptive Climate - deploy reconciliation offline test.
 Exercises app.deploy.deploy() against stub REST/WebSocket objects (no
 network, no Home Assistant) across four sequential deploys: over a v1
 install (create, prune the v1 helpers, leave foreign ones alone, set the
-starting values of what was created), idempotent reuse, an in-place
-update when offset_cap changes, and ledger-based pruning when a room is
-removed from config. Deploy only ever touches `ac_*` and sends no command
-to any unit. Before each deploy, check() - the dry run - must write nothing
-and list exactly what that deploy then does.
+starting values of what was created), idempotent reuse (every automation
+read back from HA as rendered, so none is written again and the plan has
+no changes), an automation edited in HA, one deleted there and one the
+manifest lost written again and only those, an in-place update when
+offset_cap changes (writing exactly the automations whose render changed),
+and ledger-based pruning when a room is removed from config. Deploy only
+ever touches `ac_*` and sends no command to any unit. Before each deploy,
+check() - the dry run - must write nothing and list exactly what that
+deploy then does.
 
     PYTHONPATH=. python tools/deploy_reconcile_check.py
 """
@@ -26,26 +30,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import control      # noqa: E402
 from app import deploy as d  # noqa: E402
+from app import generator as g  # noqa: E402
 
 
 class StubRest:
-    """Records automation writes/deletes and service calls; entity
-    existence is fixed."""
+    """Records automation writes/deletes and service calls, and keeps the
+    automations it was given as HA's config editor would (read back by id,
+    the id inside); entity existence is fixed."""
     def __init__(self, entity_ids):
         self._entities = set(entity_ids)
         self.set_calls: list[str] = []
         self.delete_calls: list[str] = []
         self.service_calls: list[tuple[str, str, dict]] = []
+        self.automations: dict[str, dict] = {}
 
     async def states(self):
         return [{"entity_id": e, "state": "on" if e.startswith("input_boolean.ac_hold_") else "x"}
                 for e in self._entities]
 
+    async def get_automation(self, aid):
+        return copy.deepcopy(self.automations.get(aid))
+
     async def set_automation(self, aid, cfg):
         self.set_calls.append(aid)
+        self.automations[aid] = json.loads(json.dumps(
+            {"id": aid, **{k: v for k, v in cfg.items() if k != "id"}}))
 
     async def delete_automation(self, aid):
         self.delete_calls.append(aid)
+        self.automations.pop(aid, None)
 
     async def call_service(self, domain, service, data=None):
         self.service_calls.append((domain, service, data or {}))
@@ -75,7 +88,7 @@ class StubWS:
 
 
 PLAN = ("helpers_created", "helpers_reused", "helpers_updated", "helpers_removed",
-        "automations_written", "automations_removed")
+        "automations_written", "automations_unchanged", "automations_removed")
 dry_runs = []
 
 
@@ -183,16 +196,41 @@ async def main() -> int:
     print(f"deploy 1: since set to now, offset to 0 and state to manual for the {units} new "
           "units; no climate command - OK")
 
-    # deploy 2: identical config -> idempotent, nothing pruned, nothing set
+    # deploy 2: identical config -> idempotent, nothing pruned, nothing set,
+    # nothing written: every automation reads back from HA as rendered
     rest.service_calls.clear()
+    writes = len(rest.set_calls)
     r2 = await check_then_deploy(cfg, rest, ws, tmp)
     assert r2.helpers_created == r2.helpers_updated == r2.helpers_removed == []
     assert len(r2.helpers_reused) == n_helpers
-    assert r2.automations_removed == []
-    assert len(r2.automations_written) == n_automations  # always upserted
+    assert r2.automations_removed == [] and r2.automations_written == []
+    assert len(r2.automations_unchanged) == n_automations, len(r2.automations_unchanged)
+    assert r2.changes == 0 and len(rest.set_calls) == writes
     assert rest.service_calls == [], rest.service_calls
-    print(f"deploy 2 (same config): idempotent, {n_helpers} reused, nothing pruned, no starting "
-          "values re-set (a running boost keeps its clock) - OK")
+    print(f"deploy 2 (same config): idempotent, {n_helpers} helpers reused and "
+          f"{n_automations} automations unchanged (HA's copies read back as rendered, so none "
+          "is written again: changes 0), nothing pruned, no starting values re-set (a running "
+          "boost keeps its clock) - OK")
+
+    # an automation HA no longer holds as we wrote it (edited by hand, or
+    # deleted), or one our manifest doesn't record, is written again
+    maint = next(a for a in rest.automations if a.startswith("ac_maintenance_"))
+    rest.automations[maint]["description"] = "edited in Home Assistant"
+    gone = next(a for a in rest.automations if a.startswith("ac_vote_"))
+    del rest.automations[gone]
+    manifest = json.loads(d._manifest_path(tmp).read_text())
+    unrecorded = next(a for a in manifest["automations"] if a.startswith("ac_scene_"))
+    manifest["automations"].remove(unrecorded)
+    d._manifest_path(tmp).write_text(json.dumps(manifest))
+    r2b = await check_then_deploy(cfg, rest, ws, tmp)
+    assert sorted(r2b.automations_written) == sorted([maint, gone, unrecorded]), \
+        r2b.automations_written
+    assert r2b.changes == 3 and len(r2b.automations_unchanged) == n_automations - 3
+    r2c = await d.check(cfg, rest, ws, tmp)
+    assert r2c.changes == 0, r2c.as_dict()
+    print(f"an automation edited in HA ({maint}), one deleted there ({gone}) and one our "
+          f"manifest lost ({unrecorded}) are written again, and only those (changes 3); the "
+          "next check finds nothing to change - OK")
 
     # deploy 3: a wider offset cap updates the offset helpers in place
     cfg3 = json.loads(json.dumps(cfg))
@@ -204,6 +242,15 @@ async def main() -> int:
     assert r3.helpers_created == r3.helpers_removed == [] and rest.service_calls == []
     print(f"deploy 3 (offset_cap {cap} -> {cap + 1}): the {units} offset helpers updated in "
           "place, nothing else touched - OK")
+
+    def rendered(c):
+        return {a["id"]: a for a in g.render_all(c)["automations"]}
+    before3, after3 = rendered(cfg), rendered(cfg3)
+    differ = sorted(a for a in after3 if after3[a] != before3.get(a))
+    assert differ and sorted(r3.automations_written) == differ, (r3.automations_written, differ)
+    assert len(r3.automations_unchanged) == n_automations - len(differ)
+    print(f"deploy 3: exactly the {len(differ)} automations whose render reads the offset cap "
+          f"rewritten, the other {n_automations - len(differ)} unchanged - OK")
 
     # deploy 4: baby_room removed -> only its own artifacts prune
     cfg4 = json.loads(json.dumps(cfg3))

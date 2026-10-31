@@ -41,6 +41,13 @@ Control (active):
   * scheduler loop - level-triggered; every tick, ask the scheduler which
     section should be active per room and fire the crossover (automation
     .trigger on the room's scene automation) when the answer changes.
+
+Config hot reload - reload() puts a new config in force without a restart:
+the rooms, sensors, units, schedules and settings are swapped in at once,
+every room replayed and pushed, and the scheduler run, so a moved section
+time takes effect. What a room decided for the section it is in stays (its
+conditions and block are locked for the section). One lock keeps a reload,
+a crossover and a replay from ever running at the same time.
   * almanac push - the almanac lives on sensor.ac_almanac_<room> as state
     attributes, with the room's learned block margin; API-set states do not
     survive an HA restart, so re-push on a timer, on every websocket
@@ -87,6 +94,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from app import control, outdoor
@@ -120,6 +128,36 @@ HA_START_EVENT = "homeassistant_start"
 
 def _profiles(config: dict) -> dict:
     return {p["id"]: p for p in config.get("schedule_profiles", [])}
+
+
+def _room_entries(config: dict) -> dict[str, tuple[dict, dict]]:
+    """The enabled rooms, in config order, each with the schedule profile it
+    follows (its own, else 'default', else the first)."""
+    profs = _profiles(config)
+    out = {}
+    for room in config.get("rooms", []):
+        if not room.get("enabled", True):
+            continue
+        out[room["id"]] = (room, profs.get(room.get("schedule_profile", "default"))
+                           or profs.get("default") or config["schedule_profiles"][0])
+    return out
+
+
+def _unit_index(entries: dict[str, tuple[dict, dict]]) -> dict[str, tuple[str, str]]:
+    return {u["entity_id"]: (room_id, u["id"])
+            for room_id, (room, _) in entries.items() for u in room["units"]}
+
+
+# The config's top-level sections, in the order a reload's event names them.
+CONFIG_SECTIONS = ("version", "homeassistant", "system", "learning", "outdoor", "rooms",
+                   "schedule_profiles")
+
+
+def changed_sections(old: dict, new: dict) -> list[str]:
+    """The top-level sections that differ between two configs."""
+    keys = [k for k in CONFIG_SECTIONS if k in old or k in new] + \
+        sorted(k for k in set(old) | set(new) if k not in CONFIG_SECTIONS)
+    return [k for k in keys if old.get(k) != new.get(k)]
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -270,6 +308,12 @@ class Runtime:
         self.last_votes: dict[str, dict] = {}                # room -> HA's latest ac_person_vote
         self._vote_seq = 0                                   # counts them, for the vote endpoint
         self._stopping = False
+        # One lock: a crossover, a replay and a config reload never run at
+        # the same time, so a reload never swaps the rooms out from under a
+        # crossover, and a crossover never sees half a reload.
+        self._lock = asyncio.Lock()
+        self._heartbeat_task: asyncio.Task | None = None
+        self._forecast_task: asyncio.Task | None = None
 
     # ---- config helpers -------------------------------------------
 
@@ -318,7 +362,7 @@ class Runtime:
             ts, ts_utc, _, _ = self._now()
             self.store.log_event(ts, ts_utc, "error", "config",
                                  f"the config does not validate: {e}. Running on it as it is; "
-                                 "fix it on the Config page, save, and restart",
+                                 "fix it on the Config page and Apply it",
                                  detail={"error": str(e)})
 
         states = await self.rest.states()
@@ -330,15 +374,10 @@ class Runtime:
             if s["entity_id"].startswith("automation.") and s.get("attributes", {}).get("id")
         }
 
-        profs = _profiles(self.config)
-        for room in self.config.get("rooms", []):
-            if not room.get("enabled", True):
-                continue
-            profile = profs.get(room.get("schedule_profile", "default")) \
-                or profs.get("default") or self.config["schedule_profiles"][0]
-            self.rooms[room["id"]] = RoomState(room=room, profile=profile)
-            for u in room["units"]:
-                self._unit_index[u["entity_id"]] = (room["id"], u["id"])
+        entries = _room_entries(self.config)
+        self.rooms = {rid: RoomState(room=room, profile=profile)
+                      for rid, (room, profile) in entries.items()}
+        self._unit_index = _unit_index(entries)
 
         # Register the resubscribe hook BEFORE the first subscribe, so a
         # drop at any point is repaired by the ws supervisor re-running it.
@@ -394,15 +433,161 @@ class Runtime:
 
         self._tasks = [
             asyncio.create_task(self._scheduler_loop(), name="ac-scheduler"),
-            asyncio.create_task(self._heartbeat_loop(), name="ac-heartbeat"),
             asyncio.create_task(self._almanac_push_loop(), name="ac-almanac-push"),
             asyncio.create_task(self._nightly_loop(), name="ac-nightly"),
         ]
-        if self._weather_entity:
-            # The catch-up crossovers' follow-ups may be fetching already;
-            # the loop's first pass then finds that forecast and waits.
-            self._tasks.append(asyncio.create_task(self._forecast_loop(), name="ac-forecast"))
+        self._start_heartbeat_loop()
+        # The catch-up crossovers' follow-ups may be fetching already; the
+        # forecast loop's first pass then finds that forecast and waits.
+        self._sync_forecast_loop()
         log.info("runtime started: %d room(s), tz=%s", len(self.rooms), tzname)
+
+    def _start_heartbeat_loop(self) -> None:
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._tasks.remove(self._heartbeat_task)
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="ac-heartbeat")
+        self._tasks.append(self._heartbeat_task)
+
+    def _sync_forecast_loop(self, restart: bool = False) -> None:
+        """Run the forecast loop while the outdoor source is the forecast:
+        start it, stop it, or (restart, for a new weather entity) start it
+        again so it fetches the new entity's forecast at once."""
+        running = self._forecast_task is not None and not self._forecast_task.done()
+        if running and (restart or not self._weather_entity):
+            self._forecast_task.cancel()
+            running = False
+        if self._forecast_task is not None and not running:
+            if self._forecast_task in self._tasks:
+                self._tasks.remove(self._forecast_task)
+            self._forecast_task = None
+        if self._weather_entity and not running:
+            self._forecast_task = asyncio.create_task(self._forecast_loop(), name="ac-forecast")
+            self._tasks.append(self._forecast_task)
+
+    # ---- config hot reload ----------------------------------------
+
+    async def reload(self, new_config: dict,
+                     commit: Callable[[], None] | None = None) -> dict:
+        """Put a new config in force without a restart (docs/V2_DESIGN.md,
+        Usability fixes). Atomic: the config is validated and the new rooms,
+        units and schedules built first, then `commit` runs (the Apply path
+        writes the config file there); if anything up to and including
+        `commit` raises, the running config is left exactly as it was and
+        the error goes to the caller. Then, in one step, the rooms, sensors,
+        units, schedules and the learning, control and outdoor settings are
+        swapped in, and one `config` event names the top-level sections that
+        changed. Every room is then replayed and its almanac and conditions
+        pushed, the forecast loop follows the outdoor source, and the
+        scheduler runs at once, so a moved section time crosses now if it
+        has already passed, or at its new time.
+
+        What a room already decided for the section it is in stays: its
+        conditions and block decision are locked for the section, so a
+        changed outdoor or block setting applies from each room's next
+        section, as after a restart. A room kept across the reload keeps its
+        section and any reactive window open.
+
+        Holds the runtime's lock throughout, so no crossover or replay runs
+        while the config changes."""
+        validate(new_config)
+        async with self._lock:
+            entries = _room_entries(new_config)
+            units = _unit_index(entries)
+            if commit is not None:
+                commit()
+            old = self.config
+            old_rooms = self.rooms
+            old_profiles = {rid: rs.profile for rid, rs in old_rooms.items()}
+            rooms: dict[str, RoomState] = {}
+            for rid, (room, profile) in entries.items():
+                rs = old_rooms.get(rid) or RoomState(room=room, profile=profile)
+                rs.room, rs.profile = room, profile
+                rooms[rid] = rs
+            for rid, rs in old_rooms.items():
+                if rid not in rooms and rs.reactive_task is not None:
+                    rs.reactive_task.cancel()
+            self.config, self.rooms, self._unit_index = new_config, rooms, units
+            # ---- in force from here; what follows is best effort ----
+            result = self._reload_summary(old, old_profiles)
+            self._log_reload(result)
+            try:
+                self.store.save_config_version(new_config)
+            except Exception as e:
+                log.warning("config snapshot failed: %s", e)
+            for rid in result["rooms_removed"]:
+                for key in [k for k in self._stale if k[0] == rid]:
+                    del self._stale[key]
+            for room_id in list(self.rooms):
+                await self._replay(room_id, "config reload")
+                await self._push_conditions(room_id)
+            old_out = old.get("outdoor") or {}
+            old_entity = old_out.get("weather_entity") if old_out.get("source") == "forecast" \
+                else None
+            if old_entity != self._weather_entity:
+                self._forecast, self._forecast_failed_at = None, None
+            self._sync_forecast_loop(restart=old_entity != self._weather_entity)
+            source = self._outdoor.get("source", "none")
+            if source != old_out.get("source", "none") and source in ("probe", "none"):
+                self._note_forecast(source, None)
+            interval = (old.get("system") or {}).get("heartbeat_interval_minutes", 10)
+            if self._heartbeat_task is not None and \
+                    interval != self._sys.get("heartbeat_interval_minutes", 10):
+                self._start_heartbeat_loop()
+            try:
+                # a room the reload added (or re-enabled) crosses as at startup:
+                # a catch-up, so a scene Home Assistant already shows isn't re-fired
+                result["crossovers"] = await self._tick_locked(
+                    catch_up=set(result["rooms_added"]))
+            except Exception as e:
+                log.warning("scheduler after reload: %s", e)
+                result["crossovers"] = []
+        log.info("config reloaded: %s", ", ".join(result["changed"]) or "nothing changed")
+        return result
+
+    def _reload_summary(self, old: dict, old_profiles: dict[str, dict]) -> dict:
+        """What a reload changed: the top-level sections, rooms added and
+        removed, and the rooms whose schedule (their profile's sections)
+        changed. old_profiles: each room's profile before the reload."""
+        return {
+            "changed": changed_sections(old, self.config),
+            "rooms_added": [r for r in self.rooms if r not in old_profiles],
+            "rooms_removed": [r for r in old_profiles if r not in self.rooms],
+            "schedule_changed": [r for r, rs in self.rooms.items() if r in old_profiles and
+                                 old_profiles[r].get("sections") != rs.profile.get("sections")],
+        }
+
+    def _log_reload(self, result: dict) -> None:
+        """The reload's one `config` event."""
+        changed = result["changed"]
+        parts = [f"{', '.join(changed)} changed" if changed else "nothing changed"]
+        names = {rid: rs.room.get("name", rid) for rid, rs in self.rooms.items()}
+        if result["rooms_added"]:
+            parts.append("rooms added: " + ", ".join(names[r] for r in result["rooms_added"]))
+        if result["rooms_removed"]:
+            parts.append("rooms removed: " + ", ".join(result["rooms_removed"]))
+        if result["schedule_changed"]:
+            parts.append("schedule changed for " +
+                         ", ".join(names[r] for r in result["schedule_changed"]))
+        tail = (". Outdoor and block settings apply from each room's next section; what a "
+                "room decided for the section it is in stays") if "outdoor" in changed else ""
+        ts, ts_utc, _, _ = self._now()
+        try:
+            self.store.log_event(ts, ts_utc, "info", "config",
+                                 f"Config applied without a restart: {'; '.join(parts)}{tail}",
+                                 detail=dict(result))
+        except Exception as e:
+            log.warning("could not log the config reload: %s", e)
+
+    async def refresh_automations(self) -> None:
+        """Re-read which automation entity each of our automation ids is
+        (after a deploy has written new ones, say)."""
+        states = await self.rest.states()
+        self._automation_entity = {
+            s["attributes"]["id"]: s["entity_id"]
+            for s in states
+            if s["entity_id"].startswith("automation.") and s.get("attributes", {}).get("id")
+        }
 
     async def stop(self) -> None:
         self._stopping = True
@@ -851,6 +1036,11 @@ class Runtime:
     # ---- crossover / control --------------------------------------
 
     async def _crossover(self, rs: RoomState, section: str, started, catch_up: bool) -> None:
+        async with self._lock:
+            await self._crossover_locked(rs, section, started, catch_up)
+
+    async def _crossover_locked(self, rs: RoomState, section: str, started,
+                                catch_up: bool) -> None:
         room_id = rs.room["id"]
         ts, ts_utc, local_date, now = self._now()
         # A run is dated by when it started, so a catch-up after midnight
@@ -899,6 +1089,13 @@ class Runtime:
 
         if refire:
             entity = self._automation_entity.get(scene_automation_id(room_id, section))
+            if entity is None:
+                # a room added since startup: its scene may have been deployed since
+                try:
+                    await self.refresh_automations()
+                except Exception as e:
+                    log.warning("automation lookup for %s failed: %s", room_id, e)
+                entity = self._automation_entity.get(scene_automation_id(room_id, section))
             if entity:
                 await self._safe_service("automation", "trigger", {"entity_id": entity})
             else:
@@ -1092,11 +1289,14 @@ class Runtime:
         """The follow-up to a crossover that fired on fail-open conditions:
         fetch the forecast, decide and publish the real conditions."""
         forecast = await self._forecast_for(outdoor.CACHE_MAX_AGE)
-        ov = self._section_outdoor(rs, section, started, forecast)
-        cond = await self._decide(rs, run_date, section, started, ov)
-        if rs.section == section:                    # not overtaken by the next crossover
-            await self._publish_conditions(rs, cond)
-        self._settle_section(rs, run_date, ov, cond, kept=False)
+        async with self._lock:
+            if self.rooms.get(rs.room["id"]) is not rs:
+                return                               # the room was removed by a reload
+            ov = self._section_outdoor(rs, section, started, forecast)
+            cond = await self._decide(rs, run_date, section, started, ov)
+            if rs.section == section:                # not overtaken by the next crossover
+                await self._publish_conditions(rs, cond)
+            self._settle_section(rs, run_date, ov, cond, kept=False)
 
     def _settle_section(self, rs: RoomState, run_date: str, ov: SectionOutdoor | None,
                         cond: control.Conditions, kept: bool) -> None:
@@ -1300,7 +1500,13 @@ class Runtime:
     async def replay_room(self, room_id: str, reason: str) -> None:
         """Re-run the reaction replay for one room as of now, publish it and
         push it to HA. A failure is logged and leaves the almanac in force."""
-        rs = self.rooms[room_id]
+        async with self._lock:
+            await self._replay(room_id, reason)
+
+    async def _replay(self, room_id: str, reason: str) -> None:
+        rs = self.rooms.get(room_id)
+        if rs is None:
+            return                  # removed by a config reload since it was scheduled
         ts, ts_utc, _, now = self._now()
         try:
             sections = analyse_room(self.store._conn, rs.room, self._learning_config(), now)
@@ -1363,27 +1569,40 @@ class Runtime:
         task.add_done_callback(self._followups.discard)
 
     async def run_analysis(self, reason: str = "nightly") -> None:
-        for room_id in self.rooms:
+        for room_id in list(self.rooms):
             await self.replay_room(room_id, reason)
 
     # ---- loops ----------------------------------------------------
 
+    async def _tick(self) -> list[dict]:
+        """One scheduler pass: cross every room whose schedule says it should
+        be in another section now."""
+        async with self._lock:
+            return await self._tick_locked()
+
+    async def _tick_locked(self, catch_up: set[str] = frozenset()) -> list[dict]:
+        crossed = []
+        _, _, _, now = self._now()
+        for rs in list(self.rooms.values()):
+            section, started = active_section_at(rs.profile, now, self.tz)
+            if section != rs.section:
+                await self._crossover_locked(rs, section, started,
+                                             catch_up=rs.room["id"] in catch_up)
+                crossed.append({"room": rs.room["id"], "section": section})
+        return crossed
+
     async def _scheduler_loop(self) -> None:
         while not self._stopping:
             try:
-                _, _, _, now = self._now()
-                for rs in self.rooms.values():
-                    section, started = active_section_at(rs.profile, now, self.tz)
-                    if section != rs.section:
-                        await self._crossover(rs, section, started, catch_up=False)
+                await self._tick()
             except Exception as e:
                 log.warning("scheduler tick error: %s", e)
             await asyncio.sleep(SCHEDULER_TICK_SECONDS)
 
     async def _heartbeat_loop(self) -> None:
-        interval = self._sys.get("heartbeat_interval_minutes", 10) * 60
         while not self._stopping:
-            await asyncio.sleep(interval)
+            # read each pass, so a reloaded interval is used from the next one
+            await asyncio.sleep(self._sys.get("heartbeat_interval_minutes", 10) * 60)
             for rs in list(self.rooms.values()):
                 try:
                     await self._do_heartbeat(rs)

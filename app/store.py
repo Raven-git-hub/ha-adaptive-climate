@@ -662,7 +662,7 @@ class Store:
             q += " AND category=?"; params.append(category)
         if severity:
             q += " AND severity=?"; params.append(severity)
-        q += " ORDER BY ts_utc DESC LIMIT ?"; params.append(limit)
+        q += " ORDER BY ts_utc DESC, id DESC LIMIT ?"; params.append(limit)
         with self._lock:
             rows = self._conn.execute(q, params).fetchall()
         out = []

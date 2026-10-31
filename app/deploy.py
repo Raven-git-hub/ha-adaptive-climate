@@ -18,7 +18,8 @@ two different APIs:
     deployed (data/config/deploy_manifest.json) and diff desired-now
     against deployed-last-time. This never depends on being able to
     enumerate HA's automations, and it never touches an id we didn't
-    write ourselves. See docs/DEPLOY.md.
+    write ourselves. Each desired automation is read back by its own id
+    and written only if HA's copy differs. See docs/DEPLOY.md.
 
 Either way, deploy NEVER deletes anything outside our own `ac_*`
 namespace - see docs/DESIGN.md 13 and the ownership discussion in
@@ -32,6 +33,10 @@ check() is the dry run: it verifies every referenced entity exists and,
 given the WebSocket client and the data dir, reports exactly what deploy()
 would create, reuse, update, remove and write, from the same plan, without
 writing anything. deploy() refuses to proceed if any entity is missing.
+An automation Home Assistant already holds exactly as rendered (and our
+manifest records) is unchanged and isn't written again, so the plan's
+`changes` count says whether a deploy would change Home Assistant at all;
+the Config page's Apply reads it (docs/V2_DESIGN.md, Usability fixes).
 """
 
 from __future__ import annotations
@@ -67,6 +72,7 @@ class DeployReport:
     helpers_updated: list[str] = field(default_factory=list)
     helpers_removed: list[str] = field(default_factory=list)
     automations_written: list[str] = field(default_factory=list)
+    automations_unchanged: list[str] = field(default_factory=list)
     automations_removed: list[str] = field(default_factory=list)
     missing_entities: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
@@ -75,6 +81,15 @@ class DeployReport:
     @property
     def ok(self) -> bool:
         return not self.problems and not self.missing_entities
+
+    @property
+    def changes(self) -> int:
+        """How many things in Home Assistant this plan changes: helpers
+        created, updated or removed, automations written or removed. 0 means
+        a deploy would leave Home Assistant exactly as it is."""
+        return sum(len(x) for x in (self.helpers_created, self.helpers_updated,
+                                    self.helpers_removed, self.automations_written,
+                                    self.automations_removed))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -85,7 +100,9 @@ class DeployReport:
             "helpers_updated": self.helpers_updated,
             "helpers_removed": self.helpers_removed,
             "automations_written": self.automations_written,
+            "automations_unchanged": self.automations_unchanged,
             "automations_removed": self.automations_removed,
+            "changes": self.changes,
             "missing_entities": self.missing_entities,
             "problems": self.problems,
             "notes": self.notes,
@@ -231,14 +248,43 @@ async def _reconcile_helpers(rendered_helpers: list[dict], ws: HAWebSocket,
                 report.problems.append(f"could not remove stale helper {label}: {err}")
 
 
+def _normalised(automation: dict) -> Any:
+    """An automation's config as Home Assistant stores it, without its id
+    (the body we post has none; HA adds it), through JSON so tuples and
+    lists, ints and floats compare as HA's copy reads back."""
+    return json.loads(json.dumps({k: v for k, v in automation.items() if k != "id"}))
+
+
+async def _unchanged_in_ha(aid: str, desired: dict, rest: HARest, manifest: dict) -> bool:
+    """Does Home Assistant already hold exactly this automation, written by
+    us? Only then is writing it again no change. Anything we can't confirm -
+    an id our manifest doesn't record, no copy in HA, a copy that differs, a
+    read that fails or a client that can't read - counts as a change, so
+    the plan errs toward writing."""
+    if aid not in set(manifest.get("automations", [])):
+        return False
+    read = getattr(rest, "get_automation", None)
+    if read is None:
+        return False
+    try:
+        current = await read(aid)
+    except Exception:
+        return False
+    return current is not None and _normalised(current) == _normalised(desired)
+
+
 async def _reconcile_automations(rendered_automations: list[dict], rest: HARest,
                                  manifest: dict, report: DeployReport,
                                  apply: bool = True) -> None:
-    """Write every desired automation (always upserted) and prune the ones
-    our manifest says we wrote before. apply=False plans only."""
+    """Write every desired automation that Home Assistant doesn't already
+    hold as rendered (new, changed, or not in our manifest), and prune the
+    ones our manifest says we wrote before. apply=False plans only."""
     desired = {a["id"]: a for a in rendered_automations}
 
     for aid, cfg in desired.items():
+        if await _unchanged_in_ha(aid, cfg, rest, manifest):
+            report.automations_unchanged.append(aid)
+            continue
         try:
             if apply:
                 await rest.set_automation(aid, cfg)

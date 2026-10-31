@@ -123,7 +123,9 @@ setInterval(poll, 15000);
 
 let cfg = null;                 // working copy of the config
 let cfgMode = "form";           // 'form' | 'raw'
-let entityLists = { climate: [], sensor: [], binary_sensor: [], connected: false };
+let entityLists = { climate: [], sensor: [], binary_sensor: [], weather: [], connected: false };
+let cfgSchema = null;           // schema/config.schema.json, for defaults and ranges
+let pendingApply = null;        // a preview awaiting Confirm: {config, token}
 const uiOpen = { rooms: new Set(), profiles: new Set() };
 let cfgListenersWired = false;
 
@@ -201,20 +203,20 @@ async function renderConfig() {
   }
   if (uiOpen.rooms.size === 0) (cfg.rooms || []).forEach((r) => uiOpen.rooms.add(r.id));
 
+  pendingApply = null;
   view.innerHTML = `
     <div class="toolbar">
-      <button id="cfg-save">Validate &amp; Save</button>
-      <button id="cfg-check">Check deploy</button>
-      <button id="cfg-deploy" class="danger">Deploy to Home Assistant</button>
+      <button id="cfg-apply" class="primary">Apply</button>
+      <span id="cfg-msg" class="cfg-msg" role="status"></span>
       <span class="spacer"></span>
       <button id="cfg-mode" data-action="toggle-mode">${cfgMode === "form" ? "Raw JSON" : "Form view"}</button>
-      <span id="cfg-msg" class="muted"></span>
     </div>
-    <p class="muted">A change to section <b>times</b> is live from Save alone. A change to what a
-      scene <b>does</b> \u2014 a unit's auto/off mode, transition time, or any room/unit/sensor \u2014
-      needs <b>Deploy</b>. The running observer picks up a saved config after a container restart.</p>
+    <p class="muted cfg-intro"><b>Apply</b> checks the config, then works out what it would change
+      in Home Assistant. If nothing there changes it is saved and in force at once; if helpers or
+      automations change you see them first and confirm before they are deployed. No restart is
+      needed. Outdoor and block settings take effect from each room's next section.</p>
+    <div id="cfg-apply-panel"></div>
     <div id="cfg-body"></div>
-    <pre id="cfg-report" class="report"></pre>
     <datalist id="dl-climate"></datalist>
     <datalist id="dl-sensor"></datalist>
     <datalist id="dl-binary_sensor"></datalist>
@@ -222,19 +224,35 @@ async function renderConfig() {
 
   wireConfigToolbar();
   if (!cfgListenersWired) { wireConfigDelegation(); cfgListenersWired = true; }
-  await loadEntities();
+  await Promise.all([loadEntities(), loadSchema()]);
   renderConfigBody();
+}
+
+async function loadSchema() {
+  if (cfgSchema) return;
+  try { cfgSchema = await (await fetch("/api/schema")).json(); }
+  catch { cfgSchema = null; }   /* fields still work, without defaults */
+}
+
+// The schema node for a config path ("system.control.boost_degrees").
+function schemaAt(path) {
+  let node = cfgSchema;
+  for (const part of path.split(".")) {
+    node = node && node.properties ? node.properties[part] : undefined;
+  }
+  return node || null;
 }
 
 async function loadEntities() {
   try {
-    const [c, s, b] = await Promise.all([
+    const [c, s, b, w] = await Promise.all([
       fetch("/api/entities?domain=climate").then((r) => r.json()),
       fetch("/api/entities?domain=sensor").then((r) => r.json()),
       fetch("/api/entities?domain=binary_sensor").then((r) => r.json()),
+      fetch("/api/entities?domain=weather").then((r) => r.json()),
     ]);
     entityLists = { climate: c.entities || [], sensor: s.entities || [],
-                    binary_sensor: b.entities || [],
+                    binary_sensor: b.entities || [], weather: w.entities || [],
                     connected: c.connected, note: c.note };
     const fill = (id, list) => {
       const dl = document.getElementById(id);
@@ -252,77 +270,186 @@ function entityKnown(domain, entityId) {
   return entityLists[domain].some((e) => e.entity_id === entityId);
 }
 
-// ---- Config: toolbar (save/check/deploy/mode) -------------------
+// ---- Config: toolbar (apply/mode) ------------------------------
 
 function wireConfigToolbar() {
-  const msg = document.getElementById("cfg-msg");
-  const report = document.getElementById("cfg-report");
-
-  document.getElementById("cfg-save").addEventListener("click", async () => {
-    if (cfgMode === "raw") {         // save what is in the text box, not the last form state
+  document.getElementById("cfg-apply").addEventListener("click", () => {
+    // raw mode applies what is in the text box, not the last form state
+    if (cfgMode === "raw") {
       try { cfg = JSON.parse(document.getElementById("cfg-raw").value); }
-      catch (e) { msg.textContent = "not saved: invalid JSON: " + e.message; return; }
+      catch (e) { return showApply({ status: "refused", problems: ["invalid JSON: " + e.message] }); }
     }
     const dupes = duplicateIds(cfg);
     if (dupes.length) {
-      msg.textContent = "not saved: duplicate id " + dupes.join(", ") + " - give each its own id";
-      return;
+      return showApply({ status: "refused", problems: [
+        "duplicate id " + dupes.join(", ") + " - give each its own id"] });
     }
-    msg.textContent = "saving\u2026";
-    const r = await fetch("/api/config", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(cfg),
+    postApply({ config: JSON.parse(JSON.stringify(cfg)) });
+  });
+}
+
+// ---- Config: Apply (POST /api/apply) ----------------------------
+// refused: shown, nothing written. preview: the plan, with Confirm and
+// Cancel; Confirm posts the same config back with the preview's token, Cancel
+// sends nothing. applied: saved and in force (and deployed, if Home Assistant
+// changed). error: the reload failed; nothing changed.
+
+function setCfgMsg(text, kind) {
+  const msg = document.getElementById("cfg-msg");
+  if (!msg) return;
+  msg.textContent = text;
+  msg.className = "cfg-msg" + (kind ? " " + kind : "");
+}
+
+async function postApply(body) {
+  const btn = document.getElementById("cfg-apply");
+  btn.disabled = true;
+  document.querySelectorAll("#cfg-apply-panel button").forEach((b) => { b.disabled = true; });
+  setCfgMsg(body.confirm ? "applying and deploying\u2026" : "checking\u2026");
+  let j;
+  try {
+    const r = await fetch("/api/apply", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
-    const j = await r.json().catch(() => ({}));
-    msg.textContent = r.ok ? "saved" : "rejected: " + (j.detail || r.status);
-  });
+    j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.status) j = { status: "error", error: j.detail || `request failed (${r.status})` };
+  } catch (e) {
+    j = { status: "error", error: "could not reach the container: " + e.message };
+  }
+  btn.disabled = false;
+  showApply(j, body.config);
+  if (j.status === "applied") {
+    // show what was saved: the version 2 config, as the server holds it now
+    try { cfg = await (await fetch("/api/config")).json(); } catch { /* keep the local copy */ }
+    renderConfigBody();
+  }
+}
 
-  document.getElementById("cfg-check").addEventListener("click", async () => {
-    msg.textContent = "checking\u2026"; report.textContent = "";
-    const r = await fetch("/api/deploy/check");
-    const j = await r.json().catch(() => ({ detail: "request failed" }));
-    msg.textContent = r.ok ? "check complete" : "check failed";
-    report.textContent = JSON.stringify(j, null, 2);
-  });
+function showApply(j, config) {
+  const panel = document.getElementById("cfg-apply-panel");
+  pendingApply = j.status === "preview" ? { config, token: j.token } : null;
+  if (j.status === "preview") {
+    setCfgMsg("Review the Home Assistant changes below", "warn");
+    panel.innerHTML = previewHtml(j);
+  } else if (j.status === "applied") {
+    setCfgMsg(j.message, j.deploy && !j.deploy.ok ? "warn" : "ok");
+    panel.innerHTML = appliedHtml(j);
+  } else if (j.status === "refused") {
+    setCfgMsg("Not applied", "err");
+    panel.innerHTML = refusedHtml(j);
+  } else {
+    setCfgMsg("Not applied", "err");
+    panel.innerHTML = `<section class="apply-panel err" data-apply="error">
+      <h3>Not applied</h3><p>${escapeHtml(String(j.error || "unknown error"))}</p>
+      <p class="muted">${escapeHtml(j.message || "Nothing was changed.")}</p></section>`;
+  }
+}
 
-  document.getElementById("cfg-deploy").addEventListener("click", async () => {
-    if (!confirm("This writes helpers and automations to your real Home " +
-                 "Assistant and lets them start controlling these thermostats. Continue?")) return;
-    msg.textContent = "deploying\u2026"; report.textContent = "";
-    const btn = document.getElementById("cfg-deploy"); btn.disabled = true;
-    const r = await fetch("/api/deploy", { method: "POST" });
-    const j = await r.json().catch(() => ({ detail: "request failed" }));
-    msg.textContent = r.ok && j.ok ? "deployed" : "deploy finished with problems";
-    report.textContent = JSON.stringify(j, null, 2);
-    btn.disabled = false;
-  });
+const PLAN_GROUPS = [
+  ["helpers_created", "Helpers created"], ["helpers_updated", "Helpers updated"],
+  ["helpers_removed", "Helpers removed"], ["automations_written", "Automations written"],
+  ["automations_removed", "Automations removed"],
+];
+
+function planHtml(plan) {
+  const groups = PLAN_GROUPS.filter(([k]) => (plan[k] || []).length).map(([k, label]) => `
+    <div class="plan-group" data-group="${k}">
+      <h4>${label} <span class="count">${plan[k].length}</span></h4>
+      <ul>${plan[k].map((x) => `<li><code>${escapeHtml(x)}</code></li>`).join("")}</ul>
+    </div>`).join("");
+  return `<div class="plan-groups">${groups || '<p class="muted">Nothing changes in Home Assistant.</p>'}</div>
+    <p class="muted">Unchanged: ${plan.helpers_reused ?? 0} helpers, ${plan.automations_unchanged ?? 0} automations.</p>`;
+}
+
+function listHtml(title, items, cls) {
+  if (!items || !items.length) return "";
+  return `<div class="apply-list ${cls || ""}"><h4>${title}</h4>
+    <ul>${items.map((x) => `<li>${escapeHtml(String(x))}</li>`).join("")}</ul></div>`;
+}
+
+function previewHtml(j) {
+  const plan = j.plan || {};
+  return `<section class="apply-panel preview" data-apply="preview" aria-label="Apply preview">
+    <h3>Apply would change Home Assistant</h3>
+    <p class="muted">Nothing has been saved yet. <b>Confirm</b> saves this config, puts it in force
+      and deploys these changes; <b>Cancel</b> changes nothing.</p>
+    ${j.stale ? '<p class="warn">Home Assistant changed since the last preview; this is the plan now.</p>' : ""}
+    ${planHtml(plan)}
+    ${listHtml("Problems", plan.problems, "err") || '<p class="muted">Problems: none.</p>'}
+    ${listHtml("Notes", plan.notes, "warn")}
+    <div class="apply-actions">
+      <button class="primary" data-action="apply-confirm">Confirm and deploy</button>
+      <button data-action="apply-cancel">Cancel</button>
+    </div>
+  </section>`;
+}
+
+function appliedHtml(j) {
+  const rl = j.reload || {};
+  const changed = rl.changed ? (rl.changed.length ? rl.changed.join(", ") : "nothing") : null;
+  const crossed = (rl.crossovers || []).map((c) => `${c.room} \u2192 ${c.section}`);
+  const dep = j.deploy;
+  return `<section class="apply-panel ${dep && !dep.ok ? "warn" : "ok"}" data-apply="applied">
+    <h3>${escapeHtml(j.message)}</h3>
+    <p class="muted">Saved as config version ${j.version}${changed !== null ? `; in force now (changed: ${escapeHtml(changed)})` : ""}${
+      rl.runtime === "started" ? "; the runtime started" : ""}.
+      ${j.backup ? `The previous config is in <code>backups/${escapeHtml(j.backup)}</code>.` : ""}</p>
+    ${crossed.length ? `<p class="muted">Section change on the new schedule: ${escapeHtml(crossed.join(", "))}.</p>` : ""}
+    ${dep ? `<h4 class="sub">Deployed</h4>${planHtml({ ...dep, helpers_reused: dep.helpers_reused.length,
+                                                     automations_unchanged: dep.automations_unchanged.length })}
+      ${listHtml("Problems", dep.problems, "err")}${listHtml("Notes", dep.notes, "muted")}` : ""}
+  </section>`;
+}
+
+function refusedHtml(j) {
+  const plan = j.plan || {};
+  return `<section class="apply-panel err" data-apply="refused">
+    <h3>Not applied: fix these first</h3>
+    ${listHtml("Problems", j.problems, "err")}
+    ${listHtml("Not found in Home Assistant", plan.missing_entities, "err")}
+    <p class="muted">Nothing was saved or deployed.</p>
+  </section>`;
 }
 
 // ---- Config: delegated input/change/click (survives body re-renders) ---
 
+// An edit while a preview is up: the preview no longer matches the form.
+function previewOutdated() {
+  if (!pendingApply) return;
+  pendingApply = null;
+  document.getElementById("cfg-apply-panel").innerHTML = "";
+  setCfgMsg("Changed since the preview: Apply again to see the changes", "warn");
+}
+
 function wireConfigDelegation() {
   view.addEventListener("input", (e) => {
     const t = e.target;
+    if (t.id === "cfg-raw") { previewOutdated(); return; }
     if (!t.dataset || !t.dataset.path || t.dataset.live !== "1") return;
     applyFieldValue(t);
+    previewOutdated();
     if (t.dataset.checkEntity) updateEntityCheck(t);
+    if (t.dataset.vtype === "negnumber") updateMarginReadout(t);
   });
   view.addEventListener("change", (e) => {
     const t = e.target;
     if (!t.dataset) return;
     if (t.dataset.sensorType === "1") {
       handleSensorTypeChange(t);
+      previewOutdated();
       renderConfigBody();
       return;
     }
     if (!t.dataset.path) return;
     applyFieldValue(t);
+    previewOutdated();
     if (t.dataset.checkEntity) updateEntityCheck(t);
   });
   view.addEventListener("click", (e) => {
     const b = e.target.closest("[data-action]");
     if (!b || !view.contains(b)) return;
     const fn = cfgActions[b.dataset.action];
+    if (fn && b.tagName === "A") e.preventDefault();
     if (fn) fn(b.dataset);
   });
 }
@@ -332,6 +459,8 @@ function applyFieldValue(t) {
   if (t.type === "checkbox") v = t.checked;
   else v = t.value;
   if (t.dataset.vtype === "number") v = v === "" ? undefined : parseFloat(v);
+  else if (t.dataset.vtype === "negnumber") v = v === "" ? undefined : -parseFloat(v) + 0;
+  else if (t.dataset.vtype === "nullable") v = v === "" ? null : v;
   else if (t.dataset.vtype === "csv") v = v.split(",").map((x) => x.trim()).filter(Boolean);
 
   if (t.dataset.leakDerive === "1") {
@@ -374,6 +503,22 @@ function updateEntityCheck(t) {
 // ---- Config: actions (structural changes -> re-render body only) ---
 
 const cfgActions = {
+  "apply-confirm": () => {
+    if (!pendingApply) return;
+    postApply({ config: pendingApply.config, confirm: true, token: pendingApply.token });
+  },
+  "apply-cancel": () => {
+    pendingApply = null;
+    document.getElementById("cfg-apply-panel").innerHTML = "";
+    setCfgMsg("Cancelled: nothing was saved or deployed");
+  },
+  "reset-default": (d) => {
+    const node = schemaAt(d.path);
+    if (!node || !("default" in node)) return;
+    setPath(cfg, d.path, JSON.parse(JSON.stringify(node.default)));
+    previewOutdated();
+    renderConfigBody();
+  },
   "toggle-mode": () => {
     if (cfgMode === "form") {
       cfgMode = "raw";
@@ -398,7 +543,7 @@ const cfgActions = {
     renderConfigBody();
   },
   "remove-room": (d) => {
-    if (!confirm(`Remove room "${d.room}" from config? (Deploy afterward to remove it from Home Assistant too.)`)) return;
+    if (!confirm(`Remove room "${d.room}" from config? (Apply afterward to remove it from Home Assistant too.)`)) return;
     cfg.rooms = cfg.rooms.filter((r) => r.id !== d.room);
     renderConfigBody();
   },
@@ -497,12 +642,162 @@ function leakField(path, val, domain) {
   </span>`;
 }
 
+// ---- Config: settings (structured, with the schema's defaults) ----
+
+const fmtNum = (x) => (typeof x === "number" ? String(+x.toFixed(3)).replace("-", "\u2212") : String(x));
+
+function rangeText(node, negate) {
+  let lo = node.minimum ?? node.exclusiveMinimum, hi = node.maximum;
+  if (negate) [lo, hi] = [hi === undefined ? undefined : -hi, lo === undefined ? undefined : -lo];
+  if (lo === undefined && hi === undefined) return "";
+  const above = !negate && node.exclusiveMinimum !== undefined ? " (above)" : "";
+  if (hi === undefined) return `${fmtNum(lo)}${above} or more`;
+  if (lo === undefined) return `up to ${fmtNum(hi)}`;
+  return `${fmtNum(lo)}${above} to ${fmtNum(hi)}`;
+}
+
+// The line under a field: the schema's default, its range, and a reset link.
+function defaultLine(path, opts = {}) {
+  const node = schemaAt(path);
+  if (!node || !("default" in node)) return "";
+  const def = opts.negate ? -node.default : node.default;
+  const shown = opts.label ? opts.label(node.default) : fmtNum(def === null ? "none" : def);
+  const range = node.type === "number" || node.type === "integer" ? rangeText(node, opts.negate) : "";
+  return `<span class="setting-default">default ${escapeHtml(shown)}${range ? ` \u00b7 ${range}` : ""}
+    \u00b7 <a href="#" data-action="reset-default" data-path="${path}">reset to default</a></span>`;
+}
+
+function numInput(path, val, node, opts = {}) {
+  const neg = !!opts.negate;
+  const shown = val === undefined || val === null ? "" : neg ? -val + 0 : val;
+  let lo = node?.minimum ?? node?.exclusiveMinimum, hi = node?.maximum;
+  if (neg) [lo, hi] = [hi === undefined ? undefined : -hi, lo === undefined ? undefined : -lo];
+  const step = opts.step || (node?.type === "integer" ? "1" : "0.1");
+  return `<input type="number" id="f-${path.replace(/\./g, "-")}" step="${step}"
+    ${lo !== undefined ? `min="${lo}"` : ""} ${hi !== undefined ? `max="${hi}"` : ""}
+    data-path="${path}" data-vtype="${neg ? "negnumber" : "number"}" data-live="1" value="${shown}" />`;
+}
+
+// One setting: label, input (and unit), default + range + reset, one line of help.
+function setting(path, label, help, opts = {}) {
+  const node = schemaAt(path) || {};
+  const val = getPath(cfg, path, node.default);
+  const id = `f-${path.replace(/\./g, "-")}`;
+  const control = opts.control ? opts.control(val, node)
+    : `${numInput(path, val, node, opts)}${opts.unit ? `<span class="unit">${opts.unit}</span>` : ""}`;
+  return `<div class="setting${opts.wide ? " wide" : ""}" data-setting="${path}">
+    <label for="${id}">${label}</label>
+    <div class="setting-input">${control}</div>
+    ${defaultLine(path, opts)}
+    <p class="help">${help}</p>
+  </div>`;
+}
+
+function selectControl(path, choices) {
+  return (val) => `<select id="f-${path.replace(/\./g, "-")}" data-path="${path}" data-live="1">
+    ${choices.map(([v, text, disabled]) => `<option value="${v}" ${v === val ? "selected" : ""}
+      ${disabled ? "disabled" : ""}>${escapeHtml(text)}</option>`).join("")}</select>`;
+}
+
+// The weather entities Home Assistant has, each with its temperature now and
+// whether it offers an hourly forecast; one without is listed but disabled.
+function weatherControl(val) {
+  const list = entityLists.weather || [];
+  const opts = list.map((e) => {
+    const temp = e.temperature === null || e.temperature === undefined ? "no temperature"
+      : `${fmtNum(e.temperature)}${e.temperature_unit || "\u00b0"}`;
+    const why = e.hourly ? "hourly forecast" : "no hourly forecast";
+    return `<option value="${escapeHtml(e.entity_id)}" ${e.entity_id === val ? "selected" : ""}
+      ${e.hourly ? "" : "disabled"} data-hourly="${e.hourly ? 1 : 0}">${escapeHtml(e.name)} (${escapeHtml(e.entity_id)}) \u2014 ${temp}, ${why}</option>`;
+  });
+  if (val && !list.some((e) => e.entity_id === val)) {
+    opts.unshift(`<option value="${escapeHtml(val)}" selected>${escapeHtml(val)} \u2014 ${
+      entityLists.connected ? "not found in Home Assistant" : "can't check: Home Assistant not reachable"}</option>`);
+  }
+  opts.unshift(`<option value="" ${val ? "" : "selected"}>\u2014 none \u2014</option>`);
+  return `<select id="f-outdoor-weather_entity" data-path="outdoor.weather_entity" data-live="1"
+    data-vtype="nullable">${opts.join("")}</select>`;
+}
+
+// "Stop cooling when the section's warmest hour is at or below comfort + X°",
+// X = -margin: the margin is entered the way it reads.
+function marginControl(val, node) {
+  return `<span class="sentence">Stop cooling when the section's warmest hour is at or below
+    comfort + ${numInput("outdoor.initial_margin", val, node, { negate: true, step: "0.5" })}\u00b0
+    <span class="readout" data-readout="margin">${marginReadout(val)}</span></span>`;
+}
+
+function marginReadout(margin) {
+  if (margin === undefined || margin === null || Number.isNaN(margin)) return "";
+  const x = -margin + 0;
+  return `(margin ${fmtNum(margin)}: comfort ${x < 0 ? "\u2212" : "+"} ${fmtNum(Math.abs(x))}\u00b0 or below)`;
+}
+
+function updateMarginReadout(t) {
+  const out = t.closest(".setting")?.querySelector('[data-readout="margin"]');
+  if (out) out.textContent = marginReadout(getPath(cfg, "outdoor.initial_margin"));
+}
+
+function outdoorHtml() {
+  const out = cfg.outdoor || (cfg.outdoor = {});
+  const note = entityLists.connected ? "" : `<p class="muted">Home Assistant isn't reachable, so its
+    weather entities can't be listed: ${escapeHtml(entityLists.note || "")}</p>`;
+  return `<details class="panel settings" open data-panel="outdoor"><summary>Outdoor</summary>
+    ${note}
+    <div class="settings-grid">
+      ${setting("outdoor.source", "Source",
+        "Where the outdoor temperature comes from: a weather entity's hourly forecast, or none (no lean, no block).",
+        { control: selectControl("outdoor.source", [["forecast", "forecast \u2014 a weather entity's hourly forecast"],
+          ["none", "none \u2014 no outdoor input"], ["probe", "probe \u2014 not supported yet", true]]) })}
+      ${setting("outdoor.weather_entity", "Weather entity",
+        "Its hourly forecast is read at each section change; needed when the source is forecast. One without an hourly forecast can't be picked.",
+        { control: weatherControl, label: () => "none", wide: true })}
+      ${setting("outdoor.block_mode", "Cooling block",
+        "Whether a cool forecast blocks cooling for a section. Takes effect from each room's next section.",
+        { control: selectControl("outdoor.block_mode", [["off", "off \u2014 never block"],
+          ["shadow", "shadow \u2014 decide and log, don't apply"], ["active", "active \u2014 block cooling"]]) })}
+      ${setting("outdoor.initial_margin", "Block margin",
+        "Where each room's margin starts; it then learns from what people do. Takes effect from each room's next section.",
+        { control: marginControl, negate: true, wide: true,
+          label: (m) => `comfort + ${fmtNum(-m)}\u00b0 (margin ${fmtNum(m)})` })}
+      ${setting("outdoor.lean_per_degree", "Lean per degree",
+        "How far the trigger edges lean, in band widths per \u00b0C between the room's comfort point and outdoors.",
+        { step: "0.01", unit: "band / \u00b0C" })}
+    </div>
+  </details>`;
+}
+
+function controlHtml() {
+  return `<details class="panel settings" open data-panel="control"><summary>System and control</summary>
+    <div class="settings-grid">
+      ${setting("system.sensor_stale_minutes", "Sensor stale after",
+        "A sensor Home Assistant hasn't reported for this long counts as unavailable: no vote, no learning.",
+        { unit: "min", step: "5" })}
+      ${setting("system.control.person_step_degrees", "Vote step",
+        "A too cold or too hot vote moves each sensor's comfort reading this far from its reading.",
+        { unit: "\u00b0", step: "0.5" })}
+      ${setting("system.control.boost_degrees", "Boost step",
+        "Boost cools this many degrees below the unit's base and offset.", { unit: "\u00b0", step: "0.5" })}
+      ${setting("system.control.boost_max_minutes", "Boost cap",
+        "After this long in boost a unit goes back to cool, a step cooler.", { unit: "min", step: "5" })}
+      ${setting("system.control.cool_min_heartbeats", "Minimum cool time",
+        "The least time in cool or boost before the next change, to spare the compressor.",
+        { unit: "heartbeats" })}
+      ${setting("system.control.rest_min_heartbeats", "Minimum rest time",
+        "The least time resting (off) before a unit wakes.", { unit: "heartbeats" })}
+      ${setting("learning.reaction_rate", "Learning rate",
+        "How far each reaction moves the learned setpoint and comfort readings toward what the person chose.",
+        { step: "0.05" })}
+    </div>
+  </details>`;
+}
+
 function settingsHtml() {
   const sys = cfg.system || (cfg.system = {});
   const trust = sys.trust || (sys.trust = {});
-  const ctl = sys.control || (sys.control = {});
+  sys.control || (sys.control = {});
   const ha = cfg.homeassistant || (cfg.homeassistant = {});
-  return `<details class="panel"><summary>System, learning &amp; connection settings</summary>
+  return outdoorHtml() + controlHtml() + `<details class="panel"><summary>Connection, observation &amp; trust</summary>
     <div class="field-grid">
       <label>Home Assistant URL ${textField("homeassistant.base_url", ha.base_url)}</label>
       <label class="chk"><input type="checkbox" data-path="homeassistant.verify_ssl" data-live="1"
@@ -514,8 +809,6 @@ function settingsHtml() {
         </select></label>
       <label>Heartbeat interval (min) ${numField("system.heartbeat_interval_minutes", sys.heartbeat_interval_minutes ?? 10)}</label>
       <label>Reactive min delta (\u00b0) ${numField("system.reactive_min_delta", sys.reactive_min_delta ?? 0.5, {step:"0.1"})}</label>
-      <label>Boost step (\u00b0) ${numField("system.control.boost_degrees", ctl.boost_degrees ?? 2.0, {step:"0.5"})}</label>
-      <label>Boost cap (min) ${numField("system.control.boost_max_minutes", ctl.boost_max_minutes ?? 60)}</label>
       <label>High-trust deviation (\u00b0) ${numField("system.trust.high_trust_deviation", trust.high_trust_deviation ?? 0.5, {step:"0.1"})}</label>
       <label>Low-trust deviation (\u00b0) ${numField("system.trust.low_trust_deviation", trust.low_trust_deviation ?? 5.0, {step:"0.5"})}</label>
       <label class="wide">External guard booleans (comma-separated, coexistence only)
@@ -645,7 +938,7 @@ function scenesHtml(room, i) {
     }).join("");
     return `<tr><td>${sid}</td><td>${trans}</td>${cells}</tr>`;
   }).join("");
-  return `<h3>Scenes <span class="muted">(needs Deploy to take effect)</span></h3>
+  return `<h3>Scenes <span class="muted">(Apply previews the Home Assistant change)</span></h3>
     <table class="now">${head}${rows}</table>`;
 }
 

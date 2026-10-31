@@ -229,15 +229,21 @@ are built:
   through history with the date controls.
 - **Almanac** — the learned model per room: per section, the learned setpoint per
   unit and, per sensor, the comfort reading with its trust and band.
-- **Config** — structured editor: collapsible rooms (units, sensors, leak
-  toggles, the per-section scene auto/off matrix) and collapsible time
-  profiles, plus system/learning/connection settings. Entity pickers are
-  backed by a live list from Home Assistant with a found/not-found indicator,
-  degrading to free-text entry while idle. A **Raw JSON** toggle exposes the
-  same document directly for anything the form doesn't cover yet. **Validate &
-  Save**, **Check deploy** (a dry run listing what Deploy would do, no writes), and **Deploy
-  to Home Assistant** all validate against the same schema the backend
-  enforces.
+- **Config** — structured editor: the **Outdoor** settings (source, a weather
+  entity dropdown showing each entity's temperature and whether it has an
+  hourly forecast, the cooling block, the block margin, the lean) and the
+  **System and control** settings (stale-sensor time, vote step, boost step and
+  cap, minimum cool and rest times, learning rate), each with a line of help,
+  the schema's default and range, and a reset-to-default link; collapsible
+  rooms (units, sensors, leak toggles, the per-section scene auto/off matrix)
+  and time profiles. Entity pickers are backed by a live list from Home
+  Assistant with a found/not-found indicator. A **Raw JSON** toggle exposes the
+  same document directly. One **Apply** button does the rest: it validates,
+  works out what would change in Home Assistant, and either applies at once
+  ("Applied, no Home Assistant changes") or shows the helpers and automations
+  it would change, with Confirm and Cancel. An applied config is backed up
+  first (the last 20 are kept in `data/config/backups/`), saved, and put in
+  force without a restart. See `docs/DEPLOY.md`, Apply.
 - **Log** — everything the container did and when, filterable by room, category
   and severity, with expandable detail. Heartbeats sit at debug level so they do
   not bury the rest.
@@ -290,11 +296,12 @@ docker compose run --rm \
 ```
 
 Then open `http://<host>:8098`, go to **Config**, describe your rooms, AC units
-and temperature sensors (start from `examples/config.example.json`), **Validate
-& Save**, run **Check deploy**, and **Deploy to Home Assistant**. The runtime
-starts on the next container start when rooms and credentials are present; a
-config change needs a `docker compose restart adaptive-climate` for the running
-observer to pick it up.
+and temperature sensors (start from `examples/config.example.json`), and press
+**Apply**. The first time, it previews the helpers and automations it will
+create in Home Assistant; **Confirm and deploy** writes them, and the runtime
+starts on the new config straight away. Later changes go the same way, and are
+put in force without a restart. Restart the container only to update the code
+(`docker compose up -d --build`).
 
 If you are replacing an existing climate system, disable or delete it first —
 two systems driving the same thermostats will fight. The first learned almanac
@@ -317,7 +324,11 @@ python tools/control_check.py               # the control state machine's scenar
 python tools/control_logic_check.py         # the generated Jinja replayed against them
 python tools/deploy_reconcile_check.py      # deploy create / reuse / update / prune
 python tools/leak_response_check.py         # the leak latch: off when wet, released when dry
-python tools/runtime_check.py               # runtime observer + control loop
+python tools/runtime_check.py               # runtime observer + control loop, config hot reload
+python tools/now_api_check.py               # the Now view's API
+python tools/now_render_check.py            # the Now view in headless Chromium, with screenshots
+python tools/apply_api_check.py             # Apply: preview, confirm, cancel, refusals, backups
+python tools/config_render_check.py         # the Config page in headless Chromium, with screenshots
 ```
 
 ## Documentation
@@ -333,10 +344,9 @@ python tools/runtime_check.py               # runtime observer + control loop
 
 Honest about what is not finished:
 
-- **Config editing is raw JSON.** It validates against the schema, but a
-  structured picker is still to come.
-- **Config changes need a container restart** for the running observer to pick
-  them up (deploy and the UI see them immediately).
+- **A few config keys are only in Raw JSON** (heat sources, knobs, the offset
+  cap, the grace period and the like); the common settings, rooms and time
+  profiles are structured fields.
 - **Foreign-automation conflict detection is manual.** Deploy owns and prunes
   its own `ac_*` artifacts but will not delete anything else; it reminds you to
   check that nothing else drives the same thermostats. See `docs/DEPLOY.md`.
@@ -348,5 +358,4 @@ Honest about what is not finished:
 ## Roadmap and future ideas
 
 Planned next: **Home Assistant add-on packaging** (removing the separate Docker
-host), **user-customisable AC state profiles**, and the structured Config
-picker. See `docs/ROADMAP.md`.
+host) and **user-customisable AC state profiles**. See `docs/ROADMAP.md`.

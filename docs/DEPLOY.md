@@ -26,6 +26,59 @@ wrote ourselves. This is why `docker compose run` state and the container's
 `/data` volume both matter: the manifest is part of the container's state,
 like the config and the database.
 
+Every desired automation is also **read back** by its own id
+(`GET /api/config/automation/config/<id>`) and compared with what the
+generator renders. One Home Assistant already holds exactly as rendered, and
+that the manifest records as ours, is *unchanged*: deploy doesn't write it
+again, and the report lists it under `automations_unchanged`. Anything that
+can't be confirmed (an id the manifest lacks, no copy in Home Assistant, a copy
+that differs, a read that fails) is written. So the report's `changes` count
+says whether a deploy would change Home Assistant at all, which is what the
+Config page's Apply needs (below), and one of our automations edited or deleted
+by hand in Home Assistant is put back by the next deploy.
+
+## Apply: one button saves, reloads and deploys
+
+The Config page has one **Apply** button (phase 7, docs/V2_DESIGN.md, Usability
+fixes). It replaces the old manual steps (Validate & Save, Check deploy, Deploy
+to Home Assistant, and a container restart for the running observer):
+
+1. Apply migrates the config to version 2 and validates it, then runs the dry
+   run below against it. Problems (the config doesn't validate, a configured
+   entity Home Assistant doesn't have, Home Assistant out of reach, no
+   credentials) refuse it: the page lists them, and nothing is written.
+2. If nothing in Home Assistant would change (a learning rate, a margin, a lean,
+   the weather entity, a section time), Apply backs up the config file, saves
+   the new one and hot-reloads it into the running container: "Applied, no Home
+   Assistant changes". Nothing is deployed.
+3. If something would (a room, unit or sensor, a scene's auto/off, a heat
+   source, `sensor_stale_minutes`, the boost and minimum-time settings, the
+   offset cap, `block_mode`), Apply shows a **preview** first: the helpers it
+   would create, update and remove, the automations it would write and remove,
+   any problems and notes (a hold left on). **Confirm** backs up, saves,
+   hot-reloads and deploys, then shows the deploy's result; **Cancel** changes
+   nothing. Confirm deploys exactly the plan that was shown: if Home Assistant
+   changed in between, you get a new preview instead.
+
+Every Apply that goes through first copies the config file to
+`data/config/backups/config-<timestamp>.json` (the newest 20 are kept; restore
+one by applying its contents in the Raw JSON view). The config is always
+written as version 2. The Raw JSON view applies through the same path.
+
+**Hot reload** puts the saved config in force without a restart: rooms,
+sensors, units, the schedule, and the learning, control and outdoor settings.
+What a room already decided for the section it is in (its conditions and block
+decision) stays, so changed outdoor and block settings apply from each room's
+next section, as after a restart; a moved section time takes effect at once
+(a start that has already passed crosses straight away). If the reload fails,
+the file and the running config stay as they were and the error is shown. A
+container that started with no rooms starts its runtime when an Apply gives it
+some.
+
+**A container restart is now needed only for a code update** (a rebuild).
+`GET /api/deploy/check`, `POST /api/deploy` and `POST /api/config` (save only,
+no reload) remain as API endpoints; the page no longer uses them.
+
 ## Ownership: we own `ac_*` completely; we never touch anything else
 
 Both reconciliation paths only ever create, update, or delete entities whose
@@ -36,7 +89,7 @@ prefix. The Now view's buttons (phase 6) stay inside it too: **Too cold** /
 `input_button.ac_too_cold_<room>` / `ac_too_hot_<room>`, and **Leak fixed**
 calls `input_boolean.turn_on` on the unit's own
 `input_boolean.ac_leak_confirmed_<room>_<unit>`. They add no helper or
-automation, so the Now view needs a rebuild and restart, not a deploy. This is the ownership model from the Phase 5 design discussion:
+automation, so the Now view needed a rebuild and restart (a code update), not a deploy. This is the ownership model from the Phase 5 design discussion:
 free-prune our own artifacts, never touch the user's or another integration's.
 
 **Not implemented yet:** detecting a *foreign* automation that also drives one
@@ -118,10 +171,13 @@ the current section's scene automation in HA to start a room at once).
   configured `outdoor.weather_entity`'s next 6 hourly entries. With
   `outdoor.source: forecast`, a configured entity that is missing, has no
   hourly forecast or returns an empty one fails the doctor; with another
-  source it is a warning. The outdoor input adds no helper or automation:
-  changing `outdoor.*` (`block_mode` included) needs a restart, not a deploy,
-  and a `block_mode` change applies from each room's next section. Changing a
-  room's `heat_sources` needs a deploy: the templates read them.
+  source it is a warning. The outdoor input adds no helper or automation, and
+  Apply puts an `outdoor.*` change in force without a restart, from each room's
+  next section. A `block_mode` change needs no deploy to take effect, but the
+  templates carry the config's `block_mode` as a fallback for when there is no
+  conditions entity, so Apply previews those automations and Confirm keeps them
+  in step. Changing a room's `heat_sources` changes the templates too: the
+  preview shows it.
 - **Phase 5 (the lean and the block) needs a deploy.** The scene, maintenance,
   leak release, vote and manual-change automations now read
   `sensor.ac_conditions_<room>` and the room's heat sources; no helper
@@ -133,11 +189,12 @@ the current section's scene automation in HA to start a room at once).
   push) the templates fail open: edges ±1, not blocked. The check lists a heat
   source Home Assistant doesn't have as a missing entity, and the deploy then
   aborts.
-- **Run `/api/deploy/check` (or the Config page's "Check deploy" button)
-  first.** It is the dry run: it verifies entity existence, names any hold
-  that is on, and lists exactly what Deploy would create, reuse, update,
-  remove and write, from the same plan with writing switched off
-  (`"dry_run": true`). It writes nothing and is safe to run any time.
+- **Apply previews before it deploys.** Its preview is the dry run
+  (`/api/deploy/check` runs the same thing): it verifies entity existence,
+  names any hold that is on, and lists exactly what the deploy would create,
+  update, remove and write, from the same plan with writing switched off
+  (`"dry_run": true`), and how much is unchanged. It writes nothing and is safe
+  to run any time; Cancel leaves everything as it was.
 - Deploying installs real automations that call real `climate.*` services on
   your real thermostats from the next crossover on. Deploy itself sends no
   command, and new units are hands off (`manual`) until their room's next
@@ -148,8 +205,9 @@ the current section's scene automation in HA to start a room at once).
 - **The block ships in shadow.** With `outdoor.block_mode: shadow` (the
   default) the container decides and logs each section's block ("would block
   Night: ...") and learns the margin from it, but tells control `blocked` false;
-  only heat sources block. Turning it `active` (Gate B) is a config change and a
-  restart, not a deploy.
+  only heat sources block. Turning it `active` (Gate B) is an Apply: it takes
+  effect from each room's next section with no restart, and the preview shows
+  the templates' `block_mode` fallback being updated.
 - **The vote buttons are ours, the things that press them aren't.** Deploy
   creates each room's `input_button.ac_too_cold_<room>` and
   `ac_too_hot_<room>` and the `ac_vote_<room>` automation that acts on them. A
@@ -162,7 +220,7 @@ the current section's scene automation in HA to start a room at once).
   left on by v1 pauses that room until a person turns it off. The check and
   deploy reports name every hold that is on.
 - The manifest-based prune only knows about automations *this container*
-  deployed. If you hand-edit or delete one of our `ac_*` automations directly
-  in HA, the next deploy will not necessarily notice or restore it correctly —
-  treat the generator + deploy as the source of truth once you start using it,
-  the same way the README already asks for the config.
+  deployed. One of our `ac_*` automations hand-edited or deleted in HA is
+  noticed by the next Apply (its copy no longer matches the render) and written
+  back; treat the generator + deploy as the source of truth once you start
+  using it, the same way the README already asks for the config.

@@ -109,8 +109,8 @@ that behaviour. If the last item fails, delete any `ac_preflight_*` helper by ha
 
 ## 5. Deploy, and turn off any hold (15:40, about 20 minutes before 16:00)
 
-UI: **Config** → **Check deploy** (the dry run: it writes nothing, and lists what
-the deploy will do), then **Deploy to Home Assistant**. Or:
+UI: **Config** → **Apply** (from phase 7: it runs the dry run first and shows
+what the deploy will do, writing nothing), then **Confirm and deploy**. Or:
 
 ```bash
 curl -s localhost:8098/api/deploy/check | python3 -m json.tool

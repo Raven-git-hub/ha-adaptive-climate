@@ -132,6 +132,8 @@ python tools/runtime_check.py               # runtime observer + control loop
 python tools/leak_response_check.py         # leak detection / OFF / release automations
 python tools/now_api_check.py               # /api/now's shape and values; the vote and leak-fixed endpoints
 python tools/now_render_check.py            # the Now view in headless Chromium (Node Playwright): every state, screenshots
+python tools/apply_api_check.py             # Apply: no-change, preview / cancel / confirm, refusals, backups (a running app, stub HA)
+python tools/config_render_check.py         # the Config page in headless Chromium from the real endpoints' answers, screenshots
 ```
 
 Run `PYTHONPATH=.` before these if invoking from outside the repo root (most
@@ -139,8 +141,10 @@ scripts also self-insert the repo root via `sys.path`). These harnesses are
 the test suite in the absence of a live HA instance — run the relevant ones
 after touching `app/generator.py`, `app/trust.py`, `app/control.py`, `app/deploy.py`,
 `app/scheduler.py`, `app/store.py`, `app/outdoor.py`, or `app/runtime.py`; the two
-`now_*` checks after touching `app/nowview.py`, `app/main.py` or `app/static/` (the
-render check refreshes `docs/screenshots/`; commit them with the change).
+`now_*` checks after touching `app/nowview.py`, `app/main.py` or `app/static/`, and
+`apply_api_check` and `config_render_check` after touching `app/apply.py`,
+`app/main.py`, `app/deploy.py`, `app/runtime.py` or the Config page (the render
+checks refresh `docs/screenshots/`; commit them with the change).
 
 ## Local dev / Docker
 
@@ -151,15 +155,17 @@ docker compose run --rm \
   adaptive-climate python tools/doctor.py
 ```
 
-The app serves on `:8098`. A config *time* change is live from Save alone; a
-change to scene *behavior* (unit mode, transition time, room/unit/sensor
-definitions) needs Deploy. A config change needs
-`docker compose restart adaptive-climate` for the running observer to pick it
-up — deploy and the UI see it immediately.
+The app serves on `:8098`. The Config page's one **Apply** button validates a
+config, previews what it would change in Home Assistant, then saves it,
+hot-reloads it into the running runtime (`Runtime.reload`, no restart) and,
+once confirmed, deploys it (see `docs/DEPLOY.md`, Apply). A container restart
+is needed only for a code update.
 
 ## Known gaps (don't be surprised by these; check `docs/ROADMAP.md` first)
 
-- Config editing in the UI is raw JSON; a structured picker is still to come.
+- The Config page is a structured form, but a few keys (heat sources, knobs,
+  offset cap, grace minutes, the reactive window and the like) are only in its
+  Raw JSON view.
 - CSV re-ingest (rebuilding SQLite from the CSV archive) is not implemented;
   it is a prerequisite for v2's Gate A.
 - Foreign-automation conflict detection is manual — deploy prunes only its own

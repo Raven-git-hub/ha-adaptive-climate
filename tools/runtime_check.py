@@ -84,6 +84,26 @@ Store (no Home Assistant, no network). Verifies:
     a max of comfort + 1, Sleep stays blocked at comfort + 1.5 and Sunrise
     lifts it at comfort + 2, with the margin logged and published as -1.0
     (and one that rounds to zero from below as 0.0, never -0.0)
+  * config hot reload (phase 7), on one running Runtime, never restarted:
+      - a changed sensor_stale_minutes (90 -> 30): the next heartbeat reads a
+        sensor last reported 60 minutes ago as stale, with its warning;
+      - an added sensor: the next heartbeat records it and the replay seeds
+        it into the almanac;
+      - a changed section time: Night moved from 20:30 to 20:15 at 20:00
+        crosses at 20:16 (not before, and not again at 20:30), and Sleep
+        moved from 22:00 to 20:45 at 20:50 crosses at once, from the reload;
+      - a changed block_mode (shadow -> active) inside Night: Night keeps its
+        shadow decision (blocked false, re-pushed as decided), and Sleep,
+        the next section, is blocked;
+      - each reload logs one config event naming the top-level sections that
+        changed, replays every room and re-pushes its almanac;
+      - a room removed is dropped, and added back crosses as at startup (a
+        catch-up, not re-firing a scene Home Assistant already shows);
+      - a failing reload (a config that doesn't validate, or the file write
+        failing) leaves the running config, its rooms and the file exactly
+        as they were, with no config event;
+      - a reload, a crossover and a replay never run at the same time, and
+        with the lock taken out the check sees them overlap
 
     PYTHONPATH=. python tools/runtime_check.py
 """
@@ -653,6 +673,8 @@ async def main() -> int:
     await check_conditions()
     await check_conditions_without_outdoor()
     await check_negative_margin()
+    await check_reload()
+    await check_reload_lock()
     print("\nALL RUNTIME CHECKS PASSED")
     return 0
 
@@ -1668,6 +1690,364 @@ async def check_negative_margin() -> None:
     print("negative margin: at the default -1, Night blocks at a max of comfort + 1 (24.9), "
           "Sleep stays blocked at comfort + 1.5 and Sunrise lifts it at comfort + 2, logged "
           "and published as margin -1.0; a margin rounding to zero from below shows 0.0 - OK")
+
+
+def _reload_world(clock: dict, states: list, config: dict):
+    """A Runtime on a fixed clock with Main Room's comfort point at 23.9 in
+    every section (one heartbeat each, on 1 Aug), as check_negative_margin."""
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+    tmp = Path(tempfile.mkdtemp())
+    store = Store(tmp, SCHEMA)
+    seed = datetime(2026, 8, 1, 0, 0, tzinfo=hk)
+    for k, sec in enumerate(SECTIONS):
+        at = seed + timedelta(hours=3 * k)
+        store.record_heartbeat("main_room", at.isoformat(), at.astimezone(utc).isoformat(),
+                               "2026-08-01", sec,
+                               {"living1": 23.4, "living2": 23.9, "living3": 24.4},
+                               {"main_room_ac": UnitSample(True, "cool", "low", 22.0, 24.0, None,
+                                                           control_state="cool")})
+    return tmp, store
+
+
+async def check_reload() -> None:
+    """Phase 7: a saved config reaches the running Runtime without a restart."""
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+    config = json.loads(json.dumps(CONFIG))
+    # main() shortened the window to 1 s, below the schema's minimum, and a
+    # reload validates
+    config["system"]["reactive_window_seconds"] = 10
+    config["outdoor"].update(source="forecast", weather_entity="weather.forecast_home",
+                             block_mode="shadow")
+    clock = {"t": datetime(2026, 8, 3, 19, 50, 0, tzinfo=hk)}
+    states = _build_states()
+    weather = {"entity_id": "weather.forecast_home", "state": "cloudy",
+               "attributes": {"temperature": 28.0, "supported_features": 3},
+               "last_updated": clock["t"].astimezone(utc).isoformat()}
+    states.append(weather)
+    living2 = next(s for s in states if s["entity_id"] == LIVING[1])
+    tmp, store = _reload_world(clock, states, config)
+    # Night's warmest hour comfort + 1 (would block at the margin -1),
+    # Sleep's comfort + 1.5 (held blocked after Night); 26 elsewhere
+    temps = {(3, 20): 24.9, (3, 21): 24.9,
+             **{(3, h): 25.4 for h in (22, 23)}, **{(4, h): 25.4 for h in range(6)}}
+    first = datetime(2026, 8, 3, 12, 0, tzinfo=hk)
+    fixed = [{"datetime": (first + timedelta(hours=k)).astimezone(timezone.utc).isoformat(),
+              "temperature": temps.get(((first + timedelta(hours=k)).day,
+                                        (first + timedelta(hours=k)).hour), 26.0)}
+             for k in range(30)]
+    rest = ForecastRest(states, clock, fixed=fixed)
+    rt = Runtime(config, store, rest, StubWS(), tmp)
+    rt._now = lambda: (clock["t"].isoformat(timespec="seconds"),
+                       clock["t"].astimezone(utc).isoformat(timespec="seconds"),
+                       clock["t"].date().isoformat(), clock["t"])
+    c = store._conn
+    path = tmp / "config.json"
+    path.write_text(json.dumps(config))
+
+    def at(day: int, hour: int, minute: int = 0, second: int = 0) -> None:
+        clock["t"] = datetime(2026, 8, day, hour, minute, second, tzinfo=hk)
+        weather["last_updated"] = clock["t"].astimezone(utc).isoformat()
+
+    async def settle() -> None:
+        await asyncio.sleep(0)
+        await asyncio.gather(*[t for t in list(rt._followups)
+                               if t.get_name().startswith(("ac-outdoor-", "ac-republish"))])
+
+    def config_events() -> list[dict]:
+        return list(reversed(store.recent_events(limit=1000, category="config")))
+
+    def crossovers(room: str = "main_room") -> list[str]:
+        return [e["detail"]["section"] if e.get("detail") else e["message"]
+                for e in reversed(store.recent_events(limit=1000, room_id=room,
+                                                      category="crossover"))]
+
+    def scene_triggers() -> list[str]:
+        return [x[3]["entity_id"] for x in rest.log
+                if x[0] == "service" and x[1:3] == ("automation", "trigger")
+                and x[3]["entity_id"].startswith("automation.ac_main_room_")]
+
+    async def reload(new: dict) -> dict:
+        def commit() -> None:
+            path.write_text(json.dumps(new))
+        return await rt.reload(new, commit)
+
+    def edited(**changes) -> dict:
+        new = json.loads(json.dumps(rt.config))
+        for dotted, value in changes.items():
+            node = new
+            *head, last = dotted.split(".")
+            for k in head:
+                node = node[int(k)] if k.isdigit() else node[k]
+            node[last] = value
+        return new
+
+    await rt.start()
+    await settle()
+    for task in rt._tasks:          # this check runs the scheduler's ticks itself
+        if task.get_name() == "ac-scheduler":
+            task.cancel()
+    assert rt.rooms["main_room"].section == "sunset"
+    started_rooms = {rid: id(rs) for rid, rs in rt.rooms.items()}
+
+    # --- sensor_stale_minutes 90 -> 30 ---
+    at(3, 19, 55)
+    living2["last_reported"] = (clock["t"] - timedelta(minutes=60)).astimezone(utc).isoformat()
+    await rt._do_heartbeat(rt.rooms["main_room"])
+    last_hb = "SELECT hs.sensor_id, hs.temperature FROM heartbeat_sensor hs JOIN heartbeat h " \
+              "ON h.id = hs.heartbeat_id WHERE h.room_id = 'main_room' AND h.id = " \
+              "(SELECT MAX(id) FROM heartbeat WHERE room_id = 'main_room') ORDER BY sensor_id"
+    assert dict(c.execute(last_hb).fetchall())["living2"] == 24.5
+    pushes = len([x for x in rest.set_states if x[0] == "sensor.ac_almanac_main_room"])
+    result = await reload(edited(**{"system.sensor_stale_minutes": 30}))
+    assert result["changed"] == ["system"] and result["crossovers"] == [], result
+    assert rt.config["system"]["sensor_stale_minutes"] == 30
+    assert json.loads(path.read_text())["system"]["sensor_stale_minutes"] == 30
+    ev = config_events()
+    assert len(ev) == 1 and ev[0]["message"] == \
+        "Config applied without a restart: system changed", ev
+    assert ev[0]["detail"]["changed"] == ["system"]
+    assert all(len(replays(store, r, "config reload")) == 1 for r in rt.rooms)
+    assert len([x for x in rest.set_states if x[0] == "sensor.ac_almanac_main_room"]) == \
+        pushes + 1
+    at(3, 20, 0, 30)
+    await rt._do_heartbeat(rt.rooms["main_room"])
+    assert dict(c.execute(last_hb).fetchall())["living2"] is None
+    stale = [e for e in store.recent_events(room_id="main_room", category="validation")
+             if (e.get("detail") or {}).get("sensor") == "living2"]
+    assert stale and stale[0]["detail"]["stale"] and stale[0]["detail"]["stale_minutes"] == 30
+    print("reload: sensor_stale_minutes 90 -> 30 without a restart - the next heartbeat reads "
+          "a sensor last reported 60 min ago as stale, with its warning; one config event "
+          "(\"system changed\"), every room replayed and its almanac re-pushed - OK")
+    living2.pop("last_reported")
+
+    # --- an added sensor ---
+    states.append({"entity_id": "sensor.lounge_window", "state": "25.5",
+                   "attributes": {"unit_of_measurement": "\u00b0C"}})
+    new = json.loads(json.dumps(rt.config))
+    new["rooms"][0]["sensors"].append({"id": "window", "name": "Window",
+                                       "entity_id": "sensor.lounge_window"})
+    result = await reload(new)
+    assert result["changed"] == ["rooms"] and result["rooms_added"] == [] == \
+        result["rooms_removed"], result
+    assert [s["id"] for s in rt.rooms["main_room"].room["sensors"]] == \
+        ["living1", "living2", "living3", "window"]
+    at(3, 20, 5)
+    await rt._do_heartbeat(rt.rooms["main_room"])
+    assert dict(c.execute(last_hb).fetchall())["window"] == 25.5
+    alm = store.current_almanac("main_room", as_of=rt._today())["sections"]["sunset"]
+    assert alm["sensors"]["window"]["comfort"] == 25.5, alm["sensors"]
+    assert replays(store, "main_room", "new seed in section")
+    assert config_events()[-1]["message"] == "Config applied without a restart: rooms changed"
+    print("reload: an added sensor is in the next heartbeat (25.5) and seeded into the "
+          "almanac by the replay it triggers - OK")
+
+    # --- a section time moved later than now, then one moved before now ---
+    at(3, 20, 6)
+    night = next(i for i, x in enumerate(rt.config["schedule_profiles"][0]["sections"])
+                 if x["id"] == "night")
+    sleep = next(i for i, x in enumerate(rt.config["schedule_profiles"][0]["sections"])
+                 if x["id"] == "sleep")
+    result = await reload(edited(**{f"schedule_profiles.0.sections.{night}.trigger.time":
+                                    "20:15"}))
+    assert result["changed"] == ["schedule_profiles"] and result["crossovers"] == [], result
+    assert set(result["schedule_changed"]) == set(rt.rooms), result
+    assert config_events()[-1]["message"] == (
+        "Config applied without a restart: schedule_profiles changed; schedule changed for "
+        "Main Room, Main Bedroom, Baby Room"), config_events()[-1]["message"]
+    at(3, 20, 14, 50)
+    assert await rt._tick() == [] and rt.rooms["main_room"].section == "sunset"
+    at(3, 20, 16)
+    crossed = await rt._tick()
+    await settle()
+    assert {"room": "main_room", "section": "night"} in crossed, crossed
+    assert rt.rooms["main_room"].section == "night"
+    assert scene_triggers()[-1] == "automation.ac_main_room_night"
+    run = c.execute("SELECT planned_start FROM section_run WHERE room_id = 'main_room' AND "
+                    "section = 'night' AND local_date = '2026-08-03'").fetchone()[0]
+    assert run.startswith("2026-08-03T20:15"), run
+    at(3, 20, 30, 5)
+    assert await rt._tick() == []                       # the old 20:30 is gone
+    night_cond = [x[2] for x in rest.set_states if x[0] == "sensor.ac_conditions_main_room"][-1]
+    assert (night_cond["section"], night_cond["block_mode"], night_cond["would_block"],
+            night_cond["blocked"]) == ("night", "shadow", True, False), night_cond
+    print("reload: Night moved from 20:30 to 20:15 at 20:06 - no crossover from the reload "
+          "or at 20:14:50, the scene at 20:16 (planned start 20:15), nothing at 20:30 - OK")
+
+    # --- block_mode shadow -> active inside Night: applies from Sleep ---
+    at(3, 20, 40)
+    pushed = len([x for x in rest.set_states if x[0] == "sensor.ac_conditions_main_room"])
+    result = await reload(edited(**{"outdoor.block_mode": "active"}))
+    assert result["changed"] == ["outdoor"] and result["crossovers"] == [], result
+    assert config_events()[-1]["message"] == (
+        "Config applied without a restart: outdoor changed. Outdoor and block settings apply "
+        "from each room's next section; what a room decided for the section it is in stays")
+    kept = [x[2] for x in rest.set_states if x[0] == "sensor.ac_conditions_main_room"]
+    assert len(kept) == pushed + 1 and \
+        {k: kept[-1][k] for k in ("section", "block_mode", "would_block", "blocked")} == \
+        {"section": "night", "block_mode": "shadow", "would_block": True, "blocked": False}, \
+        kept[-1]
+    assert tuple(c.execute("SELECT blocked, block_mode FROM section_run WHERE room_id = "
+                           "'main_room' AND local_date = '2026-08-03' AND section = 'night'"
+                           ).fetchone()) == (1, "shadow")
+    # --- and Sleep moved from 22:00 to 20:45 at 20:50: the reload crosses now ---
+    at(3, 20, 50)
+    result = await reload(edited(**{f"schedule_profiles.0.sections.{sleep}.trigger.time":
+                                    "20:45"}))
+    await settle()
+    assert {"room": "main_room", "section": "sleep"} in result["crossovers"], result
+    assert rt.rooms["main_room"].section == "sleep"
+    assert scene_triggers()[-1] == "automation.ac_main_room_sleep"
+    sleep_cond = [x[2] for x in rest.set_states if x[0] == "sensor.ac_conditions_main_room"][-1]
+    assert (sleep_cond["section"], sleep_cond["block_mode"], sleep_cond["blocked"]) == \
+        ("sleep", "active", True), sleep_cond
+    assert tuple(c.execute("SELECT blocked, block_mode FROM section_run WHERE room_id = "
+                           "'main_room' AND local_date = '2026-08-03' AND section = 'sleep'"
+                           ).fetchone()) == (1, "active")
+    print("reload: block_mode shadow -> active at 20:40 inside Night - Night keeps its shadow "
+          "decision (re-pushed: would block, blocked false); Sleep, moved to 20:45 at 20:50, "
+          "crosses from the reload itself and is blocked (active) - OK")
+
+    # --- a room removed, then added back: dropped, then caught up as at startup ---
+    at(3, 20, 55)
+    baby = next(r for r in rt.config["rooms"] if r["id"] == "baby_room")
+    result = await reload(edited(rooms=[r for r in rt.config["rooms"]
+                                        if r["id"] != "baby_room"]))
+    assert result["rooms_removed"] == ["baby_room"] and "baby_room" not in rt.rooms, result
+    assert not any(v == ("baby_room", "baby_room_ac") for v in rt._unit_index.values())
+    assert config_events()[-1]["message"] == \
+        "Config applied without a restart: rooms changed; rooms removed: baby_room"
+    await rt.replay_room("baby_room", "comfort window")          # a follow-up left over
+    for s in states:                    # Home Assistant already shows Baby Room in Sleep
+        if s["entity_id"] == "input_select.ac_scene_baby_room":
+            s["state"] = rt._cache[s["entity_id"]] = "sleep"
+    fired = len(rest.service_calls)
+    result = await reload(edited(rooms=rt.config["rooms"] + [baby]))
+    assert result["rooms_added"] == ["baby_room"], result
+    assert {"room": "baby_room", "section": "sleep"} in result["crossovers"], result
+    assert rt.rooms["baby_room"].section == "sleep"
+    assert not [x for x in rest.service_calls[fired:] if x[:2] == ("automation", "trigger")
+                and "baby_room" in x[2]["entity_id"]], "re-fired a scene HA already showed"
+    last = store.recent_events(room_id="baby_room", category="crossover")[0]["message"]
+    assert last == "Baby Room -> sleep (catch-up, already in section - not re-fired)", last
+    assert config_events()[-1]["message"] == \
+        "Config applied without a restart: rooms changed; rooms added: Baby Room"
+    print("reload: a room removed is dropped (its units unwatched, a leftover replay for it "
+          "harmless); added back, it crosses as at startup - a catch-up that doesn't re-fire "
+          "the scene Home Assistant already shows - OK")
+
+    # --- a failing reload changes nothing ---
+    before_cfg = json.loads(json.dumps(rt.config))
+    before_file = path.read_text()
+    before_rooms = {rid: (id(rs), rs.room, rs.profile) for rid, rs in rt.rooms.items()}
+    before_events = len(config_events())
+    bad = edited(**{"system.sensor_stale_minutes": 5})
+    try:
+        await reload(bad)
+    except runtime_mod.ConfigError as e:
+        assert "sensor_stale_minutes" in str(e), e
+    else:
+        raise AssertionError("a config that doesn't validate was reloaded")
+
+    def broken_disk() -> None:
+        raise OSError(28, "No space left on device")
+    try:
+        await rt.reload(edited(**{"system.sensor_stale_minutes": 45}), broken_disk)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("a reload whose file write failed went through")
+    assert rt.config == before_cfg and path.read_text() == before_file
+    assert {rid: (id(rs), rs.room, rs.profile) for rid, rs in rt.rooms.items()} == before_rooms
+    assert len(config_events()) == before_events
+    assert all(id(rt.rooms[rid]) == oid for rid, oid in started_rooms.items()
+               if rid != "baby_room")
+    print("reload: a config that doesn't validate (sensor_stale_minutes 5) and a file write "
+          "that fails both leave the running config, its rooms and the file as they were, "
+          "with no config event; the rooms kept are the same objects all along (no restart) - OK")
+    await rt.stop()
+    store.close()
+
+
+class _NoLock:
+    """Stands in for the runtime's lock, to show the check would catch its
+    absence."""
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+async def check_reload_lock() -> None:
+    """A reload, a crossover and a replay never run at the same time."""
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+
+    async def race(lock: bool) -> tuple[list, list]:
+        config = json.loads(json.dumps(CONFIG))
+        config["system"]["reactive_window_seconds"] = 10
+        clock = {"t": datetime(2026, 8, 3, 13, 0, 0, tzinfo=hk)}
+        states = _build_states()
+        tmp, store = _reload_world(clock, states, config)
+        rt = Runtime(config, store, StubRest(states), StubWS(), tmp)
+        rt._now = lambda: (clock["t"].isoformat(timespec="seconds"),
+                           clock["t"].astimezone(utc).isoformat(timespec="seconds"),
+                           clock["t"].date().isoformat(), clock["t"])
+        await rt.start()
+        if not lock:
+            rt._lock = _NoLock()
+        active: list[tuple] = []
+        entered: list[tuple[str, str]] = []
+        overlaps: list[tuple] = []
+
+        def watch(name, fn):
+            async def watched(*a, **k):
+                me = asyncio.current_task()
+                if any(t is not me for t, _ in active):
+                    overlaps.append((name, [n for _, n in active]))
+                entry = (me, name)
+                active.append(entry)
+                entered.append((me.get_name(), name))
+                try:
+                    await asyncio.sleep(0.01)
+                    return await fn(*a, **k)
+                finally:
+                    active.remove(entry)
+            return watched
+        rt._replay = watch("replay", rt._replay)
+        rt._crossover_locked = watch("crossover", rt._crossover_locked)
+        rt._tick_locked = watch("tick", rt._tick_locked)
+        new = json.loads(json.dumps(config))
+        new["system"]["sensor_stale_minutes"] = 45
+
+        def commit() -> None:
+            entered.append((asyncio.current_task().get_name(), "commit"))
+        clock["t"] = datetime(2026, 8, 3, 16, 0, 5, tzinfo=hk)     # Sunset is due
+        tasks = [asyncio.create_task(rt.replay_room("main_room", "manual"), name="replay"),
+                 asyncio.create_task(rt.reload(new, commit), name="reload"),
+                 asyncio.create_task(rt._crossover(rt.rooms["baby_room"], "sunset",
+                                                   datetime(2026, 8, 3, 16, 0, tzinfo=hk),
+                                                   catch_up=False), name="crossover"),
+                 asyncio.create_task(rt._tick(), name="tick")]
+        await asyncio.gather(*tasks)
+        await rt.stop()
+        store.close()
+        return overlaps, entered
+
+    overlaps, entered = await race(lock=True)
+    assert overlaps == [], overlaps
+    order = [t for t, _ in entered]
+    first, last = order.index("reload"), len(order) - 1 - order[::-1].index("reload")
+    assert set(order[first:last + 1]) == {"reload"}, entered
+    assert order.index("replay") < first, entered      # started first: the reload waited
+    assert [n for t, n in entered if t == "reload"] == ["commit"] + ["replay"] * 3 + ["tick"], \
+        entered
+    assert {"crossover", "tick", "ac-scheduler"} <= set(order), entered
+    overlaps_unlocked, _ = await race(lock=False)
+    assert overlaps_unlocked, "with no lock the race check saw no overlap: it proves nothing"
+    print("lock: a replay, a reload, a crossover and a tick started together (and the "
+          "scheduler loop's own tick) run one at a time - the reload waits for the replay "
+          "already running, and its commit, 3 replays and tick run in one unbroken stretch; "
+          f"with the lock taken out they overlap ({len(overlaps_unlocked)} times) - OK")
 
 
 if __name__ == "__main__":

@@ -3,14 +3,17 @@
 Serves the web UI, the JSON API the UI reads, and /healthz. Comes up idle
 with no rooms and stays healthy - it does nothing until a room is added.
 
-STATUS: skeleton runtime (Phases 9/10 not wired), but the almanac path is
-live end to end: /api/analysis/run builds almanacs from whatever the store
-holds, and /api/almanac/<room> serves them for the Almanac view. Rooms are
-read lightly from the raw config here; full validated loading is Phase 9.
+The Config page's Apply (POST /api/apply, app/apply.py) validates a config,
+previews what it would change in Home Assistant, and saves it, hot-reloads
+the running runtime (Runtime.reload) and, when Home Assistant would change,
+deploys it once confirmed. A config change no longer needs a restart.
+Rooms are read lightly from the raw config here; full validated loading is
+Phase 9.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -23,6 +26,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app import apply as applying
 from app.analyser import LearningConfig, MarginConfig, analyse_room, learn_margin
 from app.config import ConfigError, blank, migrate, save, validate
 from app.store import Store, StoreError
@@ -55,7 +59,7 @@ def _raw_config() -> dict:
     """Lightweight read of the live config JSON, migrated to version 2 with
     v2's new keys defaulted. Not validated, so a broken file still loads
     for the UI to show and fix. A file on disk stays version 1 until the
-    next Save writes it back as version 2."""
+    next Apply writes it back as version 2."""
     if CONFIG_PATH.exists():
         try:
             raw = json.loads(CONFIG_PATH.read_text())
@@ -87,22 +91,12 @@ async def lifespan(app: FastAPI):
         log.info("wrote a blank config to %s", CONFIG_PATH)
 
     cfg = _raw_config()
-    have_rooms = any(r.get("enabled", True) for r in cfg.get("rooms", []))
+    have_rooms = _has_rooms(cfg)
     have_creds = bool(os.environ.get("AC_HA_URL") and os.environ.get("AC_HA_TOKEN"))
     if have_rooms and have_creds:
         try:
-            from app.ha import HARest, HAWebSocket
-            from app.runtime import Runtime
-            url = os.environ["AC_HA_URL"]
-            token = os.environ["AC_HA_TOKEN"]
-            verify = os.environ.get("AC_HA_VERIFY_SSL", "true").lower() != "false"
-            rest = HARest(url, token, verify_ssl=verify)
-            ws = HAWebSocket(url, token, verify_ssl=verify)
-            await ws.connect()
-            runtime = Runtime(cfg, state.store, rest, ws, DATA_DIR)
-            await runtime.start()
-            state.runtime = runtime
-            log.info("runtime started (%d room(s) live)", len(runtime.rooms))
+            state.runtime = await _start_runtime(cfg)
+            log.info("runtime started (%d room(s) live)", len(state.runtime.rooms))  # type: ignore[attr-defined]
         except Exception as e:
             state.error = f"runtime failed to start: {e}"
             log.error(state.error)
@@ -117,6 +111,35 @@ async def lifespan(app: FastAPI):
             pass
     if state.store:
         state.store.close()
+
+
+def _has_rooms(cfg: dict) -> bool:
+    return any(r.get("enabled", True) for r in cfg.get("rooms", []))
+
+
+async def _start_runtime(cfg: dict):
+    """A live Runtime on `cfg`, started, with its own Home Assistant
+    clients from the environment. On a failure nothing is left running."""
+    from app.ha import HARest, HAWebSocket
+    from app.runtime import Runtime
+    url = os.environ["AC_HA_URL"]
+    token = os.environ["AC_HA_TOKEN"]
+    verify = os.environ.get("AC_HA_VERIFY_SSL", "true").lower() != "false"
+    rest = HARest(url, token, verify_ssl=verify)
+    ws = HAWebSocket(url, token, verify_ssl=verify)
+    runtime = Runtime(cfg, state.store, rest, ws, DATA_DIR)
+    try:
+        await ws.connect()
+        await runtime.start()
+    except Exception:
+        try:
+            await runtime.stop()
+            await ws.close()
+            await rest.close()
+        except Exception:
+            pass
+        raise
+    return runtime
 
 
 app = FastAPI(title="Adaptive Climate", version="0.1.0", lifespan=lifespan)
@@ -253,10 +276,20 @@ def api_get_config() -> dict:
     return _raw_config()
 
 
+@app.get("/api/schema")
+def api_schema() -> dict:
+    """The config schema, for the Config page's defaults, ranges and
+    choices."""
+    return json.loads((SCHEMA_DIR / "config.schema.json").read_text())
+
+
 @app.post("/api/config")
 def api_save_config(cfg: dict) -> dict:
     """Migrate (a version 1 payload is accepted), validate against the
-    version 2 schema, and save the version 2 result."""
+    version 2 schema, and save the version 2 result. Only writes the file:
+    the running runtime and Home Assistant see it at the next Apply or
+    restart. The Config page uses POST /api/apply, which also reloads and
+    deploys."""
     try:
         cfg = migrate(cfg, SCHEMA_DIR / "config.schema.json")
         validate(cfg, SCHEMA_DIR / "config.schema.json")
@@ -285,27 +318,43 @@ async def api_entities(domain: str) -> dict:
     resolve to 'unknown'. Degrades gracefully (empty list + a note) when HA
     credentials aren't set or the connection fails, rather than erroring -
     the config editor must still be usable while idle."""
-    if domain not in ("climate", "sensor", "binary_sensor"):
-        raise HTTPException(400, "domain must be 'climate', 'sensor', or 'binary_sensor'")
-    url = os.environ.get("AC_HA_URL")
-    token = os.environ.get("AC_HA_TOKEN")
-    if not url or not token:
+    if domain not in ENTITY_DOMAINS:
+        raise HTTPException(400, "domain must be one of " +
+                            ", ".join(f"'{d}'" for d in ENTITY_DOMAINS))
+    try:
+        rest, _ = _ha_clients()
+    except HTTPException:
         return {"entities": [], "connected": False,
                "note": "AC_HA_URL/AC_HA_TOKEN not set; enter entity ids manually"}
-    from app.ha import HARest
-    verify = os.environ.get("AC_HA_VERIFY_SSL", "true").lower() != "false"
-    rest = HARest(url, token, verify_ssl=verify)
     try:
         states = await rest.states()
     except Exception as e:
         return {"entities": [], "connected": False, "note": f"could not reach Home Assistant: {e}"}
     finally:
         await rest.close()
-    out = [{"entity_id": s["entity_id"],
-           "name": (s.get("attributes", {}) or {}).get("friendly_name", s["entity_id"])}
-          for s in states if s["entity_id"].startswith(f"{domain}.")]
+    out = [_entity_entry(s, domain) for s in states if s["entity_id"].startswith(f"{domain}.")]
     out.sort(key=lambda e: e["name"].lower())
     return {"entities": out, "connected": True}
+
+
+ENTITY_DOMAINS = ("climate", "sensor", "binary_sensor", "weather")
+
+
+def _entity_entry(s: dict, domain: str) -> dict:
+    """A picker entry. A weather entity also says its state, its current
+    temperature and whether it offers an hourly forecast (supported_features
+    bit 2), which outdoor.source 'forecast' needs - as the doctor's step 7
+    lists them."""
+    attrs = s.get("attributes", {}) or {}
+    entry = {"entity_id": s["entity_id"], "name": attrs.get("friendly_name", s["entity_id"])}
+    if domain == "weather":
+        from app import outdoor
+        temp = attrs.get("temperature")
+        entry.update(state=s.get("state"),
+                     temperature=temp if isinstance(temp, (int, float)) else None,
+                     temperature_unit=attrs.get("temperature_unit"),
+                     hourly=outdoor.supports_hourly(s))
+    return entry
 
 
 @app.get("/api/deploy/check")
@@ -337,7 +386,152 @@ async def api_deploy() -> dict:
     finally:
         await ws.close()
         await rest.close()
+    _log_deploy(report)
     return report.as_dict()
+
+
+def _log(severity: str, category: str, message: str, detail: dict | None = None) -> None:
+    if not state.store:
+        return
+    now = datetime.now().astimezone()
+    try:
+        state.store.log_event(now.isoformat(timespec="seconds"),
+                              now.astimezone(timezone.utc).isoformat(timespec="seconds"),
+                              severity, category, message, detail=detail)
+    except Exception as e:
+        log.warning("could not log a %s event: %s", category, e)
+
+
+def _log_deploy(report) -> None:
+    _log("info" if report.ok else "warning", "deploy", applying.deploy_message(report),
+         {k: v for k, v in report.as_dict().items() if k != "helpers_reused"})
+
+
+# One Apply at a time, so two never interleave their backup, save and reload.
+_apply_lock = asyncio.Lock()
+
+
+def _refused(problems: list[str], plan: dict | None = None) -> dict:
+    return {"status": "refused", "problems": problems, "plan": plan}
+
+
+@app.post("/api/apply")
+async def api_apply(body: dict) -> dict:
+    """The Config page's one button (app/apply.py). Body: {config, confirm,
+    token}. Validates (a version 1 config is migrated and saved as version
+    2), then plans the deploy as the dry run does:
+
+      refused  - the config doesn't validate, or the plan has problems
+                 (missing entities, Home Assistant out of reach): nothing
+                 written; `problems` says why;
+      preview  - Home Assistant would change: the `plan` and its `token`;
+                 nothing written. Send it back with confirm: true to apply;
+                 a plan that has changed since comes back as a new preview
+                 (`stale`);
+      applied  - backed up (`backup`), saved, hot-reloaded (`reload`) and,
+                 when Home Assistant changes, deployed (`deploy`);
+      error    - the reload (or starting an idle runtime) failed: the file
+                 and the running config are as they were.
+    """
+    from app import deploy as deploying
+    if not isinstance(body, dict) or not isinstance(body.get("config"), dict):
+        raise HTTPException(400, "body must be {config: {...}, confirm?, token?}")
+    confirm = body.get("confirm") is True
+    async with _apply_lock:
+        try:
+            cfg = migrate(body["config"], SCHEMA_DIR / "config.schema.json")
+            validate(cfg, SCHEMA_DIR / "config.schema.json")
+        except ConfigError as e:
+            return _refused([f"the config does not validate: {e}"])
+        try:
+            rest, ws = _ha_clients()
+        except HTTPException as e:
+            return _refused([f"{e.detail}. Apply needs Home Assistant to work out what would "
+                             "change in it, so nothing was saved"])
+        try:
+            await ws.connect()
+            report = await deploying.check(cfg, rest, ws, DATA_DIR)
+        except Exception as e:
+            report = deploying.DeployReport(dry_run=True)
+            report.problems.append(f"could not reach Home Assistant: {e}")
+        finally:
+            await _close(rest, ws)
+        plan = applying.plan_summary(report)
+        if not report.ok:
+            return _refused(plan["problems"], plan)
+        token = applying.plan_token(cfg, report)
+        if report.changes and not (confirm and body.get("token") == token):
+            return {"status": "preview", "plan": plan, "token": token,
+                    "stale": confirm}
+
+        saved = applying.backup(CONFIG_PATH)
+        out = {"status": "applied", "backup": saved.name if saved else None,
+               "version": cfg["version"], "plan": plan}
+        try:
+            out["reload"] = await _put_in_force(cfg)
+        except Exception as e:
+            log.warning("apply: reload failed: %s", e)
+            return {"status": "error", "stage": "reload", "backup": out["backup"],
+                    "error": f"{type(e).__name__}: {e}" if not isinstance(e, ConfigError)
+                    else str(e),
+                    "message": "Not applied: the config file and the running system are as "
+                               "they were"}
+        if not report.changes:
+            out.update(deployed=False, message=applying.APPLIED_NO_CHANGES)
+            return out
+        rest, ws = _ha_clients()
+        try:
+            await ws.connect()
+            result = await deploying.deploy(cfg, rest, ws, DATA_DIR)
+        except Exception as e:
+            result = deploying.DeployReport()
+            result.problems.append(f"the deploy failed: {e}")
+        finally:
+            await _close(rest, ws)
+        _log_deploy(result)
+        if state.runtime is not None:
+            try:
+                await state.runtime.refresh_automations()  # type: ignore[attr-defined]
+            except Exception as e:
+                log.warning("apply: automation refresh failed: %s", e)
+        out.update(deployed=True, deploy=result.as_dict(),
+                   message="Applied and deployed to Home Assistant" if result.ok else
+                   "Applied; the deploy to Home Assistant finished with problems")
+        return out
+
+
+async def _close(rest, ws) -> None:
+    for client in (ws, rest):
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
+async def _put_in_force(cfg: dict) -> dict:
+    """Save `cfg` and put it in force: the live runtime reloads it (and
+    writes the file only once the new config is built, so a failure leaves
+    both as they were); an idle container starts its runtime when the
+    config now has rooms."""
+    def commit() -> None:
+        save(cfg, CONFIG_PATH)
+    if state.runtime is not None:
+        return await state.runtime.reload(cfg, commit)  # type: ignore[attr-defined]
+    if not _has_rooms(cfg):
+        commit()
+        _log("info", "config", "Config applied (no rooms enabled, so nothing is running)",
+             {"changed": None, "runtime": "idle"})
+        return {"runtime": "idle"}
+    runtime = await _start_runtime(cfg)
+    try:
+        commit()
+    except Exception:
+        await runtime.stop()
+        raise
+    state.runtime, state.error = runtime, None
+    _log("info", "config", f"Config applied: the runtime started with "
+         f"{len(runtime.rooms)} room(s)", {"changed": None, "runtime": "started"})
+    return {"runtime": "started", "rooms": list(runtime.rooms)}
 
 
 def _outdoor_failing() -> str | None:
