@@ -291,6 +291,27 @@ async def main() -> int:
     print("startup: each room replayed once (no history yet: an empty almanac); no "
           "provisional almanac seeded at crossover - OK")
 
+    # --- startup order: every room's replay done and pushed before any crossover ---
+    first_scene = next(i for i, e in enumerate(rest.log)
+                       if e[0] == "service" and e[1:3] == ("automation", "trigger"))
+    pushed = {e[1].removeprefix("sensor.ac_almanac_") for e in rest.log[:first_scene]
+              if e[0] == "set_state" and e[1].startswith("sensor.ac_almanac_")}
+    assert pushed == set(rt.rooms), (pushed, rest.log[:first_scene])
+    rows = [(i, cat, room, json.loads(d or "{}")) for i, cat, room, d in store._conn.execute(
+        "SELECT id, category, room_id, detail FROM event ORDER BY id")]
+    startup_ids = {room: i for i, cat, room, d in rows
+                   if cat == "analysis" and d.get("reason") == "startup"}
+    crossover_ids = {room: i for i, cat, room, _ in rows if cat == "crossover"}
+    assert set(startup_ids) == set(crossover_ids) == set(rt.rooms), (startup_ids, crossover_ids)
+    assert max(startup_ids.values()) < min(crossover_ids.values()), (startup_ids, crossover_ids)
+    shown = [(e["category"], e["room_id"]) for e in store.recent_events(limit=50)]
+    for r in rt.rooms:                       # the Log lists newest first
+        assert shown.index(("crossover", r)) < shown.index(("analysis", r)), (r, shown)
+    print("startup: every room's replay finished and its almanac was pushed before the first "
+          "catch-up crossover fired (all 3 pushes ahead of the first scene trigger, every "
+          "startup replay event logged before every crossover event), and the Log lists each "
+          "room's crossover after its replay, though all fall in one second - OK")
+
     # --- heartbeat sampling ---
     rs = rt.rooms["main_room"]
     await rt._do_heartbeat(rs)

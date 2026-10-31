@@ -783,3 +783,12 @@ Margin learning, 31 Oct 2026:
       - `runtime_check`: Sunset (cool), Sleep (a section rest), a kept `user_off` and a latched leak are each recorded on their runs.
 
     The generated automations are unchanged; the host needs a rebuild and restart, which migrates the database behind its backup.
+
+Startup order, 31 Oct 2026:
+
+142. **Startup replays every room and pushes it before any catch-up crossover; confirmed, not changed.** At an earlier restart the Log showed the Baby Room's "replayed almanac (startup)" after its catch-up crossover, while the other rooms' came before. `Runtime.start` awaits each room's replay in turn (analysis, publish, the almanac push, then its event, all under the runtime's lock) before the first catch-up crossover. The scheduler, heartbeat and nightly loops start only after the catch-ups, and a reconnect or `homeassistant_start` only re-pushes. At startup all six events fall in the same second, and until decision 137 the Log ordered events by `ts_utc` alone, so events in one second came back in either order: that restart predates it. `runtime_check`'s startup case now asserts:
+    - every room's almanac push comes ahead of the first scene trigger in Home Assistant's call log;
+    - every startup replay event was logged before every crossover event;
+    - the Log lists each room's crossover after its replay.
+
+    With one room's startup replay deferred, the first assertion fails.
