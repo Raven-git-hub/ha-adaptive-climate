@@ -143,7 +143,12 @@ step; until it does, further presses are ignored. A section starts in **rest**
 instead of **cool** when at least a quorum of the room's sensors are below their
 comfort readings and the section's forecast mean is below the room's comfort
 point; that rest also wakes at the base, without the +1, and a press during it
-counts.
+counts. A cooling block is a presumption the sensors can overrule: if the room
+reaches a too-warm quorum against the un-leaned edges while the section's block
+rests it, the resting units wake into **cool** at the base (after their rest
+minimum), the block is lifted for every unit until the section changes, and the
+block margin learns from it as from a **too hot** press (a heater's block is
+never overruled; in shadow mode it is logged as "would have been overruled").
 
 Fan speed availability and min/max range are read from each unit at runtime, so
 one generated automation adapts per unit — including units that hide their fan

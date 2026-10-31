@@ -58,7 +58,7 @@ Expect:
 
 - `/healthz`: `"status": "ok"`, `"idle": false`, `"ha_connected": true`,
   `"error": null`.
-- The log line `migrated /data/db/adaptive_climate.db from storage version 0 to 3
+- The log line `migrated /data/db/adaptive_climate.db from storage version 0 to 5
   (backup /data/db/adaptive_climate.db.v1-backup-<timestamp>)`, and that backup
   file in `data/db/`. The migration is one checked transaction per step; if one
   fails it rolls back, the database is untouched, and `/healthz` reports the
@@ -70,7 +70,7 @@ Cmd+Shift+R: a browser may still hold v1's `app.js`, served before the UI sent
 `Cache-Control: no-cache`, and v1's script shows "undefined" in the Almanac
 tab's Status column):
 
-- **Log** tab, category *storage*: "database migrated from storage version 0 to 3;
+- **Log** tab, category *storage*: "database migrated from storage version 0 to 5;
   backup at ...".
 - Straight away, category *analysis*: "replayed almanac for Main Room (startup):
   N section(s)", one per room, before any crossover. Phase 0 emptied the almanac;

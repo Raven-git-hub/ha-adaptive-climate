@@ -78,6 +78,15 @@ Outdoor input and conditions (docs/V2_DESIGN.md, Outdoor temperature):
     event when the forecast works again.
   The probe source isn't read yet. The margin is learned by the replay
   (app.analyser.learn_margin) and logged as a `block` event when it moves.
+  * the room overruling a block (decision 143) - an ac_block_overruled
+    subscription: HA's maintenance woke the units resting for an active
+    block on a too-warm quorum against the un-leaned edges and unblocked
+    every unit. Logged as a `block` event, recorded on the section run
+    (overruled_at, the run's first) and the room replayed, so the margin
+    learns and the next section's hysteresis reads the run as not blocked.
+    In shadow mode the runtime asks app.control itself at each heartbeat
+    whether the room would have overruled the block it would have had, and
+    records the first "would have been overruled" the same way.
 
 Automation-caused changes are told apart from user ones primarily by
 context.parent_id (our service calls carry it), backed by the guard boolean,
@@ -102,9 +111,10 @@ from app import control, outdoor
 from app.analyser import (LearningConfig, MarginConfig, MarginStep, analyse_room,
                           is_setpoint_moving, learn_margin)
 from app.config import ConfigError, validate
-from app.generator import (PERSON_VOTE_EVENT, USER_OFF_WAKE_EVENT, almanac_id, base_id,
-                           conditions_id, forced_off_sections, guard_id, leak_id, offset_id,
-                           scene_automation_id, scene_select_id, state_id)
+from app.generator import (BLOCK_OVERRULED_EVENT, PERSON_VOTE_EVENT, USER_OFF_WAKE_EVENT,
+                           almanac_id, base_id, conditions_id, forced_off_sections, guard_id,
+                           leak_id, offset_id, scene_automation_id, scene_select_id, state_id,
+                           unblocked_id)
 from app.ha import HATimeoutError
 from app.scheduler import active_section_at, section_window
 from app.store import ReactiveUnitSample, UnitSample
@@ -610,6 +620,7 @@ class Runtime:
         await self.ws.subscribe_states(self._on_state_change)
         await self.ws.subscribe_events(PERSON_VOTE_EVENT, self._on_person_vote)
         await self.ws.subscribe_events(USER_OFF_WAKE_EVENT, self._on_user_off_wake)
+        await self.ws.subscribe_events(BLOCK_OVERRULED_EVENT, self._on_block_overruled)
         await self.ws.subscribe_events(HA_START_EVENT, self._on_ha_start)
 
     async def _resubscribe(self) -> None:
@@ -762,6 +773,115 @@ class Runtime:
             f"Off (by you){cools}: the room is too warm, quorum met: {tally} vote(s) "
             f"({required} needed){past}", room_id=rs.room["id"],
             detail={**data, "from": "user_off", "to": "cool"})
+
+    def _on_block_overruled(self, event: dict) -> None:
+        """An ac_block_overruled event: HA's maintenance found the room too
+        warm under the section's active block and lifted it
+        (control.overrules_block, decision 143). Recorded and logged in
+        _record_overrule."""
+        task = asyncio.create_task(self._record_overrule(event.get("data") or {}),
+                                   name="ac-overrule")
+        self._followups.add(task)
+        task.add_done_callback(self._followups.discard)
+
+    async def _record_overrule(self, data: dict) -> None:
+        """Log the overrule as a `block` event, record it on the room's run
+        (the first of a run stands) and replay the room, so the margin
+        learns from it at once. Its section must be the run in force; one
+        that isn't (a crossover in between) is logged, not recorded."""
+        async with self._lock:
+            ts, ts_utc, _, _ = self._now()
+            rs = self.rooms.get(data.get("room"))
+            if rs is None:
+                self.store.log_event(ts, ts_utc, "warning", "block",
+                                     f"an overrule event this config can't place: room "
+                                     f"{data.get('room')!r}; not recorded", detail=data)
+                return
+            names = {u["id"]: u.get("name", u["id"]) for u in rs.room["units"]}
+            woke = [w for w in data.get("woke") or [] if isinstance(w, dict)]
+            cools = "; ".join(
+                f"{names.get(w.get('unit'), w.get('unit'))} wakes and cools"
+                + (f" at {sp:g}°" if (sp := _number(w.get("setpoint"), None)) is not None else "")
+                for w in woke)
+            edge = _number(data.get("warm_edge"), None)
+            past = f" past the un-leaned warm edge {edge:+.2f}" if edge is not None else ""
+            section = data.get("section")
+            name, sec = rs.room.get("name", rs.room["id"]), self._section_name(rs, section or "")
+            message = (f"{name}: the room overruled the block for {sec}: quorum met: "
+                       f"{data.get('tally')} vote(s) ({data.get('required')} needed){past}"
+                       + (f"; {cools}" if cools else "")
+                       + "; cooling is unblocked for every unit until the section changes")
+            await self._note_overrule(rs, section, message, {**data, "shadow": False})
+
+    async def _note_overrule(self, rs: RoomState, section: str | None, message: str,
+                             detail: dict) -> None:
+        """Under the lock: record an overrule (or shadow's would-be one) on
+        the room's run in force, log it, and replay the room if it was the
+        run's first, so the margin moves (decision 143)."""
+        ts, ts_utc, local_date, _ = self._now()
+        room_id = rs.room["id"]
+        run_date = rs.section_started.date().isoformat() if rs.section_started else local_date
+        recorded = False
+        if section is not None and section == rs.section:
+            recorded = self.store.record_section_overruled(room_id, run_date, section, ts)
+        elif section != rs.section:
+            message += f" (not recorded: the room is in {rs.section} now)"
+        self.store.log_event(ts, ts_utc, "info", "block", message, room_id=room_id,
+                             detail={**detail, "run_date": run_date, "recorded": recorded})
+        if recorded:
+            await self._replay(room_id, "block overruled")
+
+    async def _shadow_overrule(self, rs: RoomState, sensors: dict) -> None:
+        """Shadow mode at a heartbeat: would the room have overruled the
+        block it would have had? Asked of control.overrules_block as if the
+        block applied (decision 143): each unit in cool, boost or rest that
+        no person or vote unblocked resting for it since the section began,
+        the room's votes against the un-leaned edges, the heat sources as
+        they are. The first such heartbeat of a run is logged ("would have
+        been overruled") and recorded, so the margin learns from it and the
+        next section isn't held blocked by this one, as in active mode."""
+        cond, started = rs.conditions, rs.section_started
+        if cond is None or cond.section != rs.section or started is None \
+                or not cond.would_block or cond.blocked:
+            return              # no shadow block (active blocks are HA's to overrule)
+        room, r = rs.room, rs.room["id"]
+        run = self.store.section_run_conditions(r, started.date().isoformat(), rs.section)
+        if run is None or run.get("overruled_at"):
+            return
+        alm = self.store.current_almanac(r, as_of=self._today())["sections"].get(rs.section)
+        plain = control.evaluate_votes(sensors, alm, *control.PLAIN_EDGES)
+        heat = [e for e in room.get("heat_sources") or [] if self._cache.get(e) == "on"]
+        cfg = control.ControlConfig.from_config(self.config)
+        applied = (alm or {}).get("units") or {}
+        units, ctxs = {}, {}
+        for u in room["units"]:
+            uid = u["id"]
+            if self._cache.get(state_id(r, uid)) not in ("cool", "boost", "rest"):
+                continue
+            units[uid] = control.Unit(state="rest", since=started,
+                                      unblocked=self._cache.get(unblocked_id(r, uid)) == "on")
+            ctxs[uid] = control.Context(
+                setpoint_applied=(applied.get(uid) or {}).get("setpoint_applied"),
+                heartbeat_interval=self._sys.get("heartbeat_interval_minutes", 10),
+                blocked=True, heat_source_on=bool(heat), block_mode=cond.block_mode,
+                leak_on=self._cache.get(leak_id(r, uid)) == "on", config=cfg)
+        now = self._now()[3]
+        if not control.overrules_block(units, plain, now, ctxs):
+            return
+        minutes = int((now - started).total_seconds() // 60)
+        name, sec = room.get("name", r), self._section_name(rs, rs.section)
+        message = (f"{name}: the block for {sec} would have been overruled (shadow mode: not "
+                   f"applied): quorum met: {plain.tally} vote(s) ({plain.required} needed) past "
+                   f"the un-leaned warm edge {control.PLAIN_EDGES[1]:+.2f}, {minutes} min into "
+                   "the section")
+        async with self._lock:
+            if self.rooms.get(r) is rs:
+                await self._note_overrule(rs, rs.section, message, {
+                    "room": r, "section": rs.section, "tally": plain.tally,
+                    "required": plain.required, "warm_side": plain.warm_side,
+                    "warm_edge": control.PLAIN_EDGES[1], "shadow": True,
+                    "resting": sorted(uid for uid, u in units.items()
+                                      if control.rests_for_block(u, ctxs[uid]))})
 
     async def _record_vote(self, event: dict) -> None:
         """Record an accepted vote as a reaction (too_cold / too_hot, every
@@ -1047,6 +1167,7 @@ class Runtime:
         reason = self._seed_reason(room_id, section, sensors, units)
         if reason:
             await self.replay_room(room_id, reason)
+        await self._shadow_overrule(rs, sensors)
 
     def _seed_reason(self, room_id: str, section: str, sensors: dict, units: dict) -> str | None:
         """Why this heartbeat should trigger a replay, if it can seed
@@ -1594,7 +1715,11 @@ class Runtime:
         """A `block` event when a reaction moves the room's margin."""
         name = rs.room.get("name", rs.room["id"])
         sec = self._section_name(rs, step.section)
-        if step.blocked:
+        if step.kind == "overruled":
+            why = (f"the room overruled the block in {sec} {step.local_date}"
+                   if step.block_mode == "active" else
+                   f"the block in {sec} {step.local_date} would have been overruled (shadow)")
+        elif step.blocked:
             was = "blocked" if step.block_mode == "active" else "would have been blocked (shadow)"
             why = (f"a {'too_hot vote' if step.kind == 'too_hot' else 'unit turned on'} in "
                    f"{sec} {step.local_date}, which {was}")

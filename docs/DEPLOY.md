@@ -235,7 +235,13 @@ the current section's scene automation in HA to start a room at once).
 - **The block ships in shadow.** With `outdoor.block_mode: shadow` (the
   default) the container decides and logs each section's block ("would block
   Night: ...") and learns the margin from it, but tells control `blocked` false;
-  only heat sources block. Turning it `active` (Gate B) is an Apply: it takes
+  only heat sources block. It also logs when the room would have overruled such
+  a block ("would have been overruled", decision 143), and learns from that too.
+- **The overrule needs a deploy and a restart** (decision 143). The room
+  overruling an active block runs in the maintenance automations (3 change for
+  the example config; no helper changes), and the container records it on the
+  section run, a column storage migration 5 adds (backed up first as
+  `pre-overrule`). Turning it `active` (Gate B) is an Apply: it takes
   effect from each room's next section with no restart, and the preview shows
   the templates' `block_mode` fallback being updated.
 - **The vote buttons are ours, the things that press them aren't.** Deploy

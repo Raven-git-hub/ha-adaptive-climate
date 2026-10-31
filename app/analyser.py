@@ -60,7 +60,10 @@ forecast max, teaches nothing), moving M at reaction_rate, within -3 to 10
 (M may be negative: blocked at a max up to comfort - M):
 
   blocked    a too_hot vote, or a person turning a unit on: toward
-             delta_max + 0.5, so that run would not have been blocked
+             delta_max + 0.5, so that run would not have been blocked; and
+             likewise the room overruling the run's block (decision 143:
+             a too-warm quorum against the un-leaned edges, or one a shadow
+             block would have met), recorded on the run as overruled_at
   unblocked  a too_cold vote, or a person turning a unit off, within 30
              minutes of the system starting to cool: toward delta_max
 
@@ -489,7 +492,7 @@ class MarginConfig:
 class MarginStep:
     """One reaction that moved the margin, for the log and the UI."""
     at: datetime                    # UTC
-    kind: str                       # too_hot | on (blocked), too_cold | off (unblocked)
+    kind: str                       # too_hot | on | overruled (blocked), too_cold | off
     section: str
     local_date: str                 # the run's
     blocked: bool                   # the run's decision (shadow's included)
@@ -511,6 +514,7 @@ class _Run:
     block_mode: str | None
     unit_starts: dict | None = None  # {unit_id: {state, why}} at the crossover; None before
                                      # storage migration 4 (decision 141)
+    overruled_at: datetime | None = None    # UTC: the room overruled the block (decision 143)
 
 
 def margin_step(margin: float, target: float, rate: float) -> float:
@@ -523,10 +527,10 @@ def margin_step(margin: float, target: float, rate: float) -> float:
 
 def _runs(conn, room_id: str, until: str) -> list[_Run]:
     runs = []
-    for d, sec, planned, actual, cp, mx, blocked, mode, starts in conn.execute(
+    for d, sec, planned, actual, cp, mx, blocked, mode, starts, overruled in conn.execute(
             "SELECT local_date, section, planned_start, actual_start, comfort_point, "
-            "outdoor_max, blocked, block_mode, unit_starts FROM section_run WHERE room_id = ?",
-            (room_id,)):
+            "outdoor_max, blocked, block_mode, unit_starts, overruled_at FROM section_run "
+            "WHERE room_id = ?", (room_id,)):
         start = planned or actual
         if not start or datetime.fromisoformat(start).tzinfo is None:
             continue
@@ -535,12 +539,14 @@ def _runs(conn, room_id: str, until: str) -> list[_Run]:
             continue
         decided = mode in DECIDING_MODES and cp is not None and mx is not None
         runs.append(_Run(at, d, sec, round(cp - mx, 2) if decided else None,
-                         bool(blocked), mode, json.loads(starts) if starts else None))
+                         bool(blocked), mode, json.loads(starts) if starts else None,
+                         _at(overruled) if overruled else None))
     return sorted(runs, key=lambda r: r.start)
 
 
 def _margin_reactions(conn, room_id: str, until: str) -> list[tuple]:
-    """(at, room kind, {unit_id: (kind, power_before)}) in time order."""
+    """(at, room kind, {unit_id: (kind, power_before)}) in time order: the
+    people's reactions."""
     units: dict[int, dict] = {}
     for rid, uid, kind, power in conn.execute(
             "SELECT ru.reactive_id, ru.unit_id, ru.kind, ru.power_before FROM reactive_unit ru "
@@ -550,6 +556,22 @@ def _margin_reactions(conn, room_id: str, until: str) -> list[tuple]:
     return [(_at(ts), kind, units.get(rid, {})) for rid, ts, kind in conn.execute(
         "SELECT id, ts_utc, kind FROM reactive WHERE room_id = ? AND ts_utc <= ? "
         "ORDER BY ts_utc, id", (room_id, until))]
+
+
+OVERRULED = "overruled"     # the room overruled a run's block (decision 143)
+
+
+def _margin_events(conn, room_id: str, until: str, runs: list[_Run]) -> list[tuple]:
+    """The people's reactions (_margin_reactions) and each run's overrule,
+    as (at, OVERRULED, {}), merged in time order; at the same second a
+    reaction comes first. An overrule is the sensors', not the system's own
+    output: it teaches the margin as a too_hot vote in a blocked run does,
+    and nothing else."""
+    events = [(at, 0, kind, units) for at, kind, units in _margin_reactions(conn, room_id, until)]
+    events += [(r.overruled_at, 1, OVERRULED, {}) for r in runs
+               if r.overruled_at is not None and _utc(r.overruled_at) <= until]
+    events.sort(key=lambda e: (e[0], e[1]))
+    return [(at, kind, units) for at, _, kind, units in events]
 
 
 def cooling_since(conn, room_id: str, unit_id: str, run_start: datetime, at: datetime,
@@ -607,14 +629,16 @@ def learn_margin(conn, room: dict, cfg: MarginConfig,
     runs = _runs(conn, room_id, until)
     starts = [r.start for r in runs]
     margin, steps = float(cfg.initial), []
-    for at, kind, units in _margin_reactions(conn, room_id, until):
+    for at, kind, units in _margin_events(conn, room_id, until, runs):
         i = bisect.bisect_right(starts, at) - 1
         if i < 0 or runs[i].delta_max is None:
             continue
         run = runs[i]
         unit_kinds = {k for k, _ in units.values()}
         since = None
-        if run.blocked and (kind == "too_hot" or "on" in unit_kinds):
+        if run.blocked and kind == OVERRULED:
+            target, what = run.delta_max + MARGIN_UNBLOCK, OVERRULED
+        elif run.blocked and (kind == "too_hot" or "on" in unit_kinds):
             target, what = run.delta_max + MARGIN_UNBLOCK, "too_hot" if kind == "too_hot" else "on"
         elif not run.blocked and (kind == "too_cold" or "off" in unit_kinds):
             what = "too_cold" if kind == "too_cold" else "off"

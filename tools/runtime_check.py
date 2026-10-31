@@ -367,7 +367,8 @@ async def main() -> int:
           "(NULL where a room has none yet) - OK")
 
     # --- a person's vote: a setpoint change on the remote ---
-    subscriptions = {"state_changed", "ac_person_vote", "ac_user_off_wake", "homeassistant_start"}
+    subscriptions = {"state_changed", "ac_person_vote", "ac_user_off_wake",
+                     "ac_block_overruled", "homeassistant_start"}
     assert set(ws.subscribed) == subscriptions, ws.subscribed
     ws.subscribed.clear()                         # a dropped socket loses them all
     await rt._resubscribe()
@@ -391,8 +392,8 @@ async def main() -> int:
     assert rx == 1, rx
     assert rxs == 3, rxs   # all sensors snapshotted at reaction time
     assert last_reaction(c, "main_room") == ("too_cold", "too_cold", None, None, None, 24.0, 1)
-    print("vote: subscribed to ac_person_vote, ac_user_off_wake and homeassistant_start as "
-          "well as state_changed, all again after a reconnect - OK")
+    print("vote: subscribed to ac_person_vote, ac_user_off_wake, ac_block_overruled and "
+          "homeassistant_start as well as state_changed, all again after a reconnect - OK")
     print("vote: a remote's setpoint change opens no window of the runtime's own; HA's event for "
           "it is one too_cold reaction (unit, chosen 24), hold not raised, 3 sensors "
           "snapshotted - OK")
@@ -694,6 +695,7 @@ async def main() -> int:
     await check_conditions()
     await check_conditions_without_outdoor()
     await check_negative_margin()
+    await check_overrule()
     await check_reload()
     await check_reload_lock()
     print("\nALL RUNTIME CHECKS PASSED")
@@ -1774,6 +1776,174 @@ async def check_negative_margin() -> None:
     print("negative margin: at the default -1, Night blocks at a max of comfort + 1 (24.9), "
           "Sleep stays blocked at comfort + 1.5 and Sunrise lifts it at comfort + 2, logged "
           "and published as margin -1.0; a margin rounding to zero from below shows 0.0 - OK")
+
+
+async def check_overrule() -> None:
+    """Decision 143: the room overrules the block. In active mode HA's
+    maintenance does it and fires ac_block_overruled: the runtime logs it,
+    records it on the run (the first of a run stands), replays the room so
+    the margin learns, and the next section is decided on its own forecast
+    rather than held. In shadow mode the runtime asks control at its own
+    heartbeat whether the room would have overruled the block it would have
+    had, and treats a yes the same way, once per run."""
+    hk, utc = ZoneInfo("Asia/Hong_Kong"), ZoneInfo("UTC")
+    # Night blocks at the default margin -1 (max comfort + 1); Sleep's max is
+    # comfort + 1.5, so it is blocked only if Night's block is carried over.
+    temps = {(3, 21): 24.9, **{(3, h): 25.4 for h in (22, 23)},
+             **{(4, h): 25.4 for h in range(6)}}
+    first = datetime(2026, 8, 3, 12, 0, tzinfo=hk)
+    fixed = [{"datetime": (first + timedelta(hours=k)).astimezone(timezone.utc).isoformat(),
+              "temperature": temps.get(((first + timedelta(hours=k)).day,
+                                        (first + timedelta(hours=k)).hour), 26.0)}
+             for k in range(30)]
+
+    def world(mode: str, heat: bool = False):
+        clock = {"t": datetime(2026, 8, 3, 20, 25, 0, tzinfo=hk)}
+        config = json.loads(json.dumps(CONFIG))
+        config["outdoor"].update(source="forecast", weather_entity="weather.forecast_home",
+                                 block_mode=mode)
+        main = next(r for r in config["rooms"] if r["id"] == "main_room")
+        main["heat_sources"] = ["switch.lounge_heater"]
+        states = _build_states() + [
+            {"entity_id": "weather.forecast_home", "state": "cloudy",
+             "attributes": {"temperature": 28.0, "supported_features": 3},
+             "last_updated": clock["t"].astimezone(utc).isoformat()},
+            {"entity_id": "switch.lounge_heater", "state": "on" if heat else "off",
+             "attributes": {}},
+            {"entity_id": "input_select.ac_state_main_room_main_room_ac", "state": "cool",
+             "attributes": {}},
+            {"entity_id": "input_boolean.ac_unblocked_main_room_main_room_ac", "state": "off",
+             "attributes": {}}]
+        tmp, store = _reload_world(clock, states, config)
+        rest = ForecastRest(states, clock, fixed=fixed)
+        rt = Runtime(config, store, rest, StubWS(), tmp)
+        rt._now = lambda: (clock["t"].isoformat(timespec="seconds"),
+                           clock["t"].astimezone(utc).isoformat(timespec="seconds"),
+                           clock["t"].date().isoformat(), clock["t"])
+        return clock, states, store, rest, rt
+
+    async def cross(rt, clock, section: str, when: datetime) -> dict:
+        clock["t"] = when + timedelta(seconds=5)
+        await rt._crossover(rt.rooms["main_room"], section, when, catch_up=False)
+        await asyncio.sleep(0)
+        await asyncio.gather(*[t for t in list(rt._followups)
+                               if t.get_name().startswith("ac-outdoor-")])
+        return [e[2] for e in rt.rest.log if e[0] == "set_state"
+                and e[1] == "sensor.ac_conditions_main_room"][-1]
+
+    async def overruled(rt, clock, when: datetime, room: str = "main_room") -> None:
+        clock["t"] = when
+        rt.ws.subscribed["ac_block_overruled"]({"event_type": "ac_block_overruled", "data": {
+            "room": room, "section": "night", "tally": 2, "required": 2, "warm_side": 3,
+            "warm_edge": 1.0, "woke": [{"unit": "main_room_ac", "setpoint": 22.0}]}})
+        await asyncio.sleep(0)
+        await asyncio.gather(*[t for t in list(rt._followups) if t.get_name() == "ac-overrule"])
+
+    def blocks(store) -> list[str]:
+        return [e["message"] for e in reversed(store.recent_events(
+            limit=1000, room_id="main_room", category="block"))]
+
+    def overruled_at(store, section: str = "night"):
+        return store._conn.execute(
+            "SELECT overruled_at FROM section_run WHERE room_id='main_room' AND "
+            "local_date='2026-08-03' AND section=?", (section,)).fetchone()[0]
+
+    # --- active: HA overrules; the runtime logs, records, learns ---------
+    for overrule in (True, False):
+        clock, states, store, rest, rt = world("active")
+        await rt.start()
+        await asyncio.sleep(0.1)
+        night = await cross(rt, clock, "night", datetime(2026, 8, 3, 20, 30, tzinfo=hk))
+        assert (night["delta_max"], night["blocked"]) == (-1.0, True), night
+        if overrule:
+            await overruled(rt, clock, datetime(2026, 8, 3, 21, 10, tzinfo=hk))
+            said = blocks(store)[-2:]
+            assert said == [
+                "Main Room: the room overruled the block for Night: quorum met: 2 vote(s) "
+                "(2 needed) past the un-leaned warm edge +1.00; Main Room AC wakes and cools at "
+                "22°; cooling is unblocked for every unit until the section changes",
+                "Main Room: block margin -1.0 -> -0.75: the room overruled the block in Night "
+                "2026-08-03 (delta max -1.0, so toward -0.5)"], said
+            assert overruled_at(store) == "2026-08-03T21:10:00+08:00"
+            assert len(replays(store, "main_room", "block overruled")) == 1
+            assert rt.margin("main_room") == -0.75 and [
+                p[2]["margin"] for p in rest.set_states
+                if p[0] == "sensor.ac_almanac_main_room"][-1] == -0.75
+            # a second overrule in the run (a leak released into the block,
+            # say) is logged, not recorded, and teaches nothing more
+            await overruled(rt, clock, datetime(2026, 8, 3, 21, 40, tzinfo=hk))
+            assert overruled_at(store) == "2026-08-03T21:10:00+08:00"
+            assert len(replays(store, "main_room", "block overruled")) == 1
+            last = store.recent_events(room_id="main_room", category="block")[0]
+            assert last["message"].startswith("Main Room: the room overruled the block for "
+                                              "Night") and last["detail"]["recorded"] is False
+            await overruled(rt, clock, datetime(2026, 8, 3, 21, 45, tzinfo=hk), room="attic")
+            stray = store.recent_events(category="block", severity="warning")[0]
+            assert stray["message"] == ("an overrule event this config can't place: room "
+                                        "'attic'; not recorded"), stray
+        sleep = await cross(rt, clock, "sleep", datetime(2026, 8, 3, 22, 0, tzinfo=hk))
+        assert (sleep["delta_max"], sleep["blocked"]) == (-1.5, not overrule), sleep
+        said = blocks(store)[-1]
+        if overrule:
+            assert said.startswith("Main Room: not blocking Sleep: forecast max 25.4, comfort "
+                                   "23.9, margin -0.75;"), said
+        else:
+            assert said.startswith("Main Room: blocking Sleep: forecast max 25.4, comfort 23.9, "
+                                   "margin -1.0, held from the last section"), said
+        await rt.stop()
+        store.close()
+    print("overrule (active): HA's ac_block_overruled is logged (\"the room overruled the block "
+          "for Night: quorum met ...\"), recorded on the run and replayed at once (margin -1.0 "
+          "-> -0.75, toward delta max + 0.5); a second one in the run is logged, not recorded; "
+          "an unknown room's is a warning; Sleep (max comfort + 1.5) is then decided on its own "
+          "forecast, not blocked, where without the overrule Night's block holds it - OK")
+
+    # --- shadow: the runtime asks control at its heartbeat ---------------
+    def hot(store) -> None:
+        alm = store.current_almanac("main_room")["sections"]["night"]["sensors"]
+        readings = {"living1": 1.2, "living2": 1.2, "living3": 0.2}     # in band widths
+        for sensor, entity in zip(("living1", "living2", "living3"), LIVING):
+            e = alm[sensor]
+            value = round(e["comfort"] + readings[sensor] * e["band"], 2)
+            next(x for x in states if x["entity_id"] == entity)["state"] = str(value)
+
+    async def beat(rt, clock, minute: int) -> None:
+        clock["t"] = datetime(2026, 8, 3, 20, 30, tzinfo=hk) + timedelta(minutes=minute)
+        await rt._do_heartbeat(rt.rooms["main_room"])
+
+    for heat in (False, True):
+        clock, states, store, rest, rt = world("shadow", heat=heat)
+        await rt.start()
+        await asyncio.sleep(0.1)
+        night = await cross(rt, clock, "night", datetime(2026, 8, 3, 20, 30, tzinfo=hk))
+        assert (night["would_block"], night["blocked"]) == (True, False), night
+        hot(store)
+        before = len(blocks(store))
+        await beat(rt, clock, 10)          # 10 min in: short of the rest minimum (15)
+        assert len(blocks(store)) == before and overruled_at(store) is None
+        await beat(rt, clock, 20)
+        if heat:
+            assert len(blocks(store)) == before and overruled_at(store) is None, blocks(store)
+            await rt.stop()
+            store.close()
+            continue
+        assert blocks(store)[before:] == [
+            "Main Room: the block for Night would have been overruled (shadow mode: not "
+            "applied): quorum met: 2 vote(s) (2 needed) past the un-leaned warm edge +1.00, 20 "
+            "min into the section",
+            "Main Room: block margin -1.0 -> -0.75: the block in Night 2026-08-03 would have "
+            "been overruled (shadow) (delta max -1.0, so toward -0.5)"], blocks(store)[before:]
+        assert overruled_at(store) == "2026-08-03T20:50:00+08:00"
+        await beat(rt, clock, 30)          # once per run
+        assert len(blocks(store)) == before + 2
+        sleep = await cross(rt, clock, "sleep", datetime(2026, 8, 3, 22, 0, tzinfo=hk))
+        assert (sleep["would_block"], sleep["blocked"]) == (False, False), sleep
+        await rt.stop()
+        store.close()
+    print("overrule (shadow): not before the rest minimum (10 min in), then \"would have been "
+          "overruled\" once at 20 min, recorded and learned from (-1.0 -> -0.75) as in active "
+          "mode, and Sleep isn't held by Night's would-be block; with a heat source on, nothing - "
+          "OK")
 
 
 def _reload_world(clock: dict, states: list, config: dict):

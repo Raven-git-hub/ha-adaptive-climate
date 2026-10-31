@@ -17,7 +17,8 @@ module never looks at what is already in HA.
 
 The control logic is app/control.py's, rendered as Jinja (docs/V2_DESIGN.md,
 Control: cool or rest): the scene runs evaluate_votes and on_section_change,
-maintenance runs evaluate_votes and step, the vote automation runs on_button, the
+maintenance runs evaluate_votes and on_heartbeat (the room overruling a block,
+then step), the vote automation runs on_button, the
 manual-change automation runs on_climate_change, and the leak automations
 run step's leak rules. Each reads the section's outdoor conditions (phase 5:
 the cooling block and the leaned vote edges) from sensor.ac_conditions_<room>,
@@ -122,6 +123,10 @@ def button_id(room: str, direction: str) -> str:
 PERSON_VOTE_EVENT = "ac_person_vote"
 # Maintenance woke a person's off on a too-warm quorum; the runtime logs why.
 USER_OFF_WAKE_EVENT = "ac_user_off_wake"
+# Maintenance found the room too warm under the section's block and lifted
+# it (control.overrules_block); the runtime logs it and records it on the
+# section run, for the margin and the next section's hysteresis.
+BLOCK_OVERRULED_EVENT = "ac_block_overruled"
 
 def scene_automation_id(room: str, section: str) -> str:
     return f"ac_scene_{room}_{section}"
@@ -258,7 +263,7 @@ def _live_section_variables(room: dict) -> dict:
 
 
 def _conditions_variables(config: dict, room: dict, section: str,
-                          edges: bool = False) -> dict:
+                          edges: bool = False, heat: bool = False) -> dict:
     """The one place `blocked` and the vote edges come from (decision 62):
     sensor.ac_conditions_<room>, read only while its state is `section` (a
     Jinja expression). Missing, unknown, unavailable or another section's
@@ -266,10 +271,11 @@ def _conditions_variables(config: dict, room: dict, section: str,
     of the room's heat sources on blocks too, checked live, unless
     block_mode is off: the conditions' own block_mode, or the config's while
     there are none. edges: also cold_edge and warm_edge, for the automations
-    that count votes (_votes_variables)."""
+    that count votes (_votes_variables). heat: the heat sources' block on its
+    own too, as heat_on (maintenance: a heat source's block isn't
+    overruled), with `blocked` read from it."""
     domain, obj = _split(conditions_id(room["id"]))
     mode = (config.get("outdoor") or {}).get("block_mode", control.DEFAULT_BLOCK_MODE)
-    heat = " or ".join(f"states('{e}') == 'on'" for e in room.get("heat_sources") or [])
     variables = {
         "conditions": _fill(
             "{%- set c = states.<<D>>.<<O>> -%}"
@@ -284,14 +290,24 @@ def _conditions_variables(config: dict, room: dict, section: str,
             "'block_mode': a.get('block_mode') if a.get('block_mode') in <<MODES>> "
             "else '<<MODE>>'} }}",
             D=domain, O=obj, S=section, MODES=list(control.BLOCK_MODES), MODE=mode),
-        "blocked": _fill("{{ conditions.blocked or (conditions.block_mode in <<HM>> and "
-                         "(<<HEAT>>)) }}", HM=list(control.HEAT_BLOCK_MODES),
-                         HEAT=heat or "false"),
+        "blocked": "{{ conditions.blocked or " + _heat_blocks(room) + " }}",
     }
+    if heat:        # heat_on ahead of blocked, which reads it
+        del variables["blocked"]
+        variables["heat_on"] = "{{ " + _heat_blocks(room) + " }}"
+        variables["blocked"] = "{{ conditions.blocked or heat_on }}"
     if edges:
         variables.update(cold_edge="{{ conditions.cold_edge }}",
                          warm_edge="{{ conditions.warm_edge }}")
     return variables
+
+
+def _heat_blocks(room: dict) -> str:
+    """control.heat_blocks as a Jinja expression, after `conditions`: one of
+    the room's heat sources on, checked live, unless block_mode is off."""
+    heat = " or ".join(f"states('{e}') == 'on'" for e in room.get("heat_sources") or [])
+    return _fill("(conditions.block_mode in <<HM>> and (<<HEAT>>))",
+                 HM=list(control.HEAT_BLOCK_MODES), HEAT=heat or "false")
 
 
 def _votes_variables(config: dict, room: dict, sensors: str) -> dict:
@@ -364,9 +380,12 @@ _RESULT = ("{{ {'go': r.go, 'state': r.state, 'offset': r.offset, 'base': r.base
 
 # Maintenance's result also says whether this heartbeat woke a person's off
 # (control.user_off_wakes: the only way maintenance moves a user_off is into
-# cool), for the ac_user_off_wake event.
+# cool), for the ac_user_off_wake event, and whether the room's overrule
+# woke the unit from a rest the block held (control.overruled_step), for the
+# ac_block_overruled event.
 _RESULT_MAINTENANCE = (_RESULT[:-len("} }}")]
-                       + ", 'woke': st == 'user_off' and r.state == 'cool'} }}")
+                       + ", 'woke': st == 'user_off' and r.state == 'cool'"
+                       + ", 'overrule_woke': overrule and held} }}")
 
 
 def _clamp(value: str) -> str:
@@ -478,6 +497,49 @@ def _step(config: dict, room: dict, unit: dict) -> str:
         + f"{{%- elif votes.cold_side < {release_floor} -%}}" + _go("cool", cfg, _release_offset(+1))
         + "{%- endif -%}"
         + "{%- endif -%}")
+
+
+def _rest_min(config: dict) -> str:
+    """control.min_time_met for the rest minimum, after _read_unit."""
+    cfg = control.ControlConfig.from_config(config)
+    interval = config.get("system", {}).get("heartbeat_interval_minutes", 10)
+    return _min_time_met((cfg.rest_min_heartbeats - 0.5) * interval * 60)
+
+
+# control.rests_for_block, after _read_unit, once `blocked` says cooling is
+# blocked for the room (the overrule only counts it under the section's block)
+_RESTS_FOR_BLOCK = "(st == 'rest' and not unb and not leak and tb is not none)"
+
+
+def _overrule(config: dict, room: dict) -> str:
+    """control.overrules_block as one Jinja expression: the section's own
+    block (conditions.blocked), no heat source on (heat_on), a too-warm
+    quorum in plain_votes (the un-leaned edges), at least one unit resting
+    for the block, and every one of them past its rest minimum time. Reads
+    each unit's helpers as its own template does (_read_unit)."""
+    body = "{%- set o = namespace(resting=0, waiting=0) -%}"
+    for unit in room["units"]:
+        body += (_read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
+                 + "{%- if " + _RESTS_FOR_BLOCK + " -%}{%- set o.resting = o.resting + 1 -%}"
+                 + "{%- if not " + _rest_min(config) + " -%}"
+                 + "{%- set o.waiting = o.waiting + 1 -%}{%- endif -%}{%- endif -%}")
+    return body + ("{{ conditions.blocked and not heat_on and plain_votes.met and "
+                   "plain_votes.direction == 'too_warm' and o.resting > 0 and o.waiting == 0 }}")
+
+
+def _overruled_step(config: dict, room: dict, unit: dict) -> str:
+    """control.on_heartbeat for one unit: when the room overrules the block
+    (`overrule`), the unit is unblocked (written only if it wasn't), and a
+    unit resting for the block wakes into cool at its base, offset 0
+    (control.overruled_step); any other unit, and every unit on a heartbeat
+    without an overrule, takes control.step, unblocked if overruled."""
+    cfg = control.ControlConfig.from_config(config)
+    return ("{%- set held = " + _RESTS_FOR_BLOCK + " -%}"
+            "{%- if overrule and not unb -%}{%- set r.unb = true -%}{%- set r.go = true -%}"
+            "{%- endif -%}"
+            "{%- set unb = unb or overrule -%}"
+            "{%- if overrule and held -%}" + _go("cool", cfg, "0")
+            + "{%- else -%}" + _step(config, room, unit) + "{%- endif -%}")
 
 
 def _vote(config: dict, direction: str, chosen: str) -> str:
@@ -849,10 +911,12 @@ def _sensor_reading_expr(sensor: dict, room: dict,
     return "none"
 
 
-def _votes_expr(room: dict, stale_minutes: int = control.DEFAULT_STALE_MINUTES) -> str:
+def _votes_expr(room: dict, stale_minutes: int = control.DEFAULT_STALE_MINUTES,
+                cold_edge: str = "cold_edge", warm_edge: str = "warm_edge") -> str:
     """control.evaluate_votes as one Jinja expression -> {met, tally,
     required, direction, warm_side, cold_side}, from `sensor_data` and the
-    `cold_edge` / `warm_edge` variables. A sensor's position is (reading -
+    `cold_edge` / `warm_edge` variables (or the edges given, as Jinja
+    expressions: the overrule's un-leaned ones). A sensor's position is (reading -
     comfort) / band; it votes past either edge. One pooled count against the
     quorum; the summed trust of each side picks the direction (too_warm /
     too_cold / none), in the room's sensor order, as app.trust sums it."""
@@ -869,7 +933,7 @@ def _votes_expr(room: dict, stale_minutes: int = control.DEFAULT_STALE_MINUTES) 
         "{%- set ns.n = ns.n + 1 -%}"
         "{%- if p > 0 -%}{%- set ns.ws = ns.ws + 1 -%}"
         "{%- elif p < 0 -%}{%- set ns.cs = ns.cs + 1 -%}{%- endif -%}"
-        "{%- if p <= cold_edge or p >= warm_edge -%}"
+        "{%- if p <= <<CE>> or p >= <<WE>> -%}"
         "{%- set ns.tally = ns.tally + 1 -%}"
         "{%- set w = (s.e.get('trust') or 0.0) + 0.000001 -%}"
         "{%- if p > 0 -%}{%- set ns.warm = ns.warm + w -%}"
@@ -884,22 +948,28 @@ def _votes_expr(room: dict, stale_minutes: int = control.DEFAULT_STALE_MINUTES) 
         "if ns.cold > ns.warm else 'none')) if met else 'none' -%}"
         "{{ {'met': met, 'tally': ns.tally, 'required': required, 'direction': direction, "
         "'warm_side': ns.ws, 'cold_side': ns.cs} }}",
-        ENTRIES=entries, BAND=repr(control.DEFAULT_BAND))
+        ENTRIES=entries, BAND=repr(control.DEFAULT_BAND), CE=cold_edge, WE=warm_edge)
 
 
 def build_maintenance_automation(config: dict, room: dict) -> dict:
     r = room["id"]
     interval = config.get("system", {}).get("heartbeat_interval_minutes", 10)
 
+    stale = config.get("system", {}).get("sensor_stale_minutes", control.DEFAULT_STALE_MINUTES)
+    cold, warm = (repr(e) for e in control.PLAIN_EDGES)
     variables = {
         **_live_section_variables(room), "now_ts": NOW_TS,
-        **_conditions_variables(config, room, "section", edges=True),
+        **_conditions_variables(config, room, "section", edges=True, heat=True),
         **_votes_variables(config, room, SENSORS_LIVE),
+        # the overrule (control.overrules_block): the room's votes against
+        # the un-leaned edges
+        "plain_votes": _votes_expr(room, stale, cold, warm),
+        "overrule": _overrule(config, room),
     }
     for unit in room["units"]:
         variables[_unit_var(unit)] = (
             _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
-            + _step(config, room, unit) + _RESULT_MAINTENANCE)
+            + _overruled_step(config, room, unit) + _RESULT_MAINTENANCE)
 
     any_go = " or ".join(f"{_unit_var(u)}.go" for u in room["units"])
     return {
@@ -917,9 +987,28 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
             *[_write_unit(room, unit) for unit in room["units"]],
             *[_send_command(unit) for unit in room["units"]],
             *[_wake_event(room, unit) for unit in room["units"]],
+            _overrule_event(room),
             _set("input_boolean.turn_off", guard_id(r)),
         ])],
     }
+
+
+def _overrule_event(room: dict) -> dict:
+    """The ac_block_overruled event, when this heartbeat's room overruled
+    the section's block: the section, the room's votes against the
+    un-leaned edges, and each unit it woke with the setpoint it now cools
+    at, for the runtime's log line and the section run. Fired once the
+    commands are sent."""
+    woke = " + ".join(
+        f"([{{'unit': '{u['id']}', 'setpoint': {_unit_var(u)}.cmd.temperature}}] "
+        f"if {_unit_var(u)}.overrule_woke else [])" for u in room["units"])
+    return _when("{{ overrule }}", [{
+        "event": BLOCK_OVERRULED_EVENT,
+        "event_data": {"room": room["id"], "section": "{{ section }}",
+                       "tally": "{{ plain_votes.tally }}",
+                       "required": "{{ plain_votes.required }}",
+                       "warm_side": "{{ plain_votes.warm_side }}",
+                       "warm_edge": control.PLAIN_EDGES[1], "woke": "{{ " + woke + " }}"}}])
 
 
 def _wake_event(room: dict, unit: dict) -> dict:

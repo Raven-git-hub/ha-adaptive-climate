@@ -56,14 +56,15 @@ REACTIVE_CSV = ["ts", "ts_utc", "section", "window_seconds", "occupied",
                 "kind", "outdoor_temp"]                             # v2
 # One row when a section run starts, one when its forecast has been read
 # (outdoor_mean and outdoor_max only), one when its conditions are decided
-# (comfort_point, lean, blocked and block_mode only) and one when it
-# closes. Re-ingest
+# (comfort_point, lean, blocked and block_mode only), one if the room
+# overrules its block (overruled_at only) and one when it closes. Re-ingest
 # merges a day file's rows per section in order; a blank field leaves the
 # earlier value, matching record_section_run's upsert.
 SECTION_RUN_CSV = ["section", "planned_start", "actual_start", "ended_at",
                    "outcome", "outcome_reason", "outdoor_mean", "outdoor_max",
                    "comfort_point", "lean", "blocked", "block_mode",
-                   "unit_starts"]                                   # migration 4, JSON
+                   "unit_starts",                                   # migration 4, JSON
+                   "overruled_at"]                                  # migration 5
 
 
 @dataclass(frozen=True)
@@ -250,6 +251,16 @@ def _migration_4(conn: sqlite3.Connection, schema: _Schema) -> None:
     _rebuild_table(conn, schema, "section_run")
 
 
+def _migration_5(conn: sqlite3.Connection, schema: _Schema) -> None:
+    """When the room overruled a run's block (decision 143).
+
+    section_run is rebuilt with its rows and a new nullable overruled_at
+    column: when a too-warm quorum against the un-leaned edges overruled
+    the run's block (or, in shadow mode, would have). Older runs keep NULL:
+    none was overruled, as there was no overrule before."""
+    _rebuild_table(conn, schema, "section_run")
+
+
 # (label for the pre-migration backup file, migration). Migration n takes
 # storage version n-1 to n; the label names the shape it upgrades from.
 # Append only.
@@ -258,6 +269,7 @@ MIGRATIONS: list[tuple[str, Callable[[sqlite3.Connection, _Schema], None]]] = [
     ("phase0", _migration_2),
     ("pre-votes", _migration_3),
     ("pre-starts", _migration_4),
+    ("pre-overrule", _migration_5),
 ]
 
 def _now_pair() -> tuple[str, str]:
@@ -489,7 +501,7 @@ class Store:
             room_id, local_date, "section_run", SECTION_RUN_CSV,
             [section, planned_start, actual_start, ended_at, outcome, outcome_reason,
              outdoor_mean, outdoor_max, comfort_point, lean, _int_or_none(blocked),
-             block_mode, starts])
+             block_mode, starts, None])
         with self._lock:
             self._conn.execute(
                 "INSERT INTO section_run(room_id,local_date,section,planned_start,"
@@ -536,7 +548,7 @@ class Store:
         # The close row goes in the run's own day file, so re-ingest merges it
         # into the run it ends.
         self._append_csv(room_id, run["local_date"], "section_run", SECTION_RUN_CSV,
-                         [run["section"], None, None, ended_at] + [None] * 9)
+                         [run["section"], None, None, ended_at] + [None] * 10)
         with self._lock:
             self._conn.execute("UPDATE section_run SET ended_at=? WHERE id=?",
                                (ended_at, run["id"]))
@@ -551,7 +563,7 @@ class Store:
         the blanks into the run's start row), and the SQLite row is updated
         in place."""
         self._append_csv(room_id, local_date, "section_run", SECTION_RUN_CSV,
-                         [section] + [None] * 5 + [outdoor_mean, outdoor_max] + [None] * 5)
+                         [section] + [None] * 5 + [outdoor_mean, outdoor_max] + [None] * 6)
         with self._lock:
             self._conn.execute(
                 "UPDATE section_run SET outdoor_mean=?, outdoor_max=? "
@@ -568,7 +580,7 @@ class Store:
         force. Its CSV row carries only those four, as the outdoor row does."""
         self._append_csv(room_id, local_date, "section_run", SECTION_RUN_CSV,
                          [section] + [None] * 7 + [comfort_point, lean, _int_or_none(blocked),
-                                                   block_mode, None])
+                                                   block_mode, None, None])
         with self._lock:
             self._conn.execute(
                 "UPDATE section_run SET comfort_point=?, lean=?, blocked=?, block_mode=? "
@@ -576,6 +588,29 @@ class Store:
                 (comfort_point, lean, _int_or_none(blocked), block_mode,
                  room_id, local_date, section))
             self._conn.commit()
+
+    def record_section_overruled(self, room_id: str, local_date: str, section: str,
+                                 overruled_at: str) -> bool:
+        """Mark a section run's block overruled by the room at overruled_at
+        (decision 143; shadow's "would have been overruled" included). The
+        first overrule of a run stands: a later one (a leak released into
+        the block, say) records nothing. Its CSV row carries only that
+        field. Returns whether it was recorded."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT overruled_at FROM section_run WHERE room_id=? AND local_date=? "
+                "AND section=?", (room_id, local_date, section)).fetchone()
+        if row is None or row["overruled_at"] is not None:
+            return False
+        self._append_csv(room_id, local_date, "section_run", SECTION_RUN_CSV,
+                         [section] + [None] * 12 + [overruled_at])
+        with self._lock:
+            self._conn.execute(
+                "UPDATE section_run SET overruled_at=? WHERE room_id=? AND local_date=? "
+                "AND section=? AND overruled_at IS NULL",
+                (overruled_at, room_id, local_date, section))
+            self._conn.commit()
+        return True
 
     def log_event(self, ts: str, ts_utc: str, severity: str, category: str,
                   message: str, room_id: str | None = None,
@@ -624,24 +659,27 @@ class Store:
     def section_run_conditions(self, room_id: str, local_date: str,
                                section: str) -> dict | None:
         """One section run's outdoor values and conditions (outdoor_mean,
-        outdoor_max, comfort_point, lean, blocked, block_mode), or None if
-        there is no such run. block_mode is NULL until it was decided."""
+        outdoor_max, comfort_point, lean, blocked, block_mode) and when the
+        room overruled its block (overruled_at), or None if there is no such
+        run. block_mode is NULL until it was decided."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT outdoor_mean, outdoor_max, comfort_point, lean, blocked, block_mode "
-                "FROM section_run WHERE room_id=? AND local_date=? AND section=?",
+                "SELECT outdoor_mean, outdoor_max, comfort_point, lean, blocked, block_mode, "
+                "overruled_at FROM section_run WHERE room_id=? AND local_date=? AND section=?",
                 (room_id, local_date, section)).fetchone()
         return None if row is None else dict(row)
 
     def previous_blocked(self, room_id: str, local_date: str, section: str,
                          before: datetime) -> bool:
         """Was the room's run before this one blocked, as decided (shadow's
-        "would block" included)? The latest run, other than this one, that
-        started before `before` (its planned start); no run, or one with no
-        decision, reads as not blocked."""
+        "would block" included), and not overruled by the room (decision
+        143: an overruled block is not carried forward, so the next run is
+        decided on its own forecast)? The latest run, other than this one,
+        that started before `before` (its planned start); no run, or one
+        with no decision, reads as not blocked."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT local_date, section, planned_start, actual_start, blocked "
+                "SELECT local_date, section, planned_start, actual_start, blocked, overruled_at "
                 "FROM section_run WHERE room_id=? ORDER BY id DESC LIMIT 50",
                 (room_id,)).fetchall()
         runs = []
@@ -651,7 +689,7 @@ class Store:
                 continue
             at = datetime.fromisoformat(start)
             if at.tzinfo is not None and at < before:
-                runs.append((at, r["blocked"]))
+                runs.append((at, r["blocked"] and r["overruled_at"] is None))
         return bool(max(runs, key=lambda x: x[0])[1]) if runs else False
 
     def reactions_since(self, room_id: str, since_utc: str) -> list[tuple[str, str | None, dict]]:

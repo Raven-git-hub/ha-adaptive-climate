@@ -64,6 +64,8 @@ READINGS = {
     "near":         {"s1": 24.5, "s2": 24.5, "s3": 24.0},  # +0.5: votes only past a leaned edge
     "near_cold":    {"s1": 23.5, "s2": 23.5, "s3": 24.0},  # -0.5: likewise, on the cold side
     "dead":         {"s1": None, "s2": None, "s3": None},  # no usable sensor
+    "warm_one":     {"s1": 25.5, "s2": 24.5, "s3": 24.3},  # 1 past +1: short of the quorum
+    "just_warm":    {"s1": 24.95, "s2": 24.95, "s3": 24.0},  # +0.95: past a leaned +0.9, not +1
 }
 CTX_DEFAULTS = {"setpoint_applied": 22.0, "unit_min": 16.0, "unit_max": 30.0,
                 "heartbeat_interval": 10, "blocked": False, "leak_on": False,
@@ -74,6 +76,7 @@ COND_DEFAULTS = {"margin": 6.0, "was_blocked": False, "block_mode": "shadow", "k
 DAYS_3 = 3 * 24 * 60 * 60       # a sensor put away three days ago
 BABY = {"unit_min": 18.0}
 MAIN = "u"                      # the scenario's unit; peers are the room's others
+_ROOM = ("peers", "peer_commands")      # a step's expectations of the room's other units
 
 
 def s(name: str, steps: list, unit: dict | None = None, ctx: dict | None = None,
@@ -82,9 +85,17 @@ def s(name: str, steps: list, unit: dict | None = None, ctx: dict | None = None,
             "steps": steps}
 
 
-def step(readings, expect_unit: dict, command, at: int = 0, **extra) -> dict:
-    return {"do": "step", "at": at, "readings": readings,
-            "expect": {"unit": expect_unit, "command": command}, **extra}
+def step(readings, expect_unit: dict, command, at: int = 0, overruled: bool | None = None,
+         **extra) -> dict:
+    """A maintenance heartbeat for the room (control.on_heartbeat).
+    overruled: whether the room overrules the section's block at it
+    (unchecked if None). extra: peers / peer_commands expectations, and
+    the step's own edges, reported ages, almanac or ctx."""
+    room = {k: extra.pop(k) for k in _ROOM if k in extra}
+    expect = {"unit": expect_unit, "command": command, **room}
+    if overruled is not None:
+        expect["overruled"] = overruled
+    return {"do": "step", "at": at, "readings": readings, "expect": expect, **extra}
 
 
 def votes(readings, expect: dict, **extra) -> dict:
@@ -103,9 +114,6 @@ def person(kind: str, expect_unit: dict, setpoint=None, at: int = 0) -> dict:
     or changing its mode (manual)."""
     return {"do": "person", "at": at, "kind": kind, "setpoint": setpoint,
             "expect": {"unit": expect_unit}}
-
-
-_ROOM = ("peers", "peer_commands")
 
 
 def press(direction: str, expect_unit: dict, command, accepted: bool = True, at: int = 0,
@@ -144,6 +152,28 @@ def conditions(expect: dict, **inputs) -> dict:
 
 def climate(mode: str, temperature: float | None = None, fan: str | None = None) -> dict:
     return {"mode": mode, "temperature": temperature, "fan": fan}
+
+
+# The room overrules the block (decision 143): an active block from a cold
+# forecast, its warm edge leaned to +1.7.
+BLOCK = conditions({"blocked": True, "warm_edge": 1.7}, comfort=24.0, mean=17.0, max=17.0,
+                   block_mode="active")
+OVERRULE_WAKES = ("the room overrules the block: a blocked room that warms to a quorum wakes "
+                  "and cools at its base, the block lifted for the section")
+OVERRULE_REST_MIN = "the room doesn't overrule the block before the rest minimum time"
+OVERRULE_EVERY_REST = ("the overrule waits for every unit resting for the block, then wakes "
+                       "them together")
+OVERRULE_NOT_HEAT = "a heat source's block isn't overruled: the heater is why the room is warm"
+OVERRULE_PLAIN_EDGE = ("the overrule counts the un-leaned warm edge (+1): past a leaned +0.9 "
+                       "isn't enough, past +1 is")
+OVERRULE_TOO_WARM = "a too-cold quorum doesn't overrule the block"
+OVERRULE_AT_BASE = ("the overrule wakes into cool at the base, offset 0, fan low: no boost, "
+                    "whatever the votes")
+OVERRULE_NOT_HELD = "a rest the block no longer holds wakes by its own rule and overrules nothing"
+OVERRULE_LIFTS_ALL = ("the overrule lifts the block for every unit: a person's off it didn't "
+                      "wake is unblocked, and wakes by its own rule")
+OVERRULE_FORCED_REST = ("the overrule wakes a forced rest: a too_cold vote under the block "
+                        "doesn't hold a room that has since warmed")
 
 
 SCENARIOS = [
@@ -326,10 +356,10 @@ SCENARIOS = [
         conditions({"would_block": True}, comfort=24.0, mean=20.0, max=18.99, was_blocked=True),
         conditions({"would_block": False}, comfort=24.0, mean=20.0, max=19.0, was_blocked=True),
         conditions({"would_block": False}, comfort=24.0, mean=20.0, max=18.5)]),
-    s("block active: the scene rests, a too-warm vote is ignored", [
+    s("block active: the scene rests; one warm sensor, short of the quorum, doesn't wake it", [
         conditions({"blocked": True}, comfort=24.0, mean=17.0, max=17.0, block_mode="active"),
         section({"state": "rest"}, OFF),
-        step("hot", {"state": "rest"}, None, at=m(20))]),
+        step("warm_one", {"state": "rest"}, None, at=m(20), overruled=False)]),
     s("block shadow: decided and kept, but control cools as if unblocked", [
         conditions({"would_block": True, "blocked": False}, comfort=24.0, mean=17.0,
                    max=17.0),
@@ -403,6 +433,86 @@ SCENARIOS = [
         step("settled_warm", {"state": "cool"}, None, at=m(31)),
         step("hot", {"state": "boost"}, cmd("cool", "medium", 20.0), at=m(41))],
       unit={"state": "rest", "since": -m(20)}, ctx={"blocked": True}),
+
+    # --- the room overrules the block (decision 143) ------------------------
+    # BLOCK: an active block from a cold forecast (delta_mean 7, so the warm
+    # edge leans to +1.7); "hot" is past +1 on two sensors but not past +1.7.
+    s(OVERRULE_WAKES, [
+        BLOCK,
+        section({"state": "rest", "unblocked": False}, OFF),
+        step("hot", {"state": "cool", "offset": 0, "base": 22.0, "unblocked": True,
+                     "since": m(20), "forced": False}, cmd("cool", "low", 22.0), at=m(20),
+             overruled=True, peers={"v": {"state": "cool", "unblocked": True}},
+             peer_commands={"v": cmd("cool", "low", 22.0)}),
+        step("hot", {"state": "cool", "unblocked": True}, None, at=m(30), overruled=False),
+        step("very_hot", {"state": "boost", "unblocked": True}, cmd("cool", "medium", 20.0),
+             at=m(40), overruled=False)],
+      peers={"v": {}}),
+    s(OVERRULE_REST_MIN, [
+        BLOCK,
+        section({"state": "rest"}, OFF),
+        step("hot", {"state": "rest", "unblocked": False}, None, at=m(10), overruled=False),
+        step("hot", {"state": "rest", "unblocked": False}, None, at=m(14, 50), overruled=False),
+        step("hot", {"state": "cool", "offset": 0, "since": m(15), "unblocked": True},
+             cmd("cool", "low", 22.0), at=m(15), overruled=True)]),
+    s(OVERRULE_EVERY_REST, [
+        step("hot", {"state": "rest"}, None, overruled=False,
+             peers={"v": {"state": "rest", "unblocked": False}}),
+        step("hot", {"state": "cool", "offset": 0, "unblocked": True}, cmd("cool", "low", 22.0),
+             at=m(10), overruled=True, peers={"v": {"state": "cool", "unblocked": True}},
+             peer_commands={"v": cmd("cool", "low", 22.0)})],
+      unit={"state": "rest", "since": -m(30)}, peers={"v": {"state": "rest", "since": -m(5)}},
+      ctx={"blocked": True}),
+    s(OVERRULE_NOT_HEAT, [
+        BLOCK,
+        section({"state": "rest"}, OFF),
+        step("very_hot", {"state": "rest", "unblocked": False}, None, at=m(30),
+             overruled=False)],
+      ctx={"heat_source_on": True}),
+    s(OVERRULE_PLAIN_EDGE, [
+        conditions({"blocked": True, "warm_edge": 0.9}, comfort=24.0, mean=25.0, max=25.0,
+                   margin=-1.0, block_mode="active"),
+        section({"state": "rest"}, OFF),
+        step("just_warm", {"state": "rest"}, None, at=m(20), overruled=False),
+        step("hot", {"state": "cool", "offset": 0, "unblocked": True},
+             cmd("cool", "low", 22.0), at=m(30), overruled=True)]),
+    s(OVERRULE_TOO_WARM, [
+        step("cold", {"state": "rest", "unblocked": False}, None, overruled=False)],
+      unit={"state": "rest", "since": -m(30)}, ctx={"blocked": True}),
+    s(OVERRULE_AT_BASE, [
+        step("very_hot", {"state": "cool", "offset": 0, "base": 23.0, "unblocked": True},
+             cmd("cool", "low", 23.0), overruled=True)],
+      unit={"state": "rest", "offset": -1, "base": 23.0, "since": -m(30)},
+      ctx={"blocked": True}),
+    s(OVERRULE_NOT_HELD, [
+        step("hot", {"state": "cool", "offset": 1}, cmd("cool", "low", 23.0), overruled=False)],
+      unit={"state": "rest", "unblocked": True, "since": -m(30)}, ctx={"blocked": True}),
+    s(OVERRULE_LIFTS_ALL, [
+        BLOCK,
+        step("hot", {"state": "cool", "unblocked": True}, cmd("cool", "low", 22.0),
+             overruled=True, peers={"v": {"state": "user_off", "unblocked": True}},
+             peer_commands={"v": None}),
+        step("very_hot", {"state": "boost"}, cmd("cool", "medium", 20.0), at=m(10),
+             peers={"v": {"state": "cool", "unblocked": True}},
+             peer_commands={"v": cmd("cool", "low", 22.0)})],
+      unit={"state": "rest", "since": -m(30)}, peers={"v": {"state": "user_off", "since": -m(60)}}),
+    s(OVERRULE_FORCED_REST, [
+        BLOCK,
+        section({"state": "rest"}, OFF),
+        press("too_cold", {"state": "rest", "forced": True, "base": 23.0, "since": 0}, None,
+              at=m(5)),
+        step("hot", {"state": "cool", "offset": 0, "base": 23.0, "forced": False,
+                     "unblocked": True}, cmd("cool", "low", 23.0), at=m(20), overruled=True)]),
+    s("a block a too_hot vote has lifted for every unit has nothing left to overrule", [
+        BLOCK,
+        section({"state": "rest"}, OFF),
+        press("too_hot", {"state": "boost", "forced": True, "unblocked": True},
+              cmd("cool", "medium", 19.0), at=m(5)),
+        step("hot", {"state": "boost"}, None, at=m(20), overruled=False)]),
+    s("shadow: control sees no block, so there is none to overrule", [
+        conditions({"would_block": True, "blocked": False}, comfort=24.0, mean=17.0, max=17.0),
+        section({"state": "cool"}, cmd("cool", "low", 22.0)),
+        step("hot", {"state": "cool", "unblocked": False}, None, at=m(20), overruled=False)]),
 
     # --- a person's grace ----------------------------------------------------
     s("grace holds cool against a cold vote, then lets it rest", [
@@ -926,17 +1036,26 @@ def conditions_differ(st: dict, cond: control.Conditions) -> str | None:
     return None if got == st["expect"] else f"conditions {got}, expected {st['expect']}"
 
 
+def plain_votes(st: dict, now: datetime = T0,
+                stale_minutes: int = control.DEFAULT_STALE_MINUTES) -> control.Votes:
+    """A heartbeat's votes against the un-leaned edges, whatever the
+    conditions lean: what the room overrules a block on."""
+    return _votes({**st, "edges": control.PLAIN_EDGES}, now, stale_minutes)
+
+
 def apply(st: dict, units: dict[str, control.Unit], now: datetime, ctx: control.Context
           ) -> tuple[dict[str, control.Unit], dict[str, control.Command | None] | None,
-                     control.PersonVote | None]:
+                     control.PersonVote | None, bool]:
     """One step on the room through app.control: the units after it, each
     unit's command (None for a person's on/off/manual, which sends
-    nothing), and the vote, if the step was one."""
+    nothing), the vote, if the step was one, and whether a heartbeat's room
+    overruled the block."""
     ctxs = _ctxs(ctx, units)
-    do, results, pv = st["do"], None, None
+    do, results, pv, overruled = st["do"], None, None, False
     if do == "step":
         v = _votes(st, now, ctx.sensor_stale_minutes)
-        results = {uid: control.step(u, v, now, ctxs[uid]) for uid, u in units.items()}
+        overruled, results = control.on_heartbeat(
+            units, v, plain_votes(st, now, ctx.sensor_stale_minutes), now, ctxs)
     elif do == "section_change":
         forced = st.get("forced_off", ctx.forced_off)
         v = _votes(st, now, ctx.sensor_stale_minutes)
@@ -944,7 +1063,7 @@ def apply(st: dict, units: dict[str, control.Unit], now: datetime, ctx: control.
                    for uid, u in units.items()}
     elif do == "person":
         new = control.on_person_change(st["kind"], units[MAIN], st.get("setpoint"), now, ctx)
-        return {**units, MAIN: new}, None, None
+        return {**units, MAIN: new}, None, None, False
     elif do == "press":
         results, pv = control.on_button(st["direction"], units, now, ctxs)
     elif do == "change":
@@ -953,7 +1072,7 @@ def apply(st: dict, units: dict[str, control.Unit], now: datetime, ctx: control.
     else:
         raise AssertionError(do)
     return ({uid: r[0] for uid, r in results.items()},
-            {uid: r[1] for uid, r in results.items()}, pv)
+            {uid: r[1] for uid, r in results.items()}, pv, overruled)
 
 
 def _command(command: control.Command | None) -> dict | None:
@@ -961,10 +1080,11 @@ def _command(command: control.Command | None) -> dict | None:
 
 
 def compare(expect: dict, units: dict[str, control.Unit], commands: dict | None,
-            pv: control.PersonVote | None, view=_view) -> str | None:
+            pv: control.PersonVote | None, view=_view, overruled: bool = False) -> str | None:
     """A step's expectations against the room after it: the unit's fields
-    and command, the peers', and the vote (accepted, or for a climate
-    change its direction and acceptance, or None for none)."""
+    and command, the peers', the vote (accepted, or for a climate change
+    its direction and acceptance, or None for none) and a heartbeat's
+    overrule."""
     checks = [("unit", MAIN, expect["unit"])] + [
         ("peer " + pid, pid, want) for pid, want in expect.get("peers", {}).items()]
     for what, uid, want in checks:
@@ -983,6 +1103,8 @@ def compare(expect: dict, units: dict[str, control.Unit], commands: dict | None,
         got = None if pv is None else {"direction": pv.direction, "accepted": pv.accepted}
         if got != expect["vote"]:
             return f"vote {got}, expected {expect['vote']}"
+    if "overruled" in expect and overruled != expect["overruled"]:
+        return f"overruled {overruled}, expected {expect['overruled']}"
     return None
 
 
@@ -1006,8 +1128,8 @@ def run(scenario: dict) -> list[str]:
                 if got != expect:
                     return [f"step {i}: votes {got}, expected {expect}"]
                 continue
-            units, commands, pv = apply(st, units, now, ctx)
-            why = compare(expect, units, commands, pv)
+            units, commands, pv, overruled = apply(st, units, now, ctx)
+            why = compare(expect, units, commands, pv, overruled=overruled)
             if why:
                 return [f"step {i}: {why}"]
     except Exception as e:                       # a broken rule may crash: that's a failure too
@@ -1027,6 +1149,9 @@ _COMFORT_POINT = control.comfort_point
 _SECTION_CONDITIONS = control.section_conditions
 _SECTION_START = control.section_start
 _GO = control._go
+_ON_HEARTBEAT = control.on_heartbeat
+_OVERRULED_STEP = control.overruled_step
+_RESTS_FOR_BLOCK = control.rests_for_block
 
 
 def _mutants() -> list[tuple[str, dict, list[str]]]:
@@ -1075,6 +1200,27 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
                                        grace_until=None, forced=False, section_rest=False), None
         return _SECTION_CHANGE(unit, ctx, forced_off, now, votes)
 
+    def overrules(min_time=True, every=True):
+        """control.overrules_block without its minimum time, or with any
+        resting unit's minimum time instead of every one's."""
+        def rule(units, plain, now, ctxs):
+            resting = [(u, ctxs[uid]) for uid, u in units.items()
+                       if c.rests_for_block(u, ctxs[uid])]
+            met = [c.min_time_met(u, now, x.config.rest_min_heartbeats, x.heartbeat_interval)
+                   for u, x in resting]
+            return (bool(resting) and c.room_overrules(plain, resting[0][1])
+                    and (not min_time or (all(met) if every else any(met))))
+        return rule
+
+    def overrule_wake(state="cool", offset=0, lift_all=True):
+        """control.overruled_step waking into another state or keeping the
+        offset (None), or lifting the block only for the units it wakes."""
+        def rule(unit, votes, now, ctx):
+            if c.rests_for_block(unit, ctx):
+                return c._go(c.lift_block(unit), state, now, ctx, offset=offset)
+            return c.step(c.lift_block(unit) if lift_all else unit, votes, now, ctx)
+        return rule
+
     kept = ["a person's off survives a section change: offset and base reset, since kept, "
             "nothing sent"]
     woke = ["a person's off lasts past the section change until the room is too warm: then cool "
@@ -1085,6 +1231,35 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
             "a person's off that a person unblocked wakes while cooling is blocked"]
 
     return [
+        ("the room overrules the block on a too-warm quorum",
+         {"overrules_block": lambda *a: False},
+         [OVERRULE_WAKES, OVERRULE_REST_MIN, OVERRULE_EVERY_REST, OVERRULE_PLAIN_EDGE,
+          OVERRULE_AT_BASE, OVERRULE_LIFTS_ALL, OVERRULE_FORCED_REST]),
+        ("the overrule waits out the rest minimum time", {"overrules_block": overrules(False)},
+         [OVERRULE_REST_MIN, OVERRULE_EVERY_REST]),
+        ("every unit resting for the block has its rest minimum first (any one's instead)",
+         {"overrules_block": overrules(every=False)}, [OVERRULE_EVERY_REST]),
+        ("a heat source's block isn't overruled",
+         {"room_overrules": lambda plain, ctx: ctx.blocked and plain.met
+          and plain.direction == c.TOO_WARM}, [OVERRULE_NOT_HEAT]),
+        ("only a too-warm quorum overrules (any quorum instead)",
+         {"room_overrules": lambda plain, ctx: ctx.blocked and not c.heat_blocks(ctx)
+          and plain.met}, [OVERRULE_TOO_WARM]),
+        ("the overrule counts the un-leaned edges (the section's leaned ones instead)",
+         {"on_heartbeat": lambda units, votes, plain, now, ctxs: _ON_HEARTBEAT(
+             units, votes, votes, now, ctxs)}, [OVERRULE_WAKES, OVERRULE_PLAIN_EDGE]),
+        ("the overrule lifts the block for every unit (only the units it wakes instead)",
+         {"overruled_step": overrule_wake(lift_all=False)}, [OVERRULE_LIFTS_ALL]),
+        ("the overrule wakes at the base, offset 0 (the offset kept instead)",
+         {"overruled_step": overrule_wake(offset=None)}, [OVERRULE_AT_BASE]),
+        ("the overrule wakes into cool, not boost", {"overruled_step": overrule_wake("boost")},
+         [OVERRULE_WAKES, OVERRULE_AT_BASE]),
+        ("a rest the block no longer holds isn't the overrule's to wake",
+         {"rests_for_block": lambda unit, ctx: unit.state == "rest" and c.room_blocked(ctx)
+          and not ctx.leak_on and c.target_base(unit, ctx) is not None}, [OVERRULE_NOT_HELD]),
+        ("a forced rest is the block's to wake too (left resting instead)",
+         {"rests_for_block": lambda unit, ctx: _RESTS_FOR_BLOCK(unit, ctx) and not unit.forced},
+         [OVERRULE_FORCED_REST]),
         ("a person's off survives a section change", {"keeps_user_off": lambda unit: False},
          kept + [woke[0],
                  "user_off_wakes_on_warm false: a person's off waits for a person, however warm "

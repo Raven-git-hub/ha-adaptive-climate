@@ -33,7 +33,11 @@ fallback. The room's heat source is a switch, on when the scenario says.
 A scenario's room may have more than one unit: every unit's helpers and
 commands must be control's. A vote's ac_person_vote event must say what
 control says - accepted exactly when control.in_episode found no forced
-state in the room - and anything else must fire none. After every command,
+state in the room - and anything else must fire none. A heartbeat fires
+ac_block_overruled exactly when control.on_heartbeat says the room
+overruled the block (decision 143), with control's un-leaned votes and the
+units it woke, and ac_user_off_wake once per unit control woke from a
+person's off. After every command,
 each unit's delayed echo of it is fed back to its manual-change automation,
 which must ignore it. Each change's kind is also checked against the
 runtime's reaction detector (UnitWindow).
@@ -543,7 +547,7 @@ def _event_says(pv: control.PersonVote | None) -> dict | None:
 class Replay:
     def __init__(self) -> None:
         self.steps = self.runs = self.echoes = self.kinds = self.ours = self.twice = 0
-        self.events = self.ignored = self.wakes = 0
+        self.events = self.ignored = self.wakes = self.overrules = 0
         self.last_vars: dict | None = None
         self.first_rendered: dict | None = None
 
@@ -620,7 +624,7 @@ class Replay:
         if do == "person":
             before, after = _person_event(st["kind"], ha, st.get("setpoint"))
             st = {**st, "before": dataclasses.asdict(before), "after": dataclasses.asdict(after)}
-        new, commands, pv = table.apply(st, units, now, ctx)
+        new, commands, pv, overruled = table.apply(st, units, now, ctx)
         commands = commands or {}
 
         if do == "step":
@@ -644,7 +648,9 @@ class Replay:
                     return new, f"{automation['id']}: {diff}"
             diff = self.compare(ha, g.build_maintenance_automation(config, room), None,
                                 overrides, units, new, commands, now,
-                                wakes=self.wakes_for(st, units, new, commands, now, ctx))
+                                wakes=self.wakes_for(st, units, new, commands, now, ctx),
+                                overrules=self.overrules_for(st, units, commands, now, ctx,
+                                                             overruled))
             return new, diff and f"maintenance: {diff}"
 
         if do == "section_change":
@@ -704,16 +710,33 @@ class Replay:
                  "required": v.required, "warm_side": v.warm_side, "warm_edge": warm_edge}
                 for uid in olds if olds[uid].state == "user_off" and news[uid].state == "cool"]
 
+    def overrules_for(self, st: dict, olds: dict, commands: dict, now: datetime,
+                      ctx: control.Context, overruled: bool) -> list[dict]:
+        """The ac_block_overruled events a heartbeat must fire: one if
+        control's room overruled the block, with its votes against the
+        un-leaned edges and each unit it woke from a rest the block held
+        (control.rests_for_block, before the heartbeat) with the setpoint it
+        now cools at, in the room's unit order."""
+        if not overruled:
+            return []
+        plain = table.plain_votes(st, now, ctx.sensor_stale_minutes)
+        return [{"room": ROOM, "section": SECTION, "tally": plain.tally,
+                 "required": plain.required, "warm_side": plain.warm_side,
+                 "warm_edge": control.PLAIN_EDGES[1],
+                 "woke": [{"unit": uid, "setpoint": commands[uid].temperature} for uid in olds
+                          if control.rests_for_block(olds[uid], self.ctxs[uid])]}]
+
     def compare(self, ha: HA, automation: dict, trigger, overrides: dict, olds: dict,
                 news: dict, commands: dict, now: datetime, echo: bool = True,
                 only: list[str] | None = None, pv: control.PersonVote | None = None,
-                wakes: list[dict] | None = None) -> str | None:
+                wakes: list[dict] | None = None,
+                overrules: list[dict] | None = None) -> str | None:
         """Run one automation - once per trigger, if given a list of the
         triggers that fired - and every unit's helpers and command must be
         control's, with nothing written or sent without a change, any
         ac_person_vote event control's vote, ac_user_off_wake events exactly
-        `wakes` (none unless given), and a run that goes on at most once per
-        change."""
+        `wakes` and ac_block_overruled events exactly `overrules` (none
+        unless given), and a run that goes on at most once per change."""
         befores = {uid: ha.climate_of(entity_of(uid)) for uid in olds}
         ha.calls, ha.events = [], []
         self.first_rendered = None
@@ -755,6 +778,10 @@ class Replay:
         if woke != (wakes or []):
             return f"wake events {woke}, control {wakes or []}"
         self.wakes += len(woke)
+        overruled = [data for kind, data in ha.events if kind == g.BLOCK_OVERRULED_EVENT]
+        if overruled != (overrules or []):
+            return f"overrule events {overruled}, control {overrules or []}"
+        self.overrules += len(overruled)
         if echo:
             for uid in uids:
                 if _sent(ha.calls, entity_of(uid)) is not None:
@@ -957,6 +984,46 @@ def _extra_cases() -> int:
            and order.index(g.state_id(ROOM, UNIT)) < order.index(ENTITY),
            "maintenance raises the guard, writes the helpers, sends, lowers the guard")
 
+    # The overrule (decision 143) reads the block from the conditions entity
+    # only while it is the section's, like everything else: otherwise it
+    # fails open, and with no block there is nothing to overrule.
+    resting = control.Unit(state="rest", since=table._time(-table.m(30)))
+    blocked = control.Conditions(SECTION, "active", cold_edge=-0.4, warm_edge=1.7,
+                                 would_block=True)
+    for what, state, want in (("published for the section", SECTION, True),
+                              ("unknown", "unknown", False), ("another section's", "night", False)):
+        ha, config, room = world(resting)
+        publish(ha, blocked, state=state)
+        ha.run(g.build_maintenance_automation(config, room))
+        events = [d for kind, d in ha.events if kind == g.BLOCK_OVERRULED_EVENT]
+        offset = int(float(ha.states(g.offset_id(ROOM, UNIT))))
+        expect((len(events) == 1) == want and ha.states(g.state_id(ROOM, UNIT)) == "cool"
+               and offset == (0 if want else 1),
+               f"the overrule, the conditions entity {what}: "
+               + ("overruled: cool at the base" if want else
+                  "nothing to overrule (fail open): the rest releases by its own rule, at +1")
+               + f" ({events})")
+    ha, config, room = world(resting)
+    publish(ha, blocked)
+    order = []
+    traced = ha.call
+
+    def traced_overrule(service, entity_id, data):
+        order.append(service)
+        traced(service, entity_id, data)
+
+    class Events(list):
+        def append(self, item):
+            order.append(item[0])
+            super().append(item)
+    ha.call, ha.events = traced_overrule, Events()
+    ha.run(g.build_maintenance_automation(config, room))
+    expect(g.BLOCK_OVERRULED_EVENT in order
+           and order.index(g.BLOCK_OVERRULED_EVENT) > max(
+               i for i, sv in enumerate(order) if sv.startswith("climate."))
+           and order[-1] == "input_boolean.turn_off",
+           "an overrule's event fires once the commands are sent, before the guard comes down")
+
     # A virtual sensor reads its unit's attribute, so it goes stale with its unit.
     vctx = table._ctx({})
     vconfig, vroom = _config(vctx, ["s1"], False)
@@ -1048,15 +1115,15 @@ def _extra_cases() -> int:
     one_place = []
     for name, a in automations.items():
         want = g._conditions_variables(config, room, sections_of[name],
-                                       edges=name in counting)
+                                       edges=name in counting, heat=name == "maintenance")
         text = repr(a)
         one_place.append({k: a["variables"].get(k) for k in want} == want
                          and text.count(g.conditions_id(ROOM)) == 1
                          and text.count(HEATER) == 1)
     expect(all(one_place) and "cold_edge" not in automations["vote"]["variables"],
            "blocked and the edges come from one place (_conditions_variables), in every "
-           "automation that reads them; the conditions entity and the heat source are read "
-           "nowhere else")
+           "automation that reads them, and maintenance's heat_on (for the overrule) with "
+           "them; the conditions entity and the heat source are read nowhere else")
     votes_expr = g._votes_variables(config, room, g.SENSORS_LIVE)["votes"]
     expect(all(automations[n]["variables"].get("votes") == votes_expr for n in counting)
            and all("votes" not in automations[n]["variables"]
@@ -1188,7 +1255,8 @@ def main() -> int:
           f"{replay.twice} firing two triggers, run once; {replay.events} vote events, "
           f"{replay.ignored} of them ignored, each accepted exactly when control.in_episode "
           f"found no forced state; {replay.wakes} wake events, each exactly a user_off "
-          f"control woke)")
+          f"control woke; {replay.overrules} overrule events, each exactly a heartbeat whose "
+          f"room overruled the block in control)")
     fuzz = _fuzz_votes(40)
     print("other cases:")
     extra = _extra_cases()

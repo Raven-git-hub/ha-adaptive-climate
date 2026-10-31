@@ -78,6 +78,11 @@ CREATE TABLE section_run (
     -- {unit_id: {"state": cool|rest|user_off|leak|config_off|none, "why": ...}}; NULL before
     -- migration 4 (the margin replay then falls back, decision 141)
     unit_starts     TEXT,
+    -- when the room overruled the run's block (decision 143): a too-warm quorum against the
+    -- un-leaned edges under an active block, or one a shadow block would have met ("would have
+    -- been overruled"); NULL if not. Teaches the margin; the run then counts as not blocked for
+    -- the next run's hysteresis. NULL before migration 5
+    overruled_at    TEXT,
     UNIQUE (room_id, local_date, section)
 );
 CREATE INDEX idx_section_run_lookup ON section_run(room_id, local_date);

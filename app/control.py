@@ -9,6 +9,11 @@ rule is a small named function, written the way a template can say it.
 
   evaluate_votes      positions in band widths, the pooled quorum and its
                       direction (app.trust), and the release counts
+  on_heartbeat        one maintenance heartbeat for the room: the room may
+                      overrule the section's block (overrules_block, a
+                      too-warm quorum against the un-leaned edges), waking
+                      the units resting for it and unblocking every unit;
+                      then each unit takes its step
   step                one maintenance heartbeat for one unit; a person's off
                       wakes on a too-warm quorum (user_off_wakes)
   on_section_change   what the scene does to a unit at a crossover: a
@@ -76,6 +81,9 @@ DEFAULT_BLOCK_MODE = "shadow"
 LEAN_CAP = 0.6          # each edge stays this far on its own side of comfort
 BLOCK_RELEASE = 1.0     # a block lifts only once delta_max <= margin - this
 MARGIN_MIN, MARGIN_MAX = -3.0, 10.0     # -1: block at a max up to comfort + 1; -3 at most
+# The room overrules a block on its votes against the un-leaned edges: the
+# block already accounts for the forecast, so the lean isn't counted twice.
+PLAIN_EDGES = (-1.0, 1.0)
 
 
 # ---------------------------------------------------------------------
@@ -285,6 +293,41 @@ def user_off_wakes(unit: Unit, votes: Votes, now: datetime, ctx: Context) -> boo
     return (cfg.user_off_wakes_on_warm and votes.met and votes.direction == TOO_WARM
             and not effective_blocked(unit, ctx)
             and min_time_met(unit, now, cfg.rest_min_heartbeats, ctx.heartbeat_interval))
+
+
+def rests_for_block(unit: Unit, ctx: Context) -> bool:
+    """A unit the cooling block holds resting: in rest, with cooling blocked
+    for it, seeded and with no leak latch. These are the units an overrule
+    wakes (a forced rest included: a block is what keeps it from releasing)."""
+    return (unit.state == "rest" and effective_blocked(unit, ctx) and not ctx.leak_on
+            and target_base(unit, ctx) is not None)
+
+
+def room_overrules(plain: Votes, ctx: Context) -> bool:
+    """The room's side of an overrule: the section's own block (ctx.blocked,
+    active mode; a heat source's block keeps ignoring the sensors, the
+    heater being why the room is warm) and a too-warm quorum among the
+    room's votes against the un-leaned edges (PLAIN_EDGES)."""
+    return ctx.blocked and not heat_blocks(ctx) and plain.met and plain.direction == TOO_WARM
+
+
+def overrules_block(units: dict[str, Unit], plain: Votes, now: datetime,
+                    ctxs: dict[str, Context]) -> bool:
+    """The room overrules the section's cooling block at this heartbeat
+    (decision 143): room_overrules, at least one unit resting for the block,
+    and every unit resting for it past its rest minimum time, so they all
+    wake together. A block already lifted for every unit (a too_hot vote, a
+    person's on, an earlier overrule) has nothing left to overrule."""
+    resting = [(u, ctxs[uid]) for uid, u in units.items() if rests_for_block(u, ctxs[uid])]
+    return (bool(resting) and room_overrules(plain, resting[0][1])
+            and all(min_time_met(u, now, c.config.rest_min_heartbeats, c.heartbeat_interval)
+                    for u, c in resting))
+
+
+def lift_block(unit: Unit) -> Unit:
+    """The overrule lifts the block for the unit for the rest of the
+    section: ac_unblocked, as a too_hot vote or a person's on sets it."""
+    return replace(unit, unblocked=True)
 
 
 def capped_offset(offset: int, cap: int) -> int:
@@ -638,6 +681,31 @@ def step(unit: Unit, votes: Votes, now: datetime, ctx: Context) -> tuple[Unit, C
         return _stay(unit, ctx)
 
     return _stay(unit, ctx)
+
+
+def overruled_step(unit: Unit, votes: Votes, now: datetime,
+                   ctx: Context) -> tuple[Unit, Command | None]:
+    """One unit at the heartbeat the room overrules the block: unblocked
+    (lift_block); a unit resting for the block wakes into cool at its base,
+    offset 0, fan low (no boost, whatever the votes); any other unit takes
+    its heartbeat unblocked."""
+    lifted = lift_block(unit)
+    if rests_for_block(unit, ctx):
+        return _go(lifted, "cool", now, ctx, offset=0)
+    return step(lifted, votes, now, ctx)
+
+
+def on_heartbeat(units: dict[str, Unit], votes: Votes, plain: Votes, now: datetime,
+                 ctxs: dict[str, Context]
+                 ) -> tuple[bool, dict[str, tuple[Unit, Command | None]]]:
+    """The maintenance automation at one heartbeat: (overruled, {unit_id:
+    (unit, command)}). votes: the room's votes against the section's leaned
+    edges; plain: the same readings against the un-leaned ones. If the room
+    overrules the block (overrules_block), every unit takes overruled_step;
+    otherwise each takes step."""
+    if overrules_block(units, plain, now, ctxs):
+        return True, {uid: overruled_step(u, votes, now, ctxs[uid]) for uid, u in units.items()}
+    return False, {uid: step(u, votes, now, ctxs[uid]) for uid, u in units.items()}
 
 
 START_BLOCKED, START_HEAT_SOURCE, START_COLD = "blocked", "heat_source", "cold"

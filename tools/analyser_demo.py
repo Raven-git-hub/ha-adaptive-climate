@@ -34,6 +34,8 @@ docs/V2_DESIGN.md and docs/TRUST_MODEL.md:
     either way (a too_hot vote in a blocked section takes it from -1 to
     0.75, a too_cold vote just after cooling started in an unblocked one
     back to -0.625), stopping at -3 and at 10
+  * the room overruling a blocked run (decision 143) teaches the margin as a
+    too_hot vote there does, from the run's overruled_at, rebuilt from CSV
   * no seed, no almanac entry
   * tools/compare_analyser.py shows v1 against v2 on the same data
 
@@ -41,6 +43,7 @@ Runs without Docker or Home Assistant:  PYTHONPATH=. python tools/analyser_demo.
 """
 from __future__ import annotations
 
+import csv
 import dataclasses
 import json
 import sys
@@ -638,6 +641,68 @@ def check_margin() -> None:
     ok("but a section rest that maintenance woke (its first heartbeat at 08:03 shows cool), "
        "then a too_cold vote at 08:18: the wake is dated from the run's start, the earliest it "
        "can have been, and the margin learns: -1 -> -1.5")
+
+    # Decision 143: the room overruling a run's block teaches the margin as a
+    # too_hot vote in a blocked run does, read from the run's overruled_at.
+    def overruled(at: datetime | None, blocked: bool = True, vote: datetime | None = None
+                  ) -> tuple[float, list]:
+        sc = Scenario()
+        decided(sc, t(6, 20, 30), "night", 24.0, 22.0, blocked)
+        if at is not None:
+            assert sc.store.record_section_overruled("lounge", "2026-08-06", "night",
+                                                     at.isoformat(timespec="seconds"))
+        if vote is not None:
+            sc.vote(vote, "too_hot", section="night")
+        return margin(sc, t(6, 23))
+
+    m, steps = overruled(t(6, 21, 10))
+    assert m == 0.75 and [(st.kind, st.at, st.before, st.target, st.after) for st in steps] == \
+        [("overruled", t(6, 21, 10).astimezone(timezone.utc), -1.0, 2.5, 0.75)], steps
+    ok("the room overruling a Night blocked at delta max 2 (at 21:10) moves the margin as a "
+       "too_hot vote there would: halfway to 2.5, -1 -> 0.75")
+    assert overruled(None) == (-1.0, [])
+    ok("the same Night with no overrule recorded teaches nothing")
+    m, steps = overruled(t(6, 21, 10), vote=t(6, 21, 40))
+    assert [(st.kind, st.after) for st in steps] == [("overruled", 0.75), ("too_hot", 1.625)], \
+        steps
+    ok("an overrule then a too_hot vote in the same blocked Night each teach, in time order: "
+       "-1 -> 0.75 -> 1.625")
+    sc = Scenario()
+    decided(sc, t(6, 20, 30), "night", 24.0, 22.0, True)
+    assert sc.store.record_section_overruled("lounge", "2026-08-06", "night",
+                                             t(6, 21, 10).isoformat(timespec="seconds"))
+    assert not sc.store.record_section_overruled("lounge", "2026-08-06", "night",
+                                                 t(6, 22).isoformat(timespec="seconds"))
+    assert margin(sc, t(6, 21, 9)) == (-1.0, []) and margin(sc, t(6, 23))[0] == 0.75
+    ok("a run's first overrule stands (a second records nothing), and the replay as of before "
+       "it hasn't learned it yet")
+    rows = list(csv.DictReader((sc.dir / "csv" / "lounge" / "2026-08-06_section_run.csv").open()))
+    assert [r["overruled_at"] for r in rows][-1] == t(6, 21, 10).isoformat(timespec="seconds") \
+        and all(v == "" for k, v in rows[-1].items() if k not in ("section", "overruled_at"))
+    rebuilt = Scenario()
+    for r in rows:      # replay the run from its CSV rows, as re-ingest would merge them
+        decided_row = {k: (v or None) for k, v in r.items()}
+        rebuilt.store.record_section_run(
+            "lounge", "2026-08-06", r["section"], planned_start=decided_row["planned_start"],
+            actual_start=decided_row["actual_start"])
+        if decided_row["block_mode"]:
+            rebuilt.store.record_section_conditions(
+                "lounge", "2026-08-06", r["section"], float(r["comfort_point"]), float(r["lean"]),
+                r["blocked"] == "1", r["block_mode"])
+        if decided_row["outdoor_max"]:
+            rebuilt.store.record_section_outdoor("lounge", "2026-08-06", r["section"],
+                                                 float(r["outdoor_mean"]), float(r["outdoor_max"]))
+        if decided_row["overruled_at"]:
+            rebuilt.store.record_section_overruled("lounge", "2026-08-06", r["section"],
+                                                   r["overruled_at"])
+    assert learn_margin(rebuilt.store._conn, ROOM, MarginConfig(initial=-1.0), t(6, 23)) == \
+        margin(sc, t(6, 23))
+    ok("the overrule's own CSV row carries only overruled_at, and the run's rows rebuild the "
+       "same margin from CSV alone")
+    m, steps = overruled(t(6, 21, 10), blocked=False)
+    assert (m, steps) == (-1.0, []), steps
+    ok("an overruled_at on a run not decided blocked teaches nothing (only a blocked run's "
+       "block can be overruled)")
 
 
 def check_missing_seed() -> None:

@@ -251,7 +251,7 @@ def check_fresh_store() -> None:
     store.record_section_conditions("baby_room", rd, "sunset", 23.9, 0.69, True, "shadow")
     assert store.section_run_conditions("baby_room", rd, "sunset") == {
         "outdoor_mean": 24.1, "outdoor_max": 25.3, "comfort_point": 23.9, "lean": 0.69,
-        "blocked": 1, "block_mode": "shadow"}
+        "blocked": 1, "block_mode": "shadow", "overruled_at": None}
     assert store.section_run_conditions("baby_room", rd, "night") is None
     assert csv_rows("section_run")[-1] == {
         **{k: "" for k in SECTION_RUN_CSV}, "section": "sunset", "comfort_point": "23.9",
@@ -267,6 +267,26 @@ def check_fresh_store() -> None:
     print("conditions: a section run's comfort point, lean, block decision and block_mode "
           "round-trip through a CSV row of their own and SQLite; the run before's decision is "
           "found by start time - OK")
+
+    # decision 143: a run whose block the room overruled counts as not blocked
+    # for the next run's hysteresis; the first overrule of a run stands, in a
+    # CSV row carrying only overruled_at
+    store.record_section_conditions("baby_room", rd, "sunset", 23.9, 0.69, True, "active")
+    assert store.previous_blocked("baby_room", rd, "night", night) is True
+    assert store.record_section_overruled("baby_room", rd, "sunset", f"{rd}T17:10:00+08:00")
+    assert not store.record_section_overruled("baby_room", rd, "sunset", f"{rd}T17:40:00+08:00")
+    assert not store.record_section_overruled("baby_room", rd, "afternoon",
+                                              f"{rd}T17:40:00+08:00")   # no such run
+    assert store.section_run_conditions("baby_room", rd, "sunset")["overruled_at"] == \
+        f"{rd}T17:10:00+08:00"
+    assert store.section_run_conditions("baby_room", rd, "sunset")["blocked"] == 1
+    assert store.previous_blocked("baby_room", rd, "night", night) is False
+    assert csv_rows("section_run")[-1] == {
+        **{k: "" for k in SECTION_RUN_CSV}, "section": "sunset",
+        "overruled_at": f"{rd}T17:10:00+08:00"}, csv_rows("section_run")[-1]
+    print("overrule: a run's first overrule is recorded (a later one, or one for a run that "
+          "doesn't exist, isn't), in a CSV row of its own; the run keeps its decision, but the "
+          "next run's hysteresis reads it as not blocked - OK")
 
     # --- every reaction kind round-trips through CSV and SQLite ---
     kinds = {  # minute -> (room kind, setpoint before/after, changed, power before/after)
@@ -456,10 +476,10 @@ def check_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store_mod.MIGRATIONS) == 4
+    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store_mod.MIGRATIONS) == 5
     assert _backups(db) == [store.backup_path], (_backups(db), store.backup_path)
     assert _dump(store.backup_path) == v1_dump, "backup is not a copy of the v1 database"
-    print(f"migration: v1 database backed up to {store.backup_path.name}, now at version 4 - OK")
+    print(f"migration: v1 database backed up to {store.backup_path.name}, now at version 5 - OK")
 
     def n(table: str) -> int:
         return c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -487,7 +507,7 @@ def check_migration() -> None:
     assert sorted(cats) == ["connection", "crossover", "reactive", "storage"], cats
     storage = store.recent_events(category="storage")[0]
     assert str(store.backup_path) in storage["message"], storage
-    assert storage["detail"] == {"from": 0, "to": 4, "backup": str(store.backup_path)}
+    assert storage["detail"] == {"from": 0, "to": 5, "backup": str(store.backup_path)}
     assert store.current_almanac("main_room", as_of=date(2026, 8, 1)) == \
         {"room_id": "main_room", "sections": {}}
     assert c.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -558,7 +578,7 @@ def check_failed_migration() -> None:
 
 def check_phase0_database() -> None:
     """A database left at storage version 1 (v2 phase 0, before the section
-    run fix) gets migrations 2 to 4, behind its own backup."""
+    run fix) gets migrations 2 to 5, behind its own backup."""
     real = store_mod.MIGRATIONS
     tmp = Path(tempfile.mkdtemp())
     db = build_v1_db(tmp)
@@ -575,12 +595,12 @@ def check_phase0_database() -> None:
     assert still_open == 6, still_open
 
     store = Store(tmp, SCHEMA)
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
     assert _backups(db, "phase0") == [store.backup_path], store.backup_path
     assert _dump(store.backup_path) == phase0
     assert _runs(store._conn) == EXPECTED_RUNS, _runs(store._conn)
     details = [e["detail"] for e in store.recent_events(category="storage")]
-    assert {"from": 1, "to": 4, "backup": str(store.backup_path)} in details, details
+    assert {"from": 1, "to": 5, "backup": str(store.backup_path)} in details, details
     store.close()
     print(f"phase 0 database: backed up to {store.backup_path.name}, migration 2 closes its "
           f"open runs - OK")
@@ -622,7 +642,7 @@ def check_votes_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 5
     assert _backups(db, "pre-votes") == [store.backup_path], store.backup_path
     assert _dump(store.backup_path) == v2
     assert [tuple(r) for r in c.execute(
@@ -645,7 +665,7 @@ def check_votes_migration() -> None:
 
 def check_starts_migration() -> None:
     """A database at storage version 3, whose section runs have no
-    unit_starts, gets migration 4 alone: every run kept (unit_starts NULL),
+    unit_starts, gets migrations 4 and 5: every run kept (unit_starts NULL),
     the column added, and the shape a fresh database's. A run recorded
     after it carries each unit's start state, in SQLite and as the CSV's
     last column; a catch-up upsert without one keeps it."""
@@ -653,7 +673,7 @@ def check_starts_migration() -> None:
     old_schema = tmp / "storage.v3.schema.sql"
     text = SCHEMA.read_text()
     start = text.index("    -- what the section change started each unit in")
-    end = text.index("    unit_starts     TEXT,\n") + len("    unit_starts     TEXT,\n")
+    end = text.index("    overruled_at    TEXT,\n") + len("    overruled_at    TEXT,\n")
     old_schema.write_text(text[:start] + text[end:])
     real = store_mod.MIGRATIONS
     store_mod.MIGRATIONS = real[:3]
@@ -676,7 +696,7 @@ def check_starts_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 5
     assert _backups(db, "pre-starts") == [store.backup_path], store.backup_path
     assert _dump(store.backup_path) == v3
     assert [tuple(r) for r in c.execute(
@@ -690,7 +710,8 @@ def check_starts_migration() -> None:
     assert json.loads(c.execute("SELECT unit_starts FROM section_run WHERE section='afternoon'")
                       .fetchone()[0]) == starts
     rows = list(csvmod.DictReader((tmp / "csv" / "main_room" / f"{rd}_section_run.csv").open()))
-    assert list(rows[0]) == SECTION_RUN_CSV and SECTION_RUN_CSV[-1] == "unit_starts"
+    assert list(rows[0]) == SECTION_RUN_CSV and SECTION_RUN_CSV[-2:] == ["unit_starts",
+                                                                       "overruled_at"]
     assert json.loads(rows[0]["unit_starts"]) == starts and rows[1]["unit_starts"] == "", rows
     assert c.execute("PRAGMA foreign_key_check").fetchall() == []
     store.close()
@@ -700,8 +721,67 @@ def check_starts_migration() -> None:
         "the database migrated from version 3 differs from a fresh one"
     print(f"migration 4: a version 3 database backed up to {store.backup_path.name}, its "
           "section run kept with unit_starts NULL; a run recorded after it keeps each unit's "
-          "start state in SQLite and as the CSV's last column (a catch-up upsert without one "
-          "keeps it), and the database matches a fresh one - OK")
+          "start state in SQLite and in the CSV, the column migration 4 appended (a catch-up "
+          "upsert without one keeps it), migration 5 following, and the database matches a "
+          "fresh one - OK")
+
+
+def check_overrule_migration() -> None:
+    """A database at storage version 4, whose section runs have no
+    overruled_at, gets migration 5 alone: every run kept (overruled_at
+    NULL), the column added, and the shape a fresh database's. An overrule
+    recorded after it lands in SQLite and as the CSV's last column."""
+    tmp = Path(tempfile.mkdtemp())
+    old_schema = tmp / "storage.v4.schema.sql"
+    text = SCHEMA.read_text()
+    start = text.index("    -- when the room overruled the run's block")
+    end = text.index("    overruled_at    TEXT,\n") + len("    overruled_at    TEXT,\n")
+    old_schema.write_text(text[:start] + text[end:])
+    real = store_mod.MIGRATIONS
+    store_mod.MIGRATIONS = real[:4]
+    try:
+        old = Store(tmp, old_schema)            # a fresh database at storage version 4
+    finally:
+        store_mod.MIGRATIONS = real
+    rd = "2026-08-01"
+    starts = json.dumps({"baby_room_ac": {"state": "rest", "why": "blocked"}})
+    old._conn.execute(
+        "INSERT INTO section_run(room_id,local_date,section,planned_start,actual_start,"
+        "comfort_point,outdoor_max,blocked,block_mode,unit_starts) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("baby_room", rd, "sleep", f"{rd}T22:00:00+08:00", f"{rd}T22:00:02+08:00",
+         24.0, 21.5, 1, "active", starts))
+    old._conn.commit()
+    assert "overruled_at" not in [r[1] for r in
+                                  old._conn.execute("PRAGMA table_info(section_run)")]
+    old.close()
+    db = tmp / "db" / "adaptive_climate.db"
+    v4 = _dump(db)
+    assert v4[0] == 4
+
+    store = Store(tmp, SCHEMA)
+    c = store._conn
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert _backups(db, "pre-overrule") == [store.backup_path], store.backup_path
+    assert _dump(store.backup_path) == v4
+    assert [tuple(r) for r in c.execute(
+        "SELECT section, planned_start, blocked, block_mode, unit_starts, overruled_at "
+        "FROM section_run")] == [("sleep", f"{rd}T22:00:00+08:00", 1, "active", starts, None)]
+    assert store.record_section_overruled("baby_room", rd, "sleep", f"{rd}T23:40:00+08:00")
+    assert c.execute("SELECT overruled_at FROM section_run").fetchone()[0] == \
+        f"{rd}T23:40:00+08:00"
+    rows = list(csvmod.DictReader((tmp / "csv" / "baby_room" / f"{rd}_section_run.csv").open()))
+    assert list(rows[0]) == SECTION_RUN_CSV and SECTION_RUN_CSV[-1] == "overruled_at"
+    assert rows[-1]["overruled_at"] == f"{rd}T23:40:00+08:00", rows
+    assert c.execute("PRAGMA foreign_key_check").fetchall() == []
+    store.close()
+    fresh = Path(tempfile.mkdtemp())
+    Store(fresh, SCHEMA).close()
+    assert _shape(db) == _shape(fresh / "db" / "adaptive_climate.db"), \
+        "the database migrated from version 4 differs from a fresh one"
+    print(f"migration 5: a version 4 database backed up to {store.backup_path.name}, its "
+          "section run kept with overruled_at NULL (unit_starts and the decision as they were); "
+          "an overrule recorded after it lands in SQLite and as the CSV's last column, and the "
+          "database matches a fresh one - OK")
 
 
 def check_newer_database_refused() -> None:
@@ -726,6 +806,7 @@ def main() -> int:
     check_phase0_database()
     check_votes_migration()
     check_starts_migration()
+    check_overrule_migration()
     check_newer_database_refused()
     print("\nALL STORE CHECKS PASSED")
     return 0
