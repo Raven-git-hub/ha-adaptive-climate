@@ -62,7 +62,8 @@ REACTIVE_CSV = ["ts", "ts_utc", "section", "window_seconds", "occupied",
 # earlier value, matching record_section_run's upsert.
 SECTION_RUN_CSV = ["section", "planned_start", "actual_start", "ended_at",
                    "outcome", "outcome_reason", "outdoor_mean", "outdoor_max",
-                   "comfort_point", "lean", "blocked", "block_mode"]
+                   "comfort_point", "lean", "blocked", "block_mode",
+                   "unit_starts"]                                   # migration 4, JSON
 
 
 @dataclass(frozen=True)
@@ -239,6 +240,16 @@ def _migration_3(conn: sqlite3.Connection, schema: _Schema) -> None:
         _rebuild_table(conn, schema, name)
 
 
+def _migration_4(conn: sqlite3.Connection, schema: _Schema) -> None:
+    """Each unit's start state on its section run (decision 141).
+
+    section_run is rebuilt with its rows and a new nullable unit_starts
+    column: what the section change started each unit in, and why, which the
+    margin replay reads instead of assuming the scene started the unit
+    cooling. Older runs keep NULL, and the replay falls back for them."""
+    _rebuild_table(conn, schema, "section_run")
+
+
 # (label for the pre-migration backup file, migration). Migration n takes
 # storage version n-1 to n; the label names the shape it upgrades from.
 # Append only.
@@ -246,6 +257,7 @@ MIGRATIONS: list[tuple[str, Callable[[sqlite3.Connection, _Schema], None]]] = [
     ("v1", _migration_1),
     ("phase0", _migration_2),
     ("pre-votes", _migration_3),
+    ("pre-starts", _migration_4),
 ]
 
 def _now_pair() -> tuple[str, str]:
@@ -467,18 +479,23 @@ class Store:
                            comfort_point: float | None = None,
                            lean: float | None = None,
                            blocked: bool | None = None,
-                           block_mode: str | None = None) -> None:
-        """Upsert one room/date/section run. Called at crossover."""
+                           block_mode: str | None = None,
+                           unit_starts: dict | None = None) -> None:
+        """Upsert one room/date/section run. Called at crossover, with
+        unit_starts ({unit_id: {state, why}}, control.unit_start) when the
+        scene fired; a catch-up that didn't re-fire keeps the run's own."""
+        starts = None if unit_starts is None else json.dumps(unit_starts, sort_keys=True)
         self._append_csv(
             room_id, local_date, "section_run", SECTION_RUN_CSV,
             [section, planned_start, actual_start, ended_at, outcome, outcome_reason,
              outdoor_mean, outdoor_max, comfort_point, lean, _int_or_none(blocked),
-             block_mode])
+             block_mode, starts])
         with self._lock:
             self._conn.execute(
                 "INSERT INTO section_run(room_id,local_date,section,planned_start,"
                 "actual_start,ended_at,outcome,outcome_reason,outdoor_mean,outdoor_max,"
-                "comfort_point,lean,blocked,block_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "comfort_point,lean,blocked,block_mode,unit_starts) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(room_id,local_date,section) DO UPDATE SET "
                 "planned_start=COALESCE(excluded.planned_start,section_run.planned_start),"
                 "actual_start=COALESCE(excluded.actual_start,section_run.actual_start),"
@@ -490,10 +507,11 @@ class Store:
                 "comfort_point=COALESCE(excluded.comfort_point,section_run.comfort_point),"
                 "lean=COALESCE(excluded.lean,section_run.lean),"
                 "blocked=COALESCE(excluded.blocked,section_run.blocked),"
-                "block_mode=COALESCE(excluded.block_mode,section_run.block_mode)",
+                "block_mode=COALESCE(excluded.block_mode,section_run.block_mode),"
+                "unit_starts=COALESCE(excluded.unit_starts,section_run.unit_starts)",
                 (room_id, local_date, section, planned_start, actual_start,
                  ended_at, outcome, outcome_reason, outdoor_mean, outdoor_max,
-                 comfort_point, lean, _int_or_none(blocked), block_mode))
+                 comfort_point, lean, _int_or_none(blocked), block_mode, starts))
             self._conn.commit()
 
     def close_section_run(self, room_id: str, ended_at: str,
@@ -518,7 +536,7 @@ class Store:
         # The close row goes in the run's own day file, so re-ingest merges it
         # into the run it ends.
         self._append_csv(room_id, run["local_date"], "section_run", SECTION_RUN_CSV,
-                         [run["section"], None, None, ended_at] + [None] * 8)
+                         [run["section"], None, None, ended_at] + [None] * 9)
         with self._lock:
             self._conn.execute("UPDATE section_run SET ended_at=? WHERE id=?",
                                (ended_at, run["id"]))
@@ -533,7 +551,7 @@ class Store:
         the blanks into the run's start row), and the SQLite row is updated
         in place."""
         self._append_csv(room_id, local_date, "section_run", SECTION_RUN_CSV,
-                         [section] + [None] * 5 + [outdoor_mean, outdoor_max] + [None] * 4)
+                         [section] + [None] * 5 + [outdoor_mean, outdoor_max] + [None] * 5)
         with self._lock:
             self._conn.execute(
                 "UPDATE section_run SET outdoor_mean=?, outdoor_max=? "
@@ -550,7 +568,7 @@ class Store:
         force. Its CSV row carries only those four, as the outdoor row does."""
         self._append_csv(room_id, local_date, "section_run", SECTION_RUN_CSV,
                          [section] + [None] * 7 + [comfort_point, lean, _int_or_none(blocked),
-                                                   block_mode])
+                                                   block_mode, None])
         with self._lock:
             self._conn.execute(
                 "UPDATE section_run SET comfort_point=?, lean=?, blocked=?, block_mode=? "

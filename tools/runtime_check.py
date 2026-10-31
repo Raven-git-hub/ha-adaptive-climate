@@ -1317,6 +1317,11 @@ async def check_conditions() -> None:
         return [e["message"] for e in reversed(store.recent_events(
             limit=1000, room_id="main_room", category="block"))]
 
+    def unit_starts(day: str, section: str) -> dict | None:
+        row = c.execute("SELECT unit_starts FROM section_run WHERE room_id = 'main_room' "
+                        "AND local_date = ? AND section = ?", (day, section)).fetchone()
+        return None if row[0] is None else json.loads(row[0])
+
     def crossovers() -> list[dict]:
         return list(reversed(store.recent_events(limit=1000, room_id="main_room",
                                                  category="crossover")))
@@ -1460,6 +1465,13 @@ async def check_conditions() -> None:
         "start": "rest", "why": "cold", "cold_side": 3, "needed": 2, "delta_mean": 6.08}, \
         sleep_start["detail"]
     assert order(rest, "sleep") == ["conditions", "scene"], order(rest, "sleep")
+    assert unit_starts("2026-08-03", "sleep") == {"main_room_ac": {"state": "rest", "why": "cold"}}
+    assert unit_starts("2026-08-03", "sunset") == {
+        "main_room_ac": {"state": "cool", "why": "not_cooler_outside"}}
+    assert sleep_start["detail"]["units"] == unit_starts("2026-08-03", "sleep")
+    print("section start: the section run records what the scene started each unit in, and "
+          "why - Sunset cool (not cooler outside), Sleep rest (cold) - in SQLite and the "
+          "crossover's detail - OK")
     assert run("2026-08-03", "sleep")[1:] == (18.0, 23.9, 0.608, 1, "shadow"), run("2026-08-03", "sleep")
     assert block_events()[-1].startswith(
         "Main Room: would block Sleep: forecast max 18.0, comfort 23.9, margin 6.7, held from the "
@@ -1590,6 +1602,8 @@ async def check_conditions() -> None:
     assert x["message"].startswith("Main Room -> afternoon: starts in ") and \
         x["message"].endswith(kept + ", or the room is too warm"), x["message"]
     assert x["detail"]["user_off"] == ["main_room_ac"], x["detail"]
+    assert unit_starts("2026-08-05", "afternoon") == {
+        "main_room_ac": {"state": "user_off", "why": "user_off"}}
     config["system"]["control"]["user_off_wakes_on_warm"] = False
     await cross(rt, "sunset", 5, 16)
     assert crossovers()[-1]["message"].endswith(kept), crossovers()[-1]["message"]
@@ -1600,6 +1614,7 @@ async def check_conditions() -> None:
     await cross(rt, "night", 5, 20, 30)
     assert "stays off" not in crossovers()[-1]["message"] and \
         crossovers()[-1]["detail"]["user_off"] == [], crossovers()[-1]
+    assert unit_starts("2026-08-05", "night") == {"main_room_ac": {"state": "leak", "why": "leak"}}
     states.remove(leak)
     print("section start: a unit a person turned off stays off through the crossover, and its "
           "event says so and until when (\"or the room is too warm\" only with "

@@ -14,7 +14,8 @@ rule is a small named function, written the way a template can say it.
   on_section_change   what the scene does to a unit at a crossover: a
                       person's off stays off; else rest if cooling is
                       blocked or the room starts cold (section_start), else
-                      cool
+                      cool; unit_start names the state it starts in, and why,
+                      for the section run
   on_room_vote        a person's too_cold / too_hot vote for the room (a
                       button press, or a setpoint change on a remote): one
                       per episode, forcing a rest or a boost
@@ -666,6 +667,30 @@ def section_start(votes: Votes | None, ctx: Context) -> tuple[str, str]:
     if ctx.delta_mean is None:
         return "cool", START_FAIL_OPEN
     return "cool", START_NOT_COOLER if ctx.delta_mean <= 0 else START_NOT_COLD
+
+
+START_LEAK, START_CONFIG_OFF, START_USER_OFF, START_NO_ALMANAC = \
+    "leak", "config_off", "user_off", "no_almanac"
+NO_START = "none"       # no almanac: the scene leaves the unit as it is
+
+
+def unit_start(unit: Unit, ctx: Context, forced_off: bool,
+               votes: Votes | None) -> tuple[str, str]:
+    """What a section change starts this unit in, and why, as its section
+    run records it (decision 141), in on_section_change's order: leak (the
+    latch), config_off (the scene forces it off), user_off (a person's off
+    kept), with no almanac nothing (NO_START; a released leak rests), else
+    section_start's rest or cool and its reason. The margin replay reads it
+    to tell whether the scene started the unit cooling."""
+    if ctx.leak_on:
+        return "leak", START_LEAK
+    if forced_off:
+        return "config_off", START_CONFIG_OFF
+    if keeps_user_off(unit):
+        return "user_off", START_USER_OFF
+    if ctx.setpoint_applied is None:
+        return ("rest" if unit.state == "leak" else NO_START), START_NO_ALMANAC
+    return section_start(votes, ctx)
 
 
 def on_section_change(unit: Unit, ctx: Context, forced_off: bool, now: datetime,

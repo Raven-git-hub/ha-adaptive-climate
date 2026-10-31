@@ -58,7 +58,7 @@ history.** Otherwise deploy follows the build plan in V2_DESIGN.md (Gate A).
 | Module | Responsibility |
 |---|---|
 | `app/trust.py` | Pure-function core: sensor trust, comfort band, quorum evaluation |
-| `app/control.py` | Pure-function control core: votes, the cool/boost/rest state machine, section changes (a cold room with a cooler forecast starts resting; a person's off stays off), a person's off woken by a too-warm quorum (`user_off_wakes`), a person's too_cold/too_hot vote (one per episode, forced rest/boost), person reactions, the "is this ours" check (rendered as Jinja by the generator) |
+| `app/control.py` | Pure-function control core: votes, the cool/boost/rest state machine, section changes (a cold room with a cooler forecast starts resting; a person's off stays off), a person's off woken by a too-warm quorum (`user_off_wakes`), what a section change starts each unit in, recorded on the run (`unit_start`), a person's too_cold/too_hot vote (one per episode, forced rest/boost), person reactions, the "is this ours" check (rendered as Jinja by the generator) |
 | `app/analyser.py` | Deterministic replay of reactions from a seed: setpoints, applied setpoints, per-sensor comfort/band (nudged per reaction)/trust, confidence |
 | `app/generator.py` | Builds HA helpers (eight per-unit control helpers, two vote buttons per room) and automations (scene, maintenance, vote, manual change, leak, watchdog) from config, rendering `app/control.py` as Jinja |
 | `app/outdoor.py` | Pure-function outdoor input: a weather entity's hourly forecast parsed, a section window's mean/max and coverage, the point value (current temperature, stale after 3 h) |

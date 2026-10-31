@@ -276,7 +276,7 @@ If a person turns a unit on during a block, or votes too hot, that unit's `ac_un
 - **Too hot while blocked:** a too hot vote, or a person turning a unit on, in a section decided blocked: M moves toward Δ of the max + 0.5, so that section would not have been blocked.
 - **Too cold just after cooling started, unblocked:** a too cold vote, or a person turning a unit off, within 30 minutes of the system starting to cool (the scene, or maintenance waking a unit from rest) in a section decided unblocked: M moves toward that section's Δ of the max.
 
-Sections decided with `block_mode` off, or with no comfort point or forecast max, teach nothing. When the system started cooling is read from the heartbeats' control state, so the margin rebuilds from CSV (decision 109).
+Sections decided with `block_mode` off, or with no comfort point or forecast max, teach nothing. When the system started cooling is read from the heartbeats' control state, and from what each section change started each unit in, recorded on the section run, so the margin rebuilds from CSV (decisions 109 and 141).
 
 ### Shadow mode
 
@@ -450,6 +450,7 @@ Phase 0 gives the database a real migration path:
 - **Re-ingest:** rebuilding SQLite from CSV is a prerequisite for Gate A, not for phase 1. Section runs reach the CSV only from phase 0, so re-ingest has to apply migration 2's rule (close an open run at the room's next run's start) to whatever it rebuilds.
 - **Migration 2 (phase 1, data only):** v1 closed a section run by its close date, so every sleep run and every run a restart interrupted stayed open. Migration 2 closes each open run except the room's latest at the next run's start; the runtime now closes the room's open run by being open, and dates a run by its planned start.
 - **Migration 3 (votes):** rebuilds `reactive` and `reactive_unit` with their rows, so their kind checks allow `too_cold` and `too_hot`. Backed up first as `<name>.pre-votes-backup-<timestamp>`.
+- **Migration 4 (unit starts):** rebuilds `section_run` with its rows and a new nullable `unit_starts` column: what each section change started each unit in, and why (decision 141). The CSV gains it as its last column. Older runs keep NULL. Backed up first as `<name>.pre-starts-backup-<timestamp>`.
 
 ### Seeding from v1 data
 
@@ -727,7 +728,7 @@ A person's off, 31 Oct 2026:
     - **What ends it.** The existing paths: a person's on (`cool`, grace, unblocked) or a too hot vote (a forced boost); a too cold vote still leaves it off. New: maintenance wakes it into `cool` when the room reaches a too-warm quorum, its votes past the section's published (leaned) warm edges (`control.user_off_wakes`). The wake is at the base, offset 0, since a person's off says nothing about the setpoint. Two conditions the request didn't state are taken from how a rest wakes: the rest minimum time (2 heartbeats, for the compressor), and not while cooling is blocked for the unit, where `cool` would go straight back to `rest` (`ac_unblocked` lifts that, as for a rest). `system.control.user_off_wakes_on_warm` (default true) turns the wake off. The generator then renders no wake branch, so changing it needs a deploy; the Config page's "Off by a person" checkbox goes through Apply, which previews the 3 maintenance automations.
     - **Leak and forced off.** A leak during a `user_off` latches as before, and its confirmed release starts the unit as at a section change from `leak`, so the person's off doesn't come back. A section whose scene forces the unit off takes it to `config_off`, and the next section starts it as usual.
     - **The log.** After its command, maintenance fires `ac_user_off_wake` with `{room, unit, why, setpoint, tally, required, warm_side, warm_edge}`. The runtime logs it as a `control` event: "Main Room: Main Room AC woke from Off (by you) and cools at 23°: the room is too warm, quorum met: 2 vote(s) (2 needed), past the warm edge +0.43". It records no reaction. A crossover's event now also names each unit a person's off keeps off, and until when ("; Main Room AC stays off, as a person turned it off, until someone turns it on or votes too hot, or the room is too warm"), with `user_off` in its detail. These are read from the state helpers; a unit with its leak latched or forced off by the section is not named.
-    - **Learning is unchanged.** The off is recorded and teaches as before. The margin's "cooling started" (109) still reads the heartbeats, so cooling after a heartbeat that showed `user_off`, whether from a person's on or a warm wake, teaches no margin. As with a section rest (127), a too cold vote before a section's first heartbeat still dates cooling from the scene, though a kept `user_off` didn't cool. That window is one heartbeat interval, and closing it would need a new column.
+    - **Learning is unchanged.** The off is recorded and teaches as before. The margin's "cooling started" (109) still reads the heartbeats, so cooling after a heartbeat that showed `user_off`, whether from a person's on or a warm wake, teaches no margin. As with a section rest (127), a too cold vote before a section's first heartbeat still dates cooling from the scene, though a kept `user_off` didn't cool. That window is one heartbeat interval; decision 141 closes it.
     - `control.HANDS_OFF` is now `manual` and `config_off`.
 
     **Checks.** On the code before this change, "a person's off survives a section change" fails in `app.control` and in the generated scene alike: both turn the unit on (cool, low, 22°). `tools/control_check.py` drops "section change ends user_off", turns "user_off is hands off" into "a person's off stays off without a too-warm quorum", and adds 14 scenarios:
@@ -756,3 +757,29 @@ Deploy, 31 Oct 2026:
     - **Why it writes.** `automations_why` in the report (shown by `GET /api/deploy/check`, not the Apply page) says why each automation it writes is written: not in our deploy manifest, no copy in HA, the read failed (with the error), or the first difference after normalising, as a path and both values. A failing read is no longer silent.
     - **The diagnostic.** `tools/automation_diff.py [ID] [--show] [--all]` reads an automation through the same `HARest.get_automation` deploy uses (default `ac_watchdog_main_room`). It prints whether the manifest records it, what the read returned, the first difference as-is and after normalising, and the verdict; it writes nothing. If this fix isn't right first time, its output on the host names what is different.
     - **Checks.** `deploy_reconcile_check` reshapes all 30 stored copies with every normalisation above (`ha_shaped`). None is equal as-is, and all are unchanged: changes 0. In those copies, a one-character template change (`'too_warm'` → `'too_warn'` in maintenance), a trigger's (`to` on → off), a condition's (the guard's state) and an action's (`turn_off` → `turn_on`) are written, and only those, each with where it differs. Knocking out any one normalisation leaves some reshaped copies unequal. The tool itself is run against the stub: equal after normalising, a `for: minutes` 5 vs "6" difference, and a read that fails (`401`), named in the verdict as in deploy's reason. The generated automations are unchanged.
+
+Margin learning, 31 Oct 2026:
+
+141. **The section run records what the scene started each unit in** (extends 109; closes the gap noted in 127 and 139). `cooling_since` used to assume that, with no heartbeat yet in a run, the scene had started each unit cooling. But a section can start a unit resting (a section rest, a block or a heat source) or leave a person's off in place (139). So a too cold vote, or a person's off, in a section's first heartbeat interval could move the margin toward "should have blocked" though nothing had cooled.
+    - **Recorded at the crossover.** `control.unit_start` names what the section change starts a unit in, and why, in `on_section_change`'s order:
+      - `leak`, when the latch is on;
+      - `config_off`, when the scene forces the unit off;
+      - `user_off`, a person's off kept;
+      - `none` with reason `no_almanac` (a released leak, `rest`): the scene leaves the unit alone;
+      - otherwise `section_start`'s `rest` (`blocked`, `heat_source`, `cold`) or `cool` (`fail_open`, `not_cooler_outside`, `not_cold`).
+
+      The runtime evaluates it per unit when the scene fires (catch-ups that re-fire included), from the unit's state helper, its leak latch, the section's forced-off units, its `setpoint_applied` and the room's votes and conditions. It stores `{unit_id: {state, why}}` as `section_run.unit_starts` and in the crossover event's detail (`units`). A catch-up that doesn't re-fire keeps the run's own.
+    - **Storage.** Migration 4 rebuilds `section_run` with the new nullable column and keeps every row, backed up first (`pre-starts`). The section-run CSV gains `unit_starts` (JSON) as its last column, so the margin rebuilds from CSV.
+    - **The replay.** `cooling_since` reads a unit's recorded start as the run's first control state, at the run's start:
+      - `cool`: the scene started cooling, as before;
+      - `rest`: a later wake by maintenance is dated from the run's start if no heartbeat showed the rest, the earliest it can have been, as 109 dates a wake by the last rest heartbeat;
+      - `user_off`, `leak`, `config_off` or `none`: the scene started no cooling, so cooling seen later was a person's (or a warm wake from `user_off`) and teaches no margin.
+
+      A run with no record (before migration 4) behaves exactly as before.
+    - **Checks.**
+      - `analyser_demo`: a too cold vote 5 minutes into a Day that started in rest teaches no margin; nor does one after a kept `user_off`, a block's rest, a forced-off section or no almanac; one into a Day that started cooling does (−1 → −1.5); so does one in a run without the column, as before; and a section rest woken before the first heartbeat is dated from the run's start. Ignoring the record, the rest case learns (−1 → −1.5), as before this fix.
+      - `control_check`: `unit_start` matches `on_section_change` in 960 combinations of state, leak, forced off, almanac, block, heat source, forecast and readings (the reason is `cold` exactly for a section rest).
+      - `store_check`: migration 4 keeps a version 3 database's runs (NULL), adds the column, matches a fresh database, and round-trips the CSV.
+      - `runtime_check`: Sunset (cool), Sleep (a section rest), a kept `user_off` and a latched leak are each recorded on their runs.
+
+    The generated automations are unchanged; the host needs a rebuild and restart, which migrates the database behind its backup.

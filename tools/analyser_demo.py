@@ -548,12 +548,15 @@ def check_margin() -> None:
        "inside the range it is halfway, across 0 either way")
 
     def decided(sc: Scenario, start: datetime, section: str, comfort: float, mx: float,
-                blocked: bool) -> None:
-        """A section run decided in shadow mode at its crossover."""
+                blocked: bool, starts: dict | None = None) -> None:
+        """A section run decided in shadow mode at its crossover; starts:
+        what the scene started each unit in (None: a run recorded before
+        storage migration 4)."""
         day = start.date().isoformat()
         sc.store.record_section_run("lounge", day, section,
                                     planned_start=start.isoformat(timespec="seconds"),
-                                    actual_start=start.isoformat(timespec="seconds"))
+                                    actual_start=start.isoformat(timespec="seconds"),
+                                    unit_starts=starts)
         sc.store.record_section_outdoor("lounge", day, section, mx - 1.0, mx)
         sc.store.record_section_conditions("lounge", day, section, comfort, 0.1, blocked,
                                            "shadow")
@@ -599,6 +602,42 @@ def check_margin() -> None:
     m, _ = margin(sc, t(4, 20, 41), 9.0)
     assert m == 10.0
     ok("capped at 10: from 9 toward 12.5 (a too_hot vote in a Night blocked at delta max 12)")
+
+    # Decision 141: a too_cold vote 5 minutes into an unblocked Day (delta max
+    # -2, margin -1), before its first heartbeat. What the scene started the
+    # unit in, recorded on the run, says whether it started cooling.
+    def early_vote(starts: dict | None, beat_state: str | None = None) -> tuple[float, list]:
+        sc = Scenario()
+        decided(sc, t(5, 8), "day", 24.0, 26.0, False, starts=starts)
+        if beat_state:
+            sc.beat(t(5, 8, 3), state=beat_state)
+        sc.vote(t(5, 8, 5 if not beat_state else 18), "too_cold")
+        return margin(sc, t(5, 8, 30))
+
+    m, steps = early_vote({"ac": {"state": "rest", "why": "cold"}})
+    assert m == -1.0 and steps == [], steps
+    ok("a too_cold vote 5 min into a Day that started in rest (a section rest) teaches no "
+       "margin: the scene started no cooling")
+    m, steps = early_vote({"ac": {"state": "cool", "why": "not_cold"}})
+    assert m == -1.5 and steps[-1].cooling_since == t(5, 8), steps
+    ok("one 5 min into a Day that started cooling moves it halfway to -2: -1 -> -1.5, cooling "
+       "dated from the scene at 08:00")
+    m, steps = early_vote(None)
+    assert m == -1.5 and steps[-1].cooling_since == t(5, 8), steps
+    ok("and one in a run recorded before storage migration 4 (no unit_starts) is taken for "
+       "the scene starting cooling, as before: -1 -> -1.5")
+    for why_off in ({"state": "user_off", "why": "user_off"}, {"state": "rest", "why": "blocked"},
+                    {"state": "config_off", "why": "config_off"},
+                    {"state": "none", "why": "no_almanac"}):
+        m, steps = early_vote({"ac": why_off})
+        assert m == -1.0 and steps == [], (why_off, steps)
+    ok("nor does a start a person's off kept (decision 139), a block's rest, a forced-off "
+       "section or no almanac")
+    m, steps = early_vote({"ac": {"state": "rest", "why": "cold"}}, beat_state="cool")
+    assert m == -1.5 and steps[-1].cooling_since == t(5, 8), steps
+    ok("but a section rest that maintenance woke (its first heartbeat at 08:03 shows cool), "
+       "then a too_cold vote at 08:18: the wake is dated from the run's start, the earliest it "
+       "can have been, and the margin learns: -1 -> -1.5")
 
 
 def check_missing_seed() -> None:

@@ -78,6 +78,7 @@ Run tools/analyser_demo.py for the worked examples.
 from __future__ import annotations
 
 import bisect
+import json
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -508,6 +509,8 @@ class _Run:
     delta_max: float | None         # None: nothing to learn from
     blocked: bool
     block_mode: str | None
+    unit_starts: dict | None = None  # {unit_id: {state, why}} at the crossover; None before
+                                     # storage migration 4 (decision 141)
 
 
 def margin_step(margin: float, target: float, rate: float) -> float:
@@ -520,9 +523,10 @@ def margin_step(margin: float, target: float, rate: float) -> float:
 
 def _runs(conn, room_id: str, until: str) -> list[_Run]:
     runs = []
-    for d, sec, planned, actual, cp, mx, blocked, mode in conn.execute(
+    for d, sec, planned, actual, cp, mx, blocked, mode, starts in conn.execute(
             "SELECT local_date, section, planned_start, actual_start, comfort_point, "
-            "outdoor_max, blocked, block_mode FROM section_run WHERE room_id = ?", (room_id,)):
+            "outdoor_max, blocked, block_mode, unit_starts FROM section_run WHERE room_id = ?",
+            (room_id,)):
         start = planned or actual
         if not start or datetime.fromisoformat(start).tzinfo is None:
             continue
@@ -531,7 +535,7 @@ def _runs(conn, room_id: str, until: str) -> list[_Run]:
             continue
         decided = mode in DECIDING_MODES and cp is not None and mx is not None
         runs.append(_Run(at, d, sec, round(cp - mx, 2) if decided else None,
-                         bool(blocked), mode))
+                         bool(blocked), mode, json.loads(starts) if starts else None))
     return sorted(runs, key=lambda r: r.start)
 
 
@@ -549,22 +553,34 @@ def _margin_reactions(conn, room_id: str, until: str) -> list[tuple]:
 
 
 def cooling_since(conn, room_id: str, unit_id: str, run_start: datetime, at: datetime,
-                  power_before: int | None) -> datetime | None:
+                  power_before: int | None, start: dict | None = None) -> datetime | None:
     """When the system started cooling the unit, as of `at` in a run that
     started (its scene) at run_start, from the control state its
     heartbeats recorded; None if it isn't cooling, or a person started it.
     Cooling at every heartbeat since the run started: the scene. Cooling
     since a heartbeat that showed rest: maintenance woke it, dated by that
     heartbeat. Resting at the last heartbeat but on when a person turned it
-    off (power_before 1): woken since then. No heartbeat yet: the scene,
-    unless the unit was off."""
+    off (power_before 1): woken since then.
+
+    `start` is what the run recorded the scene starting the unit in
+    ({state, why}, control.unit_start; decision 141), read as the run's
+    first control state at run_start. So a scene that started it cooling
+    counts as above, one that started it resting dates a later wake from
+    the run's start, and one that left it off by a person's choice, in
+    leak or config_off, or alone with no almanac, started no cooling. A run
+    recorded before storage migration 4 has none: with no heartbeat yet it
+    is taken for the scene, unless the unit was off (decision 109)."""
     beats = conn.execute(
         "SELECT h.ts_utc, hu.control_state FROM heartbeat h "
         "JOIN heartbeat_unit hu ON hu.heartbeat_id = h.id "
         "WHERE h.room_id = ? AND hu.unit_id = ? AND h.ts_utc >= ? AND h.ts_utc <= ? "
         "ORDER BY h.ts_utc, h.id", (room_id, unit_id, _utc(run_start), _utc(at))).fetchall()
-    if not beats:
-        return None if power_before == 0 else run_start
+    if not beats and power_before == 0:
+        return None
+    if start is not None:
+        beats = [(_utc(run_start), start.get("state"))] + list(beats)
+    elif not beats:
+        return run_start
     if beats[-1][1] not in COOLING_STATES:
         return _at(beats[-1][0]) if beats[-1][1] == "rest" and power_before == 1 else None
     i = len(beats) - 1
@@ -607,8 +623,10 @@ def learn_margin(conn, room: dict, cfg: MarginConfig,
             else:
                 candidates = {u["id"]: None for u in room["units"]
                               if u["id"] not in _config_off(room, run.section)}
+            recorded = run.unit_starts or {}
             starts_cooling = [s for uid, p in candidates.items()
-                              if (s := cooling_since(conn, room_id, uid, run.start, at, p))
+                              if (s := cooling_since(conn, room_id, uid, run.start, at, p,
+                                                     recorded.get(uid)))
                               is not None and timedelta(0) <= at - s <= MARGIN_COOLING_WINDOW]
             if not starts_cooling:
                 continue

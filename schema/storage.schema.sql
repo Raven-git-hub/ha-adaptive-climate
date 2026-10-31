@@ -74,6 +74,10 @@ CREATE TABLE section_run (
                     CHECK (blocked IN (0,1) OR blocked IS NULL),
     block_mode      TEXT                     -- outdoor.block_mode then: blocked=1 + shadow = "would have blocked"
                     CHECK (block_mode IN ('off','shadow','active') OR block_mode IS NULL),
+    -- what the section change started each unit in, and why (control.unit_start), as JSON:
+    -- {unit_id: {"state": cool|rest|user_off|leak|config_off|none, "why": ...}}; NULL before
+    -- migration 4 (the margin replay then falls back, decision 141)
+    unit_starts     TEXT,
     UNIQUE (room_id, local_date, section)
 );
 CREATE INDEX idx_section_run_lookup ON section_run(room_id, local_date);

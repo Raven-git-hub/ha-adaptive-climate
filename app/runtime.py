@@ -90,6 +90,7 @@ See docs/DESIGN.md 4, 12.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import sqlite3
 from dataclasses import dataclass, field
@@ -1137,7 +1138,8 @@ class Runtime:
             room_id, run_date, section,
             planned_start=started.isoformat(timespec="seconds") if started else None,
             actual_start=ts,
-            outcome="caught_up" if catch_up else "ran")
+            outcome="caught_up" if catch_up else "ran",
+            unit_starts=start_detail["units"] if start_detail else None)
         note = " (catch-up)" if catch_up else ""
         if not refire:
             note = " (catch-up, already in section - not re-fired)"
@@ -1200,7 +1202,8 @@ class Runtime:
                 else "no comfort point, so no cold start: fail open"
                 if cond.fail_open == control.NO_COMFORT_POINT
                 else "no outdoor value, so no cold start: fail open"}[why]
-        off = self._kept_off(room, section)
+        starts = self._unit_starts(room, section, alm, votes, ctx)
+        off = [u for u in room["units"] if starts[u["id"]]["state"] == "user_off"]
         if off:
             names = ", ".join(u.get("name", u["id"]) for u in off)
             it, stays = ("it", "stays") if len(off) == 1 else ("them", "stay")
@@ -1212,18 +1215,28 @@ class Runtime:
             "section": section, "start": state, "why": why, "cold_side": votes.cold_side,
             "usable": usable, "needed": need, "delta_mean": cond.delta_mean,
             "comfort_point": cond.comfort_point, "outdoor_mean": cond.outdoor_mean,
-            "heat_sources_on": heat, "user_off": [u["id"] for u in off]}
+            "heat_sources_on": heat, "user_off": [u["id"] for u in off], "units": starts}
 
-    def _kept_off(self, room: dict, section: str) -> list[dict]:
-        """The units a person's off keeps off through this section change
-        (control.keeps_user_off): in user_off, with no leak latched and not
-        forced off by the section's scene, which still win. Read whether or
-        not the scene has run yet: it leaves such a unit in user_off."""
-        r = room["id"]
-        return [u for u in room["units"]
-                if self._cache.get(state_id(r, u["id"])) == "user_off"
-                and self._cache.get(leak_id(r, u["id"])) != "on"
-                and section not in forced_off_sections(room, u)]
+    def _unit_starts(self, room: dict, section: str, alm: dict | None, votes: control.Votes,
+                     ctx: control.Context) -> dict[str, dict]:
+        """What the scene starts each unit in, and why (control.unit_start,
+        decision 141), recorded on the section run for the margin replay:
+        from the unit's state helper, its leak latch, whether the section's
+        scene forces it off, its setpoint_applied in the section's almanac
+        and the room's votes and conditions. Read whether or not the scene
+        has run yet: the only helper state it depends on is user_off, which
+        the scene leaves as it is."""
+        r, out = room["id"], {}
+        units = (alm or {}).get("units") or {}
+        for u in room["units"]:
+            unit = control.Unit(state=self._cache.get(state_id(r, u["id"])) or "unknown")
+            uctx = dataclasses.replace(
+                ctx, setpoint_applied=(units.get(u["id"]) or {}).get("setpoint_applied"),
+                leak_on=self._cache.get(leak_id(r, u["id"])) == "on")
+            state, why = control.unit_start(unit, uctx, section in forced_off_sections(room, u),
+                                            votes)
+            out[u["id"]] = {"state": state, "why": why}
+        return out
 
     # ---- outdoor and conditions -----------------------------------
 

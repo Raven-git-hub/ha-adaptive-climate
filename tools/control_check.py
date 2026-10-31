@@ -1341,6 +1341,39 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
     ]
 
 
+def check_unit_start() -> int:
+    """control.unit_start against on_section_change over a grid of unit
+    states, the leak latch, a forced-off section, an almanac or none, a
+    block, a heat source, the forecast and the readings: the state it
+    records is the one the scene starts the unit in (the unit's own with no
+    almanac), and its reason is cold exactly when the scene marks a section
+    rest."""
+    bad, n = [], 0
+    for state in (*control.STATES, "unknown"):
+        for leak in (False, True):
+            for forced in (False, True):
+                for sa in (None, 22.0):
+                    for layer in ({}, {"blocked": True, "block_mode": "active"},
+                                  {"heat_source_on": True}, {"delta_mean": 6.0},
+                                  {"delta_mean": -3.0}):
+                        for readings in ("cold", "settled_warm", "dead"):
+                            ctx = _ctx({"setpoint_applied": sa, "leak_on": leak}, layer)
+                            unit, v = _unit({"state": state}), _votes({"readings": readings})
+                            new, _ = control.on_section_change(unit, ctx, forced, T0, v)
+                            got, why = control.unit_start(unit, ctx, forced, v)
+                            want = unit.state if got == control.NO_START else got
+                            n += 1
+                            if new.state != want or new.section_rest != (why == control.START_COLD):
+                                bad.append(f"{state}, leak {leak}, forced {forced}, sa {sa}, "
+                                           f"{layer}, {readings}: unit_start {got}/{why}, "
+                                           f"the scene {new.state}")
+    for line in bad[:5]:
+        print(f"[FAIL] {line}")
+    print(f"unit_start records the state on_section_change starts the unit in, and cold "
+          f"exactly for a section rest: {n - len(bad)}/{n} cases")
+    return len(bad)
+
+
 @contextlib.contextmanager
 def _patched(patches: dict):
     saved = {name: getattr(control, name) for name in patches}
@@ -1363,7 +1396,7 @@ def main() -> int:
     passed = sum(1 for why in failures.values() if not why)
     steps = sum(len(sc["steps"]) for sc in SCENARIOS)
     print(f"{passed}/{len(SCENARIOS)} scenarios ({steps} steps) match app.control")
-    if passed != len(SCENARIOS):
+    if passed != len(SCENARIOS) or check_unit_start():
         return 1
 
     print("\nrules removed one at a time:")

@@ -456,10 +456,10 @@ def check_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store_mod.MIGRATIONS) == 3
+    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store_mod.MIGRATIONS) == 4
     assert _backups(db) == [store.backup_path], (_backups(db), store.backup_path)
     assert _dump(store.backup_path) == v1_dump, "backup is not a copy of the v1 database"
-    print(f"migration: v1 database backed up to {store.backup_path.name}, now at version 3 - OK")
+    print(f"migration: v1 database backed up to {store.backup_path.name}, now at version 4 - OK")
 
     def n(table: str) -> int:
         return c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -487,7 +487,7 @@ def check_migration() -> None:
     assert sorted(cats) == ["connection", "crossover", "reactive", "storage"], cats
     storage = store.recent_events(category="storage")[0]
     assert str(store.backup_path) in storage["message"], storage
-    assert storage["detail"] == {"from": 0, "to": 3, "backup": str(store.backup_path)}
+    assert storage["detail"] == {"from": 0, "to": 4, "backup": str(store.backup_path)}
     assert store.current_almanac("main_room", as_of=date(2026, 8, 1)) == \
         {"room_id": "main_room", "sections": {}}
     assert c.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -558,7 +558,7 @@ def check_failed_migration() -> None:
 
 def check_phase0_database() -> None:
     """A database left at storage version 1 (v2 phase 0, before the section
-    run fix) gets migrations 2 and 3, behind its own backup."""
+    run fix) gets migrations 2 to 4, behind its own backup."""
     real = store_mod.MIGRATIONS
     tmp = Path(tempfile.mkdtemp())
     db = build_v1_db(tmp)
@@ -575,12 +575,12 @@ def check_phase0_database() -> None:
     assert still_open == 6, still_open
 
     store = Store(tmp, SCHEMA)
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
     assert _backups(db, "phase0") == [store.backup_path], store.backup_path
     assert _dump(store.backup_path) == phase0
     assert _runs(store._conn) == EXPECTED_RUNS, _runs(store._conn)
     details = [e["detail"] for e in store.recent_events(category="storage")]
-    assert {"from": 1, "to": 3, "backup": str(store.backup_path)} in details, details
+    assert {"from": 1, "to": 4, "backup": str(store.backup_path)} in details, details
     store.close()
     print(f"phase 0 database: backed up to {store.backup_path.name}, migration 2 closes its "
           f"open runs - OK")
@@ -622,7 +622,7 @@ def check_votes_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 4
     assert _backups(db, "pre-votes") == [store.backup_path], store.backup_path
     assert _dump(store.backup_path) == v2
     assert [tuple(r) for r in c.execute(
@@ -637,10 +637,71 @@ def check_votes_migration() -> None:
     fresh = Path(tempfile.mkdtemp())
     Store(fresh, SCHEMA).close()
     assert _shape(db) == _shape(fresh / "db" / "adaptive_climate.db"), \
-        "the database migrated to version 3 differs from a fresh one"
+        "the database migrated from version 2 differs from a fresh one"
     print(f"migration 3: a version 2 database (refusing too_cold) backed up to "
           f"{store.backup_path.name}, its reaction, unit and sensor rows kept; it then records "
           f"a vote, and matches a fresh database - OK")
+
+
+def check_starts_migration() -> None:
+    """A database at storage version 3, whose section runs have no
+    unit_starts, gets migration 4 alone: every run kept (unit_starts NULL),
+    the column added, and the shape a fresh database's. A run recorded
+    after it carries each unit's start state, in SQLite and as the CSV's
+    last column; a catch-up upsert without one keeps it."""
+    tmp = Path(tempfile.mkdtemp())
+    old_schema = tmp / "storage.v3.schema.sql"
+    text = SCHEMA.read_text()
+    start = text.index("    -- what the section change started each unit in")
+    end = text.index("    unit_starts     TEXT,\n") + len("    unit_starts     TEXT,\n")
+    old_schema.write_text(text[:start] + text[end:])
+    real = store_mod.MIGRATIONS
+    store_mod.MIGRATIONS = real[:3]
+    try:
+        old = Store(tmp, old_schema)            # a fresh database at storage version 3
+    finally:
+        store_mod.MIGRATIONS = real
+    rd = "2026-08-01"
+    old._conn.execute(
+        "INSERT INTO section_run(room_id,local_date,section,planned_start,actual_start,"
+        "comfort_point,outdoor_max,blocked,block_mode) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("main_room", rd, "day", f"{rd}T08:00:00+08:00", f"{rd}T08:00:02+08:00",
+         23.9, 18.0, 0, "shadow"))
+    old._conn.commit()
+    assert "unit_starts" not in [r[1] for r in old._conn.execute("PRAGMA table_info(section_run)")]
+    old.close()
+    db = tmp / "db" / "adaptive_climate.db"
+    v3 = _dump(db)
+    assert v3[0] == 3
+
+    store = Store(tmp, SCHEMA)
+    c = store._conn
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert _backups(db, "pre-starts") == [store.backup_path], store.backup_path
+    assert _dump(store.backup_path) == v3
+    assert [tuple(r) for r in c.execute(
+        "SELECT section, planned_start, comfort_point, outdoor_max, blocked, block_mode, "
+        "unit_starts FROM section_run")] == [
+        ("day", f"{rd}T08:00:00+08:00", 23.9, 18.0, 0, "shadow", None)]
+    starts = {"main_room_ac": {"state": "rest", "why": "cold"}}
+    store.record_section_run("main_room", rd, "afternoon", planned_start=f"{rd}T14:00:00+08:00",
+                             unit_starts=starts)
+    store.record_section_run("main_room", rd, "afternoon", outcome="caught_up")
+    assert json.loads(c.execute("SELECT unit_starts FROM section_run WHERE section='afternoon'")
+                      .fetchone()[0]) == starts
+    rows = list(csvmod.DictReader((tmp / "csv" / "main_room" / f"{rd}_section_run.csv").open()))
+    assert list(rows[0]) == SECTION_RUN_CSV and SECTION_RUN_CSV[-1] == "unit_starts"
+    assert json.loads(rows[0]["unit_starts"]) == starts and rows[1]["unit_starts"] == "", rows
+    assert c.execute("PRAGMA foreign_key_check").fetchall() == []
+    store.close()
+    fresh = Path(tempfile.mkdtemp())
+    Store(fresh, SCHEMA).close()
+    assert _shape(db) == _shape(fresh / "db" / "adaptive_climate.db"), \
+        "the database migrated from version 3 differs from a fresh one"
+    print(f"migration 4: a version 3 database backed up to {store.backup_path.name}, its "
+          "section run kept with unit_starts NULL; a run recorded after it keeps each unit's "
+          "start state in SQLite and as the CSV's last column (a catch-up upsert without one "
+          "keeps it), and the database matches a fresh one - OK")
 
 
 def check_newer_database_refused() -> None:
@@ -664,6 +725,7 @@ def main() -> int:
     check_failed_migration()
     check_phase0_database()
     check_votes_migration()
+    check_starts_migration()
     check_newer_database_refused()
     print("\nALL STORE CHECKS PASSED")
     return 0
