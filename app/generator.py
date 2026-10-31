@@ -120,6 +120,8 @@ def button_id(room: str, direction: str) -> str:
     return f"input_button.ac_{direction}_{room}"
 
 PERSON_VOTE_EVENT = "ac_person_vote"
+# Maintenance woke a person's off on a too-warm quorum; the runtime logs why.
+USER_OFF_WAKE_EVENT = "ac_user_off_wake"
 
 def scene_automation_id(room: str, section: str) -> str:
     return f"ac_scene_{room}_{section}"
@@ -167,7 +169,7 @@ def _leak_enabled(unit: dict) -> bool:
     return bool(unit.get("leak_detection", {}).get("enabled"))
 
 
-def _forced_off_sections(room: dict, unit: dict) -> list[str]:
+def forced_off_sections(room: dict, unit: dict) -> list[str]:
     """Sections whose scene config forces this unit off (config_off)."""
     scenes = room.get("scenes", {})
     return [s for s in SECTIONS
@@ -360,6 +362,12 @@ _RESULT = ("{{ {'go': r.go, 'state': r.state, 'offset': r.offset, 'base': r.base
            "'since': r.since, 'grace': r.grace, 'unb': r.unb, 'forced': r.forced, "
            "'srest': r.srest, 'cmd': r.cmd} }}")
 
+# Maintenance's result also says whether this heartbeat woke a person's off
+# (control.user_off_wakes: the only way maintenance moves a user_off is into
+# cool), for the ac_user_off_wake event.
+_RESULT_MAINTENANCE = (_RESULT[:-len("} }}")]
+                       + ", 'woke': st == 'user_off' and r.state == 'cool'} }}")
+
 
 def _clamp(value: str) -> str:
     return f"[[{value}, lo] | max, hi] | min"
@@ -405,27 +413,29 @@ def _leak_trip(cfg: control.ControlConfig) -> str:
 def _section_change(cfg: control.ControlConfig, forced_off: str) -> str:
     """control.on_section_change, with control.section_start's rest when
     `blocked` or when the room starts cold (control.starts_cold: `votes`,
-    and the conditions' delta_mean), marked srest. A cleared grace is
-    written as now, which is no longer in the future."""
+    and the conditions' delta_mean), marked srest. A person's off stays
+    user_off (control.keeps_user_off), its since kept and nothing sent. A
+    cleared grace is written as now, which is no longer in the future."""
     return _fill(
         "{%- set r.offset = 0 -%}{%- set r.base = sa if sa is not none else 0 -%}"
         "{%- set r.unb = false -%}{%- set r.grace = now_ts -%}{%- set r.since = now_ts -%}"
         "{%- set r.forced = false -%}{%- set r.srest = false -%}{%- set r.go = true -%}"
         "{%- if leak -%}{%- set r.state = 'leak' -%}"
         "{%- elif <<FORCED>> -%}{%- set r.state = 'config_off' -%}"
+        "{%- elif st == 'user_off' -%}{%- set r.since = since -%}"
         "{%- elif sa is none -%}{%- if st == 'leak' -%}{%- set r.state = 'rest' -%}{%- endif -%}"
         "{%- else -%}"
         "{%- set r.srest = not blocked and conditions.delta_mean is not none and "
         "conditions.delta_mean > 0 and votes.cold_side >= [votes.required, 1] | max -%}"
         "{%- set r.state = 'rest' if blocked or r.srest else 'cool' -%}"
         "{%- endif -%}"
-        "{%- if leak or <<FORCED>> or sa is not none -%}{%- set r.cmd = <<CMD>> -%}"
-        "{%- endif -%}",
+        "{%- if r.state != 'user_off' and (leak or <<FORCED>> or sa is not none) -%}"
+        "{%- set r.cmd = <<CMD>> -%}{%- endif -%}",
         FORCED=forced_off, CMD=_command("r.state", "sa", "0", cfg.boost_degrees))
 
 
 def _forced_off_live(room: dict, unit: dict) -> str:
-    return f"(section in {_forced_off_sections(room, unit)!r})"
+    return f"(section in {forced_off_sections(room, unit)!r})"
 
 
 def _release_offset(change: int) -> str:
@@ -441,10 +451,16 @@ def _step(config: dict, room: dict, unit: dict) -> str:
     cool_min = _min_time_met((cfg.cool_min_heartbeats - 0.5) * interval * 60)
     rest_min = _min_time_met((cfg.rest_min_heartbeats - 0.5) * interval * 60)
     release_floor = "[votes.required, 1] | max"
+    # control.user_off_wakes: a too-warm quorum ends a person's off, as a rest
+    # wakes (its minimum time, not while blocked), into cool at the base
+    wake = (f"{{%- if votes.met and votes.direction == 'too_warm' and not (blocked and not unb) "
+            f"and {rest_min} -%}}" + _go("cool", cfg, "0") + "{%- endif -%}"
+            if cfg.user_off_wakes_on_warm else "")
     return (
         "{%- if leak -%}" + _leak_trip(cfg)
         + "{%- elif st == 'leak' -%}" + _section_change(cfg, _forced_off_live(room, unit))
         + f"{{%- elif st in {list(control.HANDS_OFF)!r} or tb is none -%}}"
+        + "{%- elif st == 'user_off' -%}" + wake
         + "{%- elif st == 'cool' -%}"
         + f"{{%- if (grace is not none and now_ts < grace) or not {cool_min} -%}}"
         + "{%- elif blocked and not unb -%}" + _go("rest", cfg)
@@ -665,7 +681,7 @@ def build_scene_automation(config: dict, room: dict, section: dict) -> dict:
         **_votes_variables(config, room,
                            f"{_sections_literal(room, sid)}.get('sensors') or {{}}")}
     for unit in room["units"]:
-        forced = "true" if sid in _forced_off_sections(room, unit) else "false"
+        forced = "true" if sid in forced_off_sections(room, unit) else "false"
         variables[_unit_var(unit)] = (
             _read_unit(room, unit, _sa_literal(room, sid, unit), _leak_on(room, unit))
             + _section_change(cfg, forced) + _RESULT)
@@ -883,7 +899,7 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
     for unit in room["units"]:
         variables[_unit_var(unit)] = (
             _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
-            + _step(config, room, unit) + _RESULT)
+            + _step(config, room, unit) + _RESULT_MAINTENANCE)
 
     any_go = " or ".join(f"{_unit_var(u)}.go" for u in room["units"])
     return {
@@ -900,9 +916,23 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
             _set("input_boolean.turn_on", guard_id(r)),
             *[_write_unit(room, unit) for unit in room["units"]],
             *[_send_command(unit) for unit in room["units"]],
+            *[_wake_event(room, unit) for unit in room["units"]],
             _set("input_boolean.turn_off", guard_id(r)),
         ])],
     }
+
+
+def _wake_event(room: dict, unit: dict) -> dict:
+    """The ac_user_off_wake event, when this heartbeat woke the unit from a
+    person's off: the room's votes that woke it and the setpoint it now
+    cools at, for the runtime's log line. Fired once its command is sent."""
+    v = _unit_var(unit)
+    return _when(f"{{{{ {v}.woke }}}}", [{
+        "event": USER_OFF_WAKE_EVENT,
+        "event_data": {"room": room["id"], "unit": unit["id"], "why": control.TOO_WARM,
+                       "setpoint": f"{{{{ {v}.cmd.temperature }}}}",
+                       "tally": "{{ votes.tally }}", "required": "{{ votes.required }}",
+                       "warm_side": "{{ votes.warm_side }}", "warm_edge": "{{ warm_edge }}"}}])
 
 
 # ---------------------------------------------------------------------

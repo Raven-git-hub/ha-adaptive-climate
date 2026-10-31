@@ -9,10 +9,12 @@ rule is a small named function, written the way a template can say it.
 
   evaluate_votes      positions in band widths, the pooled quorum and its
                       direction (app.trust), and the release counts
-  step                one maintenance heartbeat for one unit
-  on_section_change   what the scene does to a unit at a crossover: rest if
-                      cooling is blocked or the room starts cold
-                      (section_start), else cool
+  step                one maintenance heartbeat for one unit; a person's off
+                      wakes on a too-warm quorum (user_off_wakes)
+  on_section_change   what the scene does to a unit at a crossover: a
+                      person's off stays off; else rest if cooling is
+                      blocked or the room starts cold (section_start), else
+                      cool
   on_room_vote        a person's too_cold / too_hot vote for the room (a
                       button press, or a setpoint change on a remote): one
                       per episode, forcing a rest or a boost
@@ -43,7 +45,7 @@ from datetime import datetime, timedelta
 from app import trust
 
 STATES = ("cool", "boost", "rest", "user_off", "manual", "config_off", "leak")
-HANDS_OFF = ("user_off", "manual", "config_off")   # maintenance never moves these
+HANDS_OFF = ("manual", "config_off")   # maintenance never moves these (user_off: user_off_wakes)
 
 # Vote direction: the side the room is on. app.trust names what the room
 # needs instead ('cool' = needs cooling = too warm); this is the one place
@@ -88,6 +90,7 @@ class ControlConfig:
     rest_min_heartbeats: int = 2
     person_grace_minutes: int = 30
     offset_cap: int = 3
+    user_off_wakes_on_warm: bool = True     # a too-warm quorum ends a person's off
 
     @classmethod
     def from_config(cls, config: dict) -> ControlConfig:
@@ -263,6 +266,24 @@ def release_offset(unit: Unit, change: int) -> int:
     section started in because the room was cold (nobody said too cold),
     goes back to cool at its base."""
     return 0 if unit.forced or unit.section_rest else unit.offset + change
+
+
+def keeps_user_off(unit: Unit) -> bool:
+    """A person's off lasts past a section change: it ends only when a
+    person turns the unit on or votes too hot, or the room is too warm
+    (user_off_wakes). A leak and a forced-off section still beat it."""
+    return unit.state == "user_off"
+
+
+def user_off_wakes(unit: Unit, votes: Votes, now: datetime, ctx: Context) -> bool:
+    """With system.control.user_off_wakes_on_warm, a too-warm quorum (the
+    room's votes past the section's warm edges) ends a person's off, as a
+    rest wakes: once the rest minimum time is met, and never while cooling
+    is blocked for the unit (a cool would go straight back to rest)."""
+    cfg = ctx.config
+    return (cfg.user_off_wakes_on_warm and votes.met and votes.direction == TOO_WARM
+            and not effective_blocked(unit, ctx)
+            and min_time_met(unit, now, cfg.rest_min_heartbeats, ctx.heartbeat_interval))
 
 
 def capped_offset(offset: int, cap: int) -> int:
@@ -582,6 +603,12 @@ def step(unit: Unit, votes: Votes, now: datetime, ctx: Context) -> tuple[Unit, C
     cfg, interval = ctx.config, ctx.heartbeat_interval
     blocked = effective_blocked(unit, ctx)
 
+    if unit.state == "user_off":
+        if user_off_wakes(unit, votes, now, ctx):
+            # at its base: a person's off says nothing about the setpoint
+            return _go(unit, "cool", now, ctx, offset=0)
+        return _stay(unit, ctx)
+
     if unit.state == "cool":
         if in_grace(unit, now) or not min_time_met(unit, now, cfg.cool_min_heartbeats, interval):
             return _stay(unit, ctx)
@@ -645,18 +672,23 @@ def on_section_change(unit: Unit, ctx: Context, forced_off: bool, now: datetime,
                       votes: Votes | None) -> tuple[Unit, Command | None]:
     """The scene at a crossover (and a confirmed leak release). Resets the
     section-scoped fields, then: leak if the latch is on (off is re-sent),
-    else config_off if the scene forces the unit off, else section_start:
-    rest if cooling is blocked (the section's block or a heat source), or if
-    the room starts cold (votes: the room's, against the new section's
-    almanac), else cool. A rest the room's cold start began is marked
-    section_rest, so it wakes at the base. user_off, manual, a forced state
-    and a section rest end here. Minimum times don't apply."""
+    else config_off if the scene forces the unit off, else a person's off
+    stays user_off (keeps_user_off: since kept, nothing sent), else
+    section_start: rest if cooling is blocked (the section's block or a heat
+    source), or if the room starts cold (votes: the room's, against the new
+    section's almanac), else cool. A rest the room's cold start began is
+    marked section_rest, so it wakes at the base. manual, a forced state and
+    a section rest end here. Minimum times don't apply."""
     reset = replace(unit, offset=0, base=ctx.setpoint_applied, unblocked=False,
                     grace_until=None, since=now, forced=False, section_rest=False)
     if ctx.leak_on:
         state = "leak"
     elif forced_off:
         state = "config_off"
+    elif keeps_user_off(unit):
+        # The unit is already off, as the person left it: nothing to send,
+        # and its off still began when they turned it off.
+        return replace(reset, state="user_off", since=unit.since), None
     elif ctx.setpoint_applied is None:
         if unit.state != "leak":
             return reset, None               # no almanac yet: leave the unit alone

@@ -693,6 +693,12 @@ function setting(path, label, help, opts = {}) {
   </div>`;
 }
 
+// A yes/no setting: a checkbox, with the line that says what "on" does.
+function checkControl(path, text) {
+  return (val) => `<label class="chk"><input type="checkbox" id="f-${path.replace(/\./g, "-")}"
+    data-path="${path}" data-live="1" ${val !== false ? "checked" : ""}/> ${escapeHtml(text)}</label>`;
+}
+
 function selectControl(path, choices) {
   return (val) => `<select id="f-${path.replace(/\./g, "-")}" data-path="${path}" data-live="1">
     ${choices.map(([v, text, disabled]) => `<option value="${v}" ${v === val ? "selected" : ""}
@@ -785,6 +791,10 @@ function controlHtml() {
         { unit: "heartbeats" })}
       ${setting("system.control.rest_min_heartbeats", "Minimum rest time",
         "The least time resting (off) before a unit wakes.", { unit: "heartbeats" })}
+      ${setting("system.control.user_off_wakes_on_warm", "Off by a person",
+        "A unit someone turned off stays off across section changes until someone turns it on or votes too hot. With this on, the room getting too warm wakes it too.",
+        { control: checkControl("system.control.user_off_wakes_on_warm",
+            "wake it when the room is too warm"), label: (v) => (v ? "on" : "off") })}
       ${setting("learning.reaction_rate", "Learning rate",
         "How far each reaction moves the learned setpoint and comfort readings toward what the person chose.",
         { step: "0.05" })}

@@ -122,7 +122,7 @@ cools a unit or turns it off, apart from leak protection:
 | **cool** | the default while a section is running | COOL | LOW | base + offset |
 | **boost** | the quorum says too warm, or you pressed **too hot** | COOL | MEDIUM | base + offset − 2°C |
 | **rest** | the quorum says too cold, you pressed **too cold**, cooling is blocked, or the section started with the room cold and the forecast cooler | OFF | — | — |
-| **user_off** | a person turned the unit off | OFF | — | — |
+| **user_off** | a person turned the unit off; it stays off until someone turns it on or presses **too hot**, or the room gets too warm | OFF | — | — |
 | **manual** | a person chose another mode or fan | theirs | theirs | theirs |
 | **config_off** | the section's scene forces the unit off | OFF | — | — |
 | **leak** | leak detected (latched) | OFF | — | — |
@@ -133,7 +133,10 @@ what a person chose since. The **offset** moves in whole steps within a section:
 section change. Commands are sent only on transitions, clamped to the unit's own
 range, and never re-sent every heartbeat. A unit stays in a state for at least
 one heartbeat (two when resting), and a person's turn-on holds it in **cool**
-for 30 minutes. **user_off** and **manual** last until the section changes. A
+for 30 minutes. **manual** lasts until the section changes. **user_off** lasts
+past section changes: it ends when someone turns the unit on or presses **too
+hot**, or when the room reaches a too-warm quorum (then **cool** at the base,
+logged with why; `system.control.user_off_wakes_on_warm` turns that off). A
 rest or boost you forced with a press (or a setpoint change on the remote) ends
 by the same rules, but returns to **cool** at the new base, without the offset
 step; until it does, further presses are ignored. A section starts in **rest**

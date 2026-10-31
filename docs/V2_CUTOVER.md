@@ -213,14 +213,15 @@ back to cool at 23.
 
 Optional: turn the unit off on the remote. `ac_state` becomes `user_off` straight
 away, a *reactive* "turned main_room_ac off" appears within 2 minutes, and
-maintenance leaves the unit off until 20:30 (Night). Turn it back on to see `cool`,
-`ac_unblocked` on, and a grace period of 30 minutes.
+the unit stays off, through 20:30 (Night) too, until you turn it on, press too hot,
+or the room gets too warm (a *control* event "woke from Off (by you)" says why).
+Turn it back on to see `cool`, `ac_unblocked` on, and a grace period of 30 minutes.
 
 ## 8. The first 24 hours
 
 | When | What to check |
 | --- | --- |
-| Every boundary: 20:30 Night, 22:00 Sleep, 05:30 Sunrise, 08:00 Day, 14:00 Afternoon, 16:00 Sunset | A *crossover* event per room. `ac_offset_*` back to 0, `user_off` and `manual` units back in `cool` (or `rest`, `config_off`). The scene trace has no errors |
+| Every boundary: 20:30 Night, 22:00 Sleep, 05:30 Sunrise, 08:00 Day, 14:00 Afternoon, 16:00 Sunset | A *crossover* event per room. `ac_offset_*` back to 0, `manual` units back in `cool` (or `rest`, `config_off`); `user_off` units stay off, and the crossover event names them. The scene trace has no errors |
 | Every 10 minutes | Maintenance traces have no template errors |
 | Through the evening and night | Boosts end within 60 minutes or when the room settles, then another may start a degree lower. Rests wake when the room warms back to comfort. No unit flips state more often than every 10 to 20 minutes |
 | Any time | `ac_state` becomes `manual` or `user_off` only when someone actually touched that unit. If it changes with nobody touching it, note the time and open the manual-change trace at that time (`kind`, `ours`): a late echo of our own command got through |

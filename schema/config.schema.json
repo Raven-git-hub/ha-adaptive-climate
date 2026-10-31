@@ -94,6 +94,10 @@
             "person_step_degrees": {
               "type": "number", "minimum": 0, "maximum": 5, "default": 1.0,
               "description": "A person's vote moves each sensor's comfort reading toward its reading plus this (too cold) or minus it (too hot), at learning.reaction_rate."
+            },
+            "user_off_wakes_on_warm": {
+              "type": "boolean", "default": true,
+              "description": "A unit a person turned off stays off across section changes until a person turns it on or votes too hot. With this on, a too-warm quorum (the room's sensors past the section's warm edges) also wakes it, into cool at its base, once the rest minimum time is met and cooling isn't blocked."
             }
           }
         },

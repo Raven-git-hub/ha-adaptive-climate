@@ -444,7 +444,10 @@ SCENARIOS = [
     # --- nothing to drive / hands off -------------------------------------------
     s("no setpoint: maintenance leaves the unit alone", [step("hot", {"state": "cool"}, None)],
       unit={"since": -m(10)}, ctx={"setpoint_applied": None}),
-    s("user_off is hands off", [step("hot", {"state": "user_off"}, None)],
+    s("a person's off stays off without a too-warm quorum", [
+        step("settled_warm", {"state": "user_off"}, None),
+        step("cold", {"state": "user_off"}, None, at=m(10)),
+        step("dead", {"state": "user_off"}, None, at=m(20))],
       unit={"state": "user_off", "since": -m(30)}),
     s("manual is hands off", [step("cold", {"state": "manual"}, None)],
       unit={"state": "manual", "since": -m(30)}),
@@ -472,8 +475,6 @@ SCENARIOS = [
     s("section change with the leak latched re-sends off", [
         section({"state": "leak"}, OFF)],
       unit={"state": "leak"}, ctx={"leak_on": True}),
-    s("section change ends user_off", [section({"state": "cool"}, cmd("cool", "low", 22.0))],
-      unit={"state": "user_off"}),
     s("section change ends manual", [section({"state": "cool"}, cmd("cool", "low", 22.0))],
       unit={"state": "manual"}),
     s("section change overrides the minimum time", [
@@ -572,6 +573,80 @@ SCENARIOS = [
         person("on", {"state": "leak", "unblocked": False}, setpoint=25.0),
         person("manual", {"state": "leak"})],
       unit={"state": "leak", "since": -m(5)}, ctx={"leak_on": True}),
+
+    # --- a person's off lasts until a person or the room says otherwise ---------------
+    # (decision 139: a section change keeps it; a person's on, a too_hot vote or
+    # a too-warm quorum ends it; a leak or a forced-off section still wins)
+    s("a person's off survives a section change: offset and base reset, since kept, nothing "
+      "sent", [
+        section({"state": "user_off", "offset": 0, "base": 22.0, "since": -m(21),
+                 "unblocked": False, "grace_until": None, "forced": False,
+                 "section_rest": False}, None)],
+      unit={"state": "user_off", "offset": 1, "base": 24.0, "since": -m(21), "unblocked": True}),
+    s("a person's off lasts past the section change until the room is too warm: then cool at "
+      "the base, offset 0", [
+        section({"state": "user_off", "base": 22.0, "offset": 0}, None),
+        step("settled_warm", {"state": "user_off"}, None, at=m(10)),
+        step("hot", {"state": "cool", "offset": 0, "base": 22.0, "since": m(20)},
+             cmd("cool", "low", 22.0), at=m(20)),
+        step("hot", {"state": "boost"}, cmd("cool", "medium", 20.0), at=m(30))],
+      unit={"state": "user_off", "offset": -1, "since": -m(21)}),
+    s("a too-warm quorum wakes a person's off at its base, dropping the section offset", [
+        step("hot", {"state": "cool", "offset": 0, "base": 24.0, "since": 0, "forced": False},
+             cmd("cool", "low", 24.0))],
+      unit={"state": "user_off", "offset": -2, "base": 24.0, "since": -m(30)}),
+    s("the wake counts against the section's leaned warm edge", [
+        conditions({"warm_edge": 1.6}, comfort=24.0, mean=18.0, max=19.0),
+        step("hot", {"state": "user_off"}, None),
+        conditions({"warm_edge": 0.4}, comfort=24.0, mean=30.0, max=31.0),
+        step("near", {"state": "cool", "offset": 0}, cmd("cool", "low", 22.0), at=m(10))],
+      unit={"state": "user_off", "since": -m(30)}),
+    s("a too-warm quorum doesn't wake a person's off before the rest minimum time", [
+        step("hot", {"state": "user_off"}, None),
+        step("hot", {"state": "cool", "since": m(5)}, cmd("cool", "low", 22.0), at=m(5))],
+      unit={"state": "user_off", "since": -m(10)}),
+    s("a too-warm quorum doesn't wake a person's off while cooling is blocked", [
+        step("very_hot", {"state": "user_off"}, None)],
+      unit={"state": "user_off", "since": -m(30)}, ctx={"blocked": True}),
+    s("a person's off that a person unblocked wakes while cooling is blocked", [
+        step("hot", {"state": "cool", "unblocked": True}, cmd("cool", "low", 22.0))],
+      unit={"state": "user_off", "unblocked": True, "since": -m(30)}, ctx={"blocked": True}),
+    s("no seed: a too-warm quorum leaves a person's off alone", [
+        step("hot", {"state": "user_off"}, None)],
+      unit={"state": "user_off", "since": -m(30)}, ctx={"setpoint_applied": None}),
+    s("user_off_wakes_on_warm false: a person's off waits for a person, however warm the room", [
+        section({"state": "user_off"}, None),
+        step("very_hot", {"state": "user_off"}, None, at=m(20)),
+        step("very_hot", {"state": "user_off"}, None, at=m(30)),
+        press("too_hot", {"state": "boost", "forced": True, "base": 21.0},
+              cmd("cool", "medium", 19.0), at=m(35))],
+      unit={"state": "user_off", "since": -m(30)},
+      ctx={"control": {"user_off_wakes_on_warm": False}}),
+    s("a person's on ends a person's off kept through a section change", [
+        section({"state": "user_off"}, None),
+        person("on", {"state": "cool", "base": 23.0, "offset": 0, "unblocked": True,
+                      "since": m(5), "grace_until": m(35)}, setpoint=23.0, at=m(5))],
+      unit={"state": "user_off", "since": -m(21)}),
+    s("a too_hot vote ends a person's off kept through a section change: a forced boost", [
+        section({"state": "user_off"}, None),
+        press("too_hot", {"state": "boost", "forced": True, "base": 21.0, "offset": 0,
+                          "since": m(5)}, cmd("cool", "medium", 19.0), at=m(5))],
+      unit={"state": "user_off", "since": -m(21)}),
+    s("a leak during a person's off: the leak wins, and its release starts the unit as at a "
+      "section change", [
+        step("cold", {"state": "leak", "since": m(5)}, OFF, at=m(5), ctx={"leak_on": True}),
+        step("hot", {"state": "leak"}, None, at=m(15), ctx={"leak_on": True}),
+        step("settled_warm", {"state": "cool", "offset": 0, "base": 22.0, "since": m(25)},
+             cmd("cool", "low", 22.0), at=m(25))],
+      unit={"state": "user_off", "since": -m(21)}),
+    s("a section change with the leak latched takes a person's off into leak", [
+        section({"state": "leak"}, OFF)],
+      unit={"state": "user_off", "since": -m(21)}, ctx={"leak_on": True}),
+    s("a forced-off section takes a person's off into config_off; the next section starts it as "
+      "usual", [
+        section({"state": "config_off"}, OFF, forced_off=True),
+        section({"state": "cool"}, cmd("cool", "low", 22.0), at=m(10))],
+      unit={"state": "user_off", "since": -m(21)}),
 
     # --- a person's vote: the too_cold / too_hot buttons -----------------------------
     s("too_cold while cooling: a forced rest, then cool at base+1 with no extra offset", [
@@ -951,6 +1026,7 @@ _PERSON_VOTE = control.on_person_vote
 _COMFORT_POINT = control.comfort_point
 _SECTION_CONDITIONS = control.section_conditions
 _SECTION_START = control.section_start
+_GO = control._go
 
 
 def _mutants() -> list[tuple[str, dict, list[str]]]:
@@ -959,7 +1035,7 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
 
     def leak_waits(unit, votes, now, ctx):       # leak queued behind hands-off, grace, min time
         if ctx.leak_on and unit.state != "leak" and (
-                unit.state in c.HANDS_OFF or c.in_grace(unit, now)
+                unit.state in (*c.HANDS_OFF, "user_off") or c.in_grace(unit, now)
                 or not c.min_time_met(unit, now, ctx.config.cool_min_heartbeats,
                                       ctx.heartbeat_interval)):
             return None
@@ -976,10 +1052,77 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
         return unit, (c.command_for(unit.state, base, unit.offset, ctx)
                       if base is not None else None)
 
+    def wakes(config=True, warm=True, block=True, min_time=True):
+        """control.user_off_wakes with one of its conditions taken out."""
+        def rule(unit, votes, now, ctx):
+            cfg = ctx.config
+            return ((not config or cfg.user_off_wakes_on_warm) and votes.met
+                    and (not warm or votes.direction == c.TOO_WARM)
+                    and (not block or not c.effective_blocked(unit, ctx))
+                    and (not min_time or c.min_time_met(unit, now, cfg.rest_min_heartbeats,
+                                                        ctx.heartbeat_interval)))
+        return rule
+
+    def section_change_then(fix):                # the scene, then `fix` on a kept user_off
+        def rule(unit, ctx, forced_off, now, votes):
+            new, command = _SECTION_CHANGE(unit, ctx, forced_off, now, votes)
+            return fix(new, command, now) if new.state == "user_off" else (new, command)
+        return rule
+
+    def kept_first(unit, ctx, forced_off, now, votes):   # a person's off ahead of leak, config_off
+        if unit.state == "user_off":
+            return dataclasses.replace(unit, offset=0, base=ctx.setpoint_applied, unblocked=False,
+                                       grace_until=None, forced=False, section_rest=False), None
+        return _SECTION_CHANGE(unit, ctx, forced_off, now, votes)
+
+    kept = ["a person's off survives a section change: offset and base reset, since kept, "
+            "nothing sent"]
+    woke = ["a person's off lasts past the section change until the room is too warm: then cool "
+            "at the base, offset 0",
+            "a too-warm quorum wakes a person's off at its base, dropping the section offset",
+            "the wake counts against the section's leaned warm edge",
+            "a too-warm quorum doesn't wake a person's off before the rest minimum time",
+            "a person's off that a person unblocked wakes while cooling is blocked"]
+
     return [
+        ("a person's off survives a section change", {"keeps_user_off": lambda unit: False},
+         kept + [woke[0],
+                 "user_off_wakes_on_warm false: a person's off waits for a person, however warm "
+                 "the room",
+                 "a person's on ends a person's off kept through a section change",
+                 "a too_hot vote ends a person's off kept through a section change: a forced "
+                 "boost"]),
+        ("a kept person's off keeps its since (since = now instead)",
+         {"on_section_change": section_change_then(
+             lambda new, command, now: (dataclasses.replace(new, since=now), command))}, kept),
+        ("a kept person's off is sent nothing (off re-sent instead)",
+         {"on_section_change": section_change_then(
+             lambda new, command, now: (new, c.Command("off")))}, kept),
+        ("a leak and a forced-off section beat a kept person's off",
+         {"on_section_change": kept_first},
+         ["a section change with the leak latched takes a person's off into leak",
+          "a forced-off section takes a person's off into config_off; the next section starts it "
+          "as usual"]),
+        ("a too-warm quorum wakes a person's off", {"user_off_wakes": lambda *a: False}, woke),
+        ("the wake is system.control.user_off_wakes_on_warm's (always on instead)",
+         {"user_off_wakes": wakes(config=False)},
+         ["user_off_wakes_on_warm false: a person's off waits for a person, however warm the "
+          "room"]),
+        ("only a too-warm quorum wakes a person's off (any quorum instead)",
+         {"user_off_wakes": wakes(warm=False)},
+         ["a person's off stays off without a too-warm quorum"]),
+        ("the wake waits out the rest minimum time", {"user_off_wakes": wakes(min_time=False)},
+         ["a too-warm quorum doesn't wake a person's off before the rest minimum time"]),
+        ("a block holds a person's off", {"user_off_wakes": wakes(block=False)},
+         ["a too-warm quorum doesn't wake a person's off while cooling is blocked"]),
+        ("the wake cools at the base, offset 0 (the offset kept instead)",
+         {"_go": lambda unit, state, now, ctx, offset=None: _GO(
+             unit, state, now, ctx, None if unit.state == "user_off" else offset)},
+         ["a too-warm quorum wakes a person's off at its base, dropping the section offset"]),
         ("minimum time", {"min_time_met": lambda unit, now, n, interval: True},
          ["cool: minimum time not met", "cool: 4:59 is short of half a heartbeat",
-          "rest: 14:50 is short of 1.5 heartbeats"]),
+          "rest: 14:50 is short of 1.5 heartbeats",
+          "a too-warm quorum doesn't wake a person's off before the rest minimum time"]),
         ("half-heartbeat jitter tolerance",
          {"min_time_met": lambda unit, now, n, interval:
           unit.since is None or now - unit.since >= timedelta(minutes=n * interval)},
@@ -990,9 +1133,11 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
         ("cooling block", {"effective_blocked": lambda unit, ctx: False},
          ["blocked: cool rests with no votes at all",
           "blocked: too-warm votes are ignored (rest, not boost)",
-          "blocked: a rest doesn't wake", "blocked: a boost goes to rest"]),
+          "blocked: a rest doesn't wake", "blocked: a boost goes to rest",
+          "a too-warm quorum doesn't wake a person's off while cooling is blocked"]),
         ("per-unit unblock", {"effective_blocked": lambda unit, ctx: c.room_blocked(ctx)},
          ["unblocked by a person's on, for that unit",
+          "a person's off that a person unblocked wakes while cooling is blocked",
           "block active: a too_hot vote unblocks the unit, so its boost isn't rested",
           "heat source: a too_hot vote unblocks against it"]),
         ("the lean caps", {"lean_edges": lambda lean: (-1.0, 1.0) if lean is None
@@ -1004,7 +1149,8 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
          ["lean table: delta -6 (hot outside) cools early, rests late",
           "lean table: delta +6 (cool outside) rests early, cools late",
           "lean: delta +6 rests on readings half a band cold",
-          "lean: delta -6 boosts on readings half a band warm"]),
+          "lean: delta -6 boosts on readings half a band warm",
+          "the wake counts against the section's leaned warm edge"]),
         ("the block's hysteresis",
          {"decide_block": lambda delta_max, margin, was_blocked:
           delta_max is not None and delta_max >= margin},
@@ -1056,7 +1202,9 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
          ["clamp: the baby room's boost floors at 18", "clamp: a wake at 29 + 3 tops out at 30",
           "section change clamps to the baby room's 18"]),
         ("leak first", {"_leak_step": leak_waits},
-         ["leak overrides the minimum time and grace", "leak overrides a person's off"]),
+         ["leak overrides the minimum time and grace", "leak overrides a person's off",
+          "a leak during a person's off: the leak wins, and its release starts the unit as at a "
+          "section change"]),
         ("commands only on transitions", {"_stay": resend},
          ["cool stays cool without votes, and sends nothing",
           "boost holds while still too warm, and sends nothing",
@@ -1066,7 +1214,8 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
           "mixed votes resolved by trust: boost, not rest"]),
         ("no-setpoint no-op",
          {"target_base": lambda unit, ctx: unit.base or ctx.setpoint_applied or 0.0},
-         ["no setpoint: maintenance leaves the unit alone"]),
+         ["no setpoint: maintenance leaves the unit alone",
+          "no seed: a too-warm quorum leaves a person's off alone"]),
         ("release counts against at least one",
          {"released": lambda side_count, required: side_count < required},
          ["no usable sensor: a rest wakes", "no usable sensor: a boost releases"]),

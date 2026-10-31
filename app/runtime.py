@@ -101,8 +101,9 @@ from app import control, outdoor
 from app.analyser import (LearningConfig, MarginConfig, MarginStep, analyse_room,
                           is_setpoint_moving, learn_margin)
 from app.config import ConfigError, validate
-from app.generator import (PERSON_VOTE_EVENT, almanac_id, base_id, conditions_id, guard_id,
-                           offset_id, scene_automation_id, scene_select_id, state_id)
+from app.generator import (PERSON_VOTE_EVENT, USER_OFF_WAKE_EVENT, almanac_id, base_id,
+                           conditions_id, forced_off_sections, guard_id, leak_id, offset_id,
+                           scene_automation_id, scene_select_id, state_id)
 from app.ha import HATimeoutError
 from app.scheduler import active_section_at, section_window
 from app.store import ReactiveUnitSample, UnitSample
@@ -607,6 +608,7 @@ class Runtime:
     async def _subscribe(self) -> None:
         await self.ws.subscribe_states(self._on_state_change)
         await self.ws.subscribe_events(PERSON_VOTE_EVENT, self._on_person_vote)
+        await self.ws.subscribe_events(USER_OFF_WAKE_EVENT, self._on_user_off_wake)
         await self.ws.subscribe_events(HA_START_EVENT, self._on_ha_start)
 
     async def _resubscribe(self) -> None:
@@ -733,6 +735,32 @@ class Runtime:
         task = asyncio.create_task(self._record_vote(event))
         self._followups.add(task)
         task.add_done_callback(self._followups.discard)
+
+    def _on_user_off_wake(self, event: dict) -> None:
+        """An ac_user_off_wake event: HA's maintenance woke a unit a person
+        had turned off, because the room reached a too-warm quorum
+        (control.user_off_wakes). Logged as a control event saying why; it is
+        the system's doing, so no reaction is recorded."""
+        data = event.get("data") or {}
+        ts, ts_utc, _, _ = self._now()
+        rs = self.rooms.get(data.get("room"))
+        unit = next((u for u in rs.room["units"] if u["id"] == data.get("unit")), None) \
+            if rs is not None else None
+        if unit is None:
+            self.store.log_event(ts, ts_utc, "warning", "control",
+                                 "a wake event this config can't place: room "
+                                 f"{data.get('room')!r}, unit {data.get('unit')!r}", detail=data)
+            return
+        setpoint, edge = _number(data.get("setpoint"), None), _number(data.get("warm_edge"), None)
+        tally, required = data.get("tally"), data.get("required")
+        cools = f" and cools at {setpoint:g}°" if setpoint is not None else ""
+        past = f", past the warm edge {edge:+.2f}" if edge is not None else ""
+        self.store.log_event(
+            ts, ts_utc, "info", "control",
+            f"{rs.room.get('name', rs.room['id'])}: {unit.get('name', unit['id'])} woke from "
+            f"Off (by you){cools}: the room is too warm, quorum met: {tally} vote(s) "
+            f"({required} needed){past}", room_id=rs.room["id"],
+            detail={**data, "from": "user_off", "to": "cool"})
 
     async def _record_vote(self, event: dict) -> None:
         """Record an accepted vote as a reaction (too_cold / too_hot, every
@@ -1172,11 +1200,30 @@ class Runtime:
                 else "no comfort point, so no cold start: fail open"
                 if cond.fail_open == control.NO_COMFORT_POINT
                 else "no outdoor value, so no cold start: fail open"}[why]
+        off = self._kept_off(room, section)
+        if off:
+            names = ", ".join(u.get("name", u["id"]) for u in off)
+            it, stays = ("it", "stays") if len(off) == 1 else ("them", "stay")
+            warm = ", or the room is too warm" \
+                if control.ControlConfig.from_config(self.config).user_off_wakes_on_warm else ""
+            reason += (f"; {names} {stays} off, as a person turned {it} off, until someone "
+                       f"turns {it} on or votes too hot{warm}")
         return f": starts in {state}: {reason}", {
             "section": section, "start": state, "why": why, "cold_side": votes.cold_side,
             "usable": usable, "needed": need, "delta_mean": cond.delta_mean,
             "comfort_point": cond.comfort_point, "outdoor_mean": cond.outdoor_mean,
-            "heat_sources_on": heat}
+            "heat_sources_on": heat, "user_off": [u["id"] for u in off]}
+
+    def _kept_off(self, room: dict, section: str) -> list[dict]:
+        """The units a person's off keeps off through this section change
+        (control.keeps_user_off): in user_off, with no leak latched and not
+        forced off by the section's scene, which still win. Read whether or
+        not the scene has run yet: it leaves such a unit in user_off."""
+        r = room["id"]
+        return [u for u in room["units"]
+                if self._cache.get(state_id(r, u["id"])) == "user_off"
+                and self._cache.get(leak_id(r, u["id"])) != "on"
+                and section not in forced_off_sections(room, u)]
 
     # ---- outdoor and conditions -----------------------------------
 

@@ -94,8 +94,9 @@ and "believe this sensor more".
 Light nudged one number. Each climate unit has a state, kept in Home Assistant
 helpers so it survives container downtime (v2, phase 3; `docs/V2_DESIGN.md`,
 Control): `cool` (cool, fan low, base + offset), `boost` (cool, fan medium,
-base + offset − the boost step), `rest` (off, waiting), `user_off` and `manual`
-(a person turned it off or chose another mode or fan; hands off until the
+base + offset − the boost step), `rest` (off, waiting), `user_off` (a person
+turned it off; off until a person turns it on or votes too hot, or the room is
+too warm), `manual` (a person chose another mode or fan; hands off until the
 section changes), `config_off` (the section's scene forces it off) and `leak`
 (off, latched). The system only ever cools a unit or turns it off: v1's
 Warming state (fan_only) is gone, and leak protection turns the unit off

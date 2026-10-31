@@ -346,7 +346,7 @@ async def main() -> int:
           "(NULL where a room has none yet) - OK")
 
     # --- a person's vote: a setpoint change on the remote ---
-    subscriptions = {"state_changed", "ac_person_vote", "homeassistant_start"}
+    subscriptions = {"state_changed", "ac_person_vote", "ac_user_off_wake", "homeassistant_start"}
     assert set(ws.subscribed) == subscriptions, ws.subscribed
     ws.subscribed.clear()                         # a dropped socket loses them all
     await rt._resubscribe()
@@ -370,8 +370,8 @@ async def main() -> int:
     assert rx == 1, rx
     assert rxs == 3, rxs   # all sensors snapshotted at reaction time
     assert last_reaction(c, "main_room") == ("too_cold", "too_cold", None, None, None, 24.0, 1)
-    print("vote: subscribed to ac_person_vote and homeassistant_start as well as "
-          "state_changed, all again after a reconnect - OK")
+    print("vote: subscribed to ac_person_vote, ac_user_off_wake and homeassistant_start as "
+          "well as state_changed, all again after a reconnect - OK")
     print("vote: a remote's setpoint change opens no window of the runtime's own; HA's event for "
           "it is one too_cold reaction (unit, chosen 24), hold not raised, 3 sensors "
           "snapshotted - OK")
@@ -1467,6 +1467,7 @@ async def check_conditions() -> None:
         block_events()[-1]
     # --- margin: a person's on in a blocked run ---
     await person(rt, 3, 22, 30, "off", "cool", state="user_off")
+    helper["state"] = "cool"         # as HA's manual-change automation writes it after an on
     assert round(rt.margin("main_room"), 6) == 6.55, rt.margin("main_room")     # 6.7 + (6.4 - 6.7) / 2
     assert "a unit turned on in Sleep 2026-08-03" in block_events()[-1], block_events()[-1]
     await cross(rt, "sunrise", 4, 5, 30)
@@ -1579,6 +1580,53 @@ async def check_conditions() -> None:
         == "error"
     print("fail open: a failing forecast leaves Day with edges -1/+1 and no block (active "
           "mode), one outdoor warning for the streak and one block event - OK")
+
+    # --- a person's off survives the section change, and the crossover says so ---
+    helper["state"] = rt._cache[helper["entity_id"]] = "user_off"     # a person turned it off
+    kept = "; Main Room AC stays off, as a person turned it off, until someone turns it on " \
+           "or votes too hot"
+    await cross(rt, "afternoon", 5, 14)
+    x = crossovers()[-1]
+    assert x["message"].startswith("Main Room -> afternoon: starts in ") and \
+        x["message"].endswith(kept + ", or the room is too warm"), x["message"]
+    assert x["detail"]["user_off"] == ["main_room_ac"], x["detail"]
+    config["system"]["control"]["user_off_wakes_on_warm"] = False
+    await cross(rt, "sunset", 5, 16)
+    assert crossovers()[-1]["message"].endswith(kept), crossovers()[-1]["message"]
+    config["system"]["control"]["user_off_wakes_on_warm"] = True
+    leak = {"entity_id": "input_boolean.ac_leak_main_room_main_room_ac", "state": "on",
+            "attributes": {}}
+    states.append(leak)                                  # a latched leak still wins
+    await cross(rt, "night", 5, 20, 30)
+    assert "stays off" not in crossovers()[-1]["message"] and \
+        crossovers()[-1]["detail"]["user_off"] == [], crossovers()[-1]
+    states.remove(leak)
+    print("section start: a unit a person turned off stays off through the crossover, and its "
+          "event says so and until when (\"or the room is too warm\" only with "
+          "user_off_wakes_on_warm); a latched leak isn't named - OK")
+
+    # --- a too-warm quorum woke it: HA's event, logged as a control event ---
+    at(5, 21, 0)
+    rt.ws.subscribed["ac_user_off_wake"]({
+        "event_type": "ac_user_off_wake",
+        "data": {"room": "main_room", "unit": "main_room_ac", "why": "too_warm",
+                 "setpoint": 23.0, "tally": 2, "required": 2, "warm_side": 3,
+                 "warm_edge": 0.43},
+        "context": {"id": "c3", "parent_id": "the maintenance run", "user_id": None}})
+    rt.ws.subscribed["ac_user_off_wake"]({"event_type": "ac_user_off_wake",
+                                          "data": {"room": "attic", "unit": "attic_ac"}})
+    wake, unknown = store.recent_events(limit=2, category="control")[::-1]
+    assert (wake["severity"], wake["room_id"], wake["message"]) == (
+        "info", "main_room", "Main Room: Main Room AC woke from Off (by you) and cools at 23°: "
+        "the room is too warm, quorum met: 2 vote(s) (2 needed), past the warm edge +0.43"), wake
+    assert (wake["detail"]["from"], wake["detail"]["to"], wake["detail"]["tally"]) == \
+        ("user_off", "cool", 2), wake["detail"]
+    assert unknown["severity"] == "warning" and "can't place" in unknown["message"], unknown
+    assert c.execute("SELECT COUNT(*) FROM reactive WHERE ts >= ?",
+                     (at(5, 21, 0).isoformat(timespec="seconds"),)).fetchone()[0] == 0
+    print("wake: HA's ac_user_off_wake is logged as a control event saying why the unit woke "
+          "(too warm, 2 votes of 2 needed, past the warm edge +0.43; cooling at 23) and records "
+          "no reaction; one for a room this config hasn't is a warning - OK")
     await rt.stop()
     store.close()
 

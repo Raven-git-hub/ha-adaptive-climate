@@ -543,7 +543,7 @@ def _event_says(pv: control.PersonVote | None) -> dict | None:
 class Replay:
     def __init__(self) -> None:
         self.steps = self.runs = self.echoes = self.kinds = self.ours = self.twice = 0
-        self.events = self.ignored = 0
+        self.events = self.ignored = self.wakes = 0
         self.last_vars: dict | None = None
         self.first_rendered: dict | None = None
 
@@ -643,7 +643,8 @@ class Replay:
                 if diff:
                     return new, f"{automation['id']}: {diff}"
             diff = self.compare(ha, g.build_maintenance_automation(config, room), None,
-                                overrides, units, new, commands, now)
+                                overrides, units, new, commands, now,
+                                wakes=self.wakes_for(st, units, new, commands, now, ctx))
             return new, diff and f"maintenance: {diff}"
 
         if do == "section_change":
@@ -689,15 +690,30 @@ class Replay:
             diff = "no trigger fired, but control changed the unit"
         return new, diff and f"manual change: {diff}"
 
+    @staticmethod
+    def wakes_for(st: dict, olds: dict, news: dict, commands: dict, now: datetime,
+                  ctx: control.Context) -> list[dict]:
+        """The ac_user_off_wake events a heartbeat must fire: one per unit
+        control woke from user_off into cool, with control's votes, the
+        setpoint it now cools at, and the warm edge the templates read
+        (the step's published edges, or +1 with no conditions entity)."""
+        v = table._votes(st, now, ctx.sensor_stale_minutes)
+        warm_edge = (st.get("edges") or (-1.0, 1.0))[1]
+        return [{"room": ROOM, "unit": uid, "why": control.TOO_WARM,
+                 "setpoint": commands[uid].temperature, "tally": v.tally,
+                 "required": v.required, "warm_side": v.warm_side, "warm_edge": warm_edge}
+                for uid in olds if olds[uid].state == "user_off" and news[uid].state == "cool"]
+
     def compare(self, ha: HA, automation: dict, trigger, overrides: dict, olds: dict,
                 news: dict, commands: dict, now: datetime, echo: bool = True,
-                only: list[str] | None = None, pv: control.PersonVote | None = None
-                ) -> str | None:
+                only: list[str] | None = None, pv: control.PersonVote | None = None,
+                wakes: list[dict] | None = None) -> str | None:
         """Run one automation - once per trigger, if given a list of the
         triggers that fired - and every unit's helpers and command must be
         control's, with nothing written or sent without a change, any
-        ac_person_vote event control's vote, and a run that goes on at most
-        once per change."""
+        ac_person_vote event control's vote, ac_user_off_wake events exactly
+        `wakes` (none unless given), and a run that goes on at most once per
+        change."""
         befores = {uid: ha.climate_of(entity_of(uid)) for uid in olds}
         ha.calls, ha.events = [], []
         self.first_rendered = None
@@ -735,6 +751,10 @@ class Replay:
         diff = self.check_event(ha, olds, pv)
         if diff:
             return diff
+        woke = [data for kind, data in ha.events if kind == g.USER_OFF_WAKE_EVENT]
+        if woke != (wakes or []):
+            return f"wake events {woke}, control {wakes or []}"
+        self.wakes += len(woke)
         if echo:
             for uid in uids:
                 if _sent(ha.calls, entity_of(uid)) is not None:
@@ -1167,7 +1187,8 @@ def main() -> int:
           f"{replay.kinds} changes' kind and is-this-ours checked, {replay.ours} of them ours, "
           f"{replay.twice} firing two triggers, run once; {replay.events} vote events, "
           f"{replay.ignored} of them ignored, each accepted exactly when control.in_episode "
-          f"found no forced state)")
+          f"found no forced state; {replay.wakes} wake events, each exactly a user_off "
+          f"control woke)")
     fuzz = _fuzz_votes(40)
     print("other cases:")
     extra = _extra_cases()

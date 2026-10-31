@@ -95,6 +95,7 @@ def case_settings() -> dict:
         "system.control.boost_max_minutes": "default 60 · 1 to 240",
         "system.control.cool_min_heartbeats": "default 1 · 0 to 12",
         "system.control.rest_min_heartbeats": "default 2 · 0 to 12",
+        "system.control.user_off_wakes_on_warm": "default on",
         "learning.reaction_rate": "default 0.5 · 0 (above) to 1",
     }
     actions = [["wait", '[data-panel="outdoor"]']]
@@ -117,6 +118,9 @@ def case_settings() -> dict:
         ["value", f"{MARGIN} input", "1"],
         ["text", f"{MARGIN} .readout", "(margin −1: comfort + 1° or below)"],
         ["value", f"{STEP} input", "1.5"],
+        ["count", "#f-system-control-user_off_wakes_on_warm:checked", 1],
+        ["text", '[data-setting="system.control.user_off_wakes_on_warm"] .setting-input',
+         "wake it when the room is too warm"],
         ["shot", "config-settings", '[data-panel="outdoor"]', '[data-panel="control"]'],
         ["open", WEATHER],
         ["shot", "config-weather", '[data-setting="outdoor.source"]',
