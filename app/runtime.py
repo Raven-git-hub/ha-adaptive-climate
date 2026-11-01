@@ -112,7 +112,8 @@ from app.analyser import (LearningConfig, MarginConfig, MarginStep, analyse_room
                           is_setpoint_moving, learn_margin)
 from app.config import ConfigError, validate
 from app.generator import (BLOCK_OVERRULED_EVENT, PERSON_VOTE_EVENT, USER_OFF_WAKE_EVENT,
-                           almanac_id, base_id, conditions_id, forced_off_sections, guard_id,
+                           almanac_id, base_id, chosen_id, conditions_id, forced_id,
+                           forced_off_sections, guard_id,
                            leak_id, offset_id, scene_automation_id, scene_select_id, state_id,
                            unblocked_id)
 from app.ha import HATimeoutError
@@ -317,6 +318,7 @@ class Runtime:
         self._forecast_failed_at: datetime | None = None     # the last failed attempt
         self._forecast_failing = False                       # in a failure streak, as last logged
         self._margins: dict[str, float] = {}                 # room -> the replay's block margin
+        self._margin_skips: dict[str, set] = {}              # room -> skipped steps already seen
         self.last_votes: dict[str, dict] = {}                # room -> HA's latest ac_person_vote
         self._vote_seq = 0                                   # counts them, for the vote endpoint
         self._stopping = False
@@ -945,7 +947,9 @@ class Runtime:
         applied = ((section.get("units") or {}).get(unit_id) or {}).get("setpoint_applied")
         unit = control.Unit(state=state, offset=int(_number(self._cache.get(
             offset_id(room_id, unit_id)))), base=_number(self._cache.get(
-                base_id(room_id, unit_id))) or None)
+                base_id(room_id, unit_id))) or None,
+            forced=self._cache.get(forced_id(room_id, unit_id)) == "on",
+            chosen=self._cache.get(chosen_id(room_id, unit_id)) == "on")
         ctx = control.Context(
             setpoint_applied=applied,
             unit_min=attrs.get("min_temp") or control.DEFAULT_MIN_TEMP,
@@ -1708,11 +1712,30 @@ class Runtime:
                              f"{len(sections)} section(s)", room_id=room_id,
                              detail={"reason": reason,
                                      "sections": [s.section for s in sections]})
-        if previous is not None and steps and abs(margin - previous) > 1e-9:
-            self._note_margin(rs, steps[-1])
+        taught = [st for st in steps if not st.skipped]
+        if previous is not None and taught and abs(margin - previous) > 1e-9:
+            self._note_margin(rs, taught[-1])
+        # A run that has taught once teaches no more (decision 144): each
+        # event it skips is logged once, the first replay that finds it (not
+        # at startup, which replays history already logged).
+        skips = {(st.at, st.kind) for st in steps if st.skipped}
+        seen = self._margin_skips.get(room_id)
+        self._margin_skips[room_id] = skips
+        if seen is not None:
+            for st in steps:
+                if st.skipped and (st.at, st.kind) not in seen:
+                    self._note_margin(rs, st)
+
+    @staticmethod
+    def _margin_what(step: MarginStep) -> str:
+        return {"overruled": "the room's overrule", "too_hot": "a too_hot vote",
+                "on": "a unit turned on", "too_cold": "a too_cold vote",
+                "off": "a unit turned off"}.get(step.kind, step.kind)
 
     def _note_margin(self, rs: RoomState, step: MarginStep) -> None:
-        """A `block` event when a reaction moves the room's margin."""
+        """A `block` event when a reaction moves the room's margin, or when
+        one that would have is skipped because its section run has already
+        taught the margin once (decision 144)."""
         name = rs.room.get("name", rs.room["id"])
         sec = self._section_name(rs, step.section)
         if step.kind == "overruled":
@@ -1721,25 +1744,30 @@ class Runtime:
                    f"the block in {sec} {step.local_date} would have been overruled (shadow)")
         elif step.blocked:
             was = "blocked" if step.block_mode == "active" else "would have been blocked (shadow)"
-            why = (f"a {'too_hot vote' if step.kind == 'too_hot' else 'unit turned on'} in "
-                   f"{sec} {step.local_date}, which {was}")
+            why = f"{self._margin_what(step)} in {sec} {step.local_date}, which {was}"
         else:
             minutes = int((step.at - step.cooling_since).total_seconds() // 60)
-            why = (f"a {'too_cold vote' if step.kind == 'too_cold' else 'unit turned off'} "
-                   f"{minutes} min after cooling started in {sec} {step.local_date}, unblocked")
+            why = (f"{self._margin_what(step)} {minutes} min after cooling started in {sec} "
+                   f"{step.local_date}, unblocked")
         ts, ts_utc, _, _ = self._now()
-        self.store.log_event(
-            ts, ts_utc, "info", "block",
-            f"{name}: block margin {_deg(step.before)} -> {_deg(step.after)}: {why} "
-            f"(delta max {step.delta_max:.1f}, so toward {step.target:.1f})",
-            room_id=rs.room["id"],
-            detail={"margin": {"before": step.before, "after": step.after,
-                               "target": step.target},
-                    "kind": step.kind, "section": step.section, "run_date": step.local_date,
-                    "blocked": step.blocked, "block_mode": step.block_mode,
-                    "delta_max": step.delta_max,
-                    "cooling_since": step.cooling_since.isoformat()
-                    if step.cooling_since else None})
+        detail = {"margin": {"before": step.before, "after": step.after, "target": step.target},
+                  "kind": step.kind, "section": step.section, "run_date": step.local_date,
+                  "blocked": step.blocked, "block_mode": step.block_mode,
+                  "delta_max": step.delta_max,
+                  "cooling_since": step.cooling_since.isoformat()
+                  if step.cooling_since else None}
+        if step.skipped:
+            first = step.first
+            at = first.at.astimezone(self.tz).strftime("%H:%M") if self.tz else first.at
+            message = (f"{name}: block margin stays {_deg(step.after)}: {why}, but the margin "
+                       f"already learned from this section ({self._margin_what(first)} at "
+                       f"{at}), so this teaches nothing")
+            detail.update(skipped=True, first={"kind": first.kind, "at": first.at.isoformat()})
+        else:
+            message = (f"{name}: block margin {_deg(step.before)} -> {_deg(step.after)}: {why} "
+                       f"(delta max {step.delta_max:.1f}, so toward {step.target:.1f})")
+        self.store.log_event(ts, ts_utc, "info", "block", message, room_id=rs.room["id"],
+                             detail=detail)
 
     def _schedule_comfort_replay(self, room_id: str, due: datetime) -> None:
         """Replay the room at `due`, once a reaction's comfort window has

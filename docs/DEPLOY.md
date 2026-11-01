@@ -157,8 +157,9 @@ acts without a learned setpoint); this brought the scene automation in line.
 
 ## Starting values: no `initial`, and new units start hands off
 
-Each unit has eight control helpers (`ac_state`, `ac_base`, `ac_offset`,
-`ac_since`, `ac_grace_until`, `ac_unblocked`, `ac_forced`, `ac_section_rest`), and each room two
+Each unit has nine control helpers (`ac_state`, `ac_base`, `ac_offset`,
+`ac_since`, `ac_grace_until`, `ac_unblocked`, `ac_forced`, `ac_section_rest`,
+`ac_chosen`), and each room two
 vote buttons (`input_button.ac_too_cold_<room>`, `input_button.ac_too_hot_<room>`).
 None is created with an `initial`: in Home Assistant, a helper's `initial` overrides its restored value
 at **every** restart, which would wipe a person's chosen base, a `user_off` or
@@ -175,6 +176,7 @@ starting values of the helpers **it has just created**, and only those:
 | `ac_unblocked_…` | off | HA's default |
 | `ac_forced_…` | off: no forced state | HA's default |
 | `ac_section_rest_…` | off: no section rest | HA's default |
+| `ac_chosen_…` | off: a forced boost takes the boost step | HA's default |
 | `ac_too_cold_<room>`, `ac_too_hot_<room>` | never pressed (`unknown`); the first press counts | HA's default |
 | `ac_offset_…` | 0 | deploy sets it (its minimum is −`offset_cap`) |
 | `ac_since_…` | now, as an epoch timestamp | deploy sets it |
@@ -237,6 +239,11 @@ the current section's scene automation in HA to start a room at once).
   Night: ...") and learns the margin from it, but tells control `blocked` false;
   only heat sources block. It also logs when the room would have overruled such
   a block ("would have been overruled", decision 143), and learns from that too.
+- **A remote's boost at the chosen value needs a deploy** (decision 145): one
+  new helper per unit (`input_boolean.ac_chosen_<room>_<unit>`), and the vote
+  and manual-change automations change (6 for the example config). The
+  margin's once-per-run rule (decision 144) is the container's alone: a
+  rebuild and restart, and its first replay recomputes the margin.
 - **The overrule needs a deploy and a restart** (decision 143). The room
   overruling an active block runs in the maintenance automations (3 change for
   the example config; no helper changes), and the container records it on the

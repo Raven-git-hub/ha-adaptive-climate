@@ -1542,16 +1542,24 @@ async def check_conditions() -> None:
     assert round(rt.margin("main_room"), 6) == 6.225, rt.margin("main_room")   # 6.55 + (5.9 - 6.55) / 2
     assert "a too_cold vote 20 min after cooling started in Day 2026-08-04, unblocked" in \
         block_events()[-1], block_events()[-1]
-    # --- margin: an off 25 min after a wake (dated by the last rest heartbeat) ---
+    # --- margin: an off 25 min after a wake (dated by the last rest heartbeat),
+    # in the same run: already learned from this section (decision 144) ---
     await beat(rt, 4, 8, 25, "rest")
     await beat(rt, 4, 8, 35, "rest")
     await beat(rt, 4, 8, 45, "cool")
+    n = len(block_events())
     await person(rt, 4, 9, 0, "cool", "off")
-    assert round(rt.margin("main_room"), 6) == 6.0625, rt.margin("main_room")  # 6.225 + (5.9 - 6.225) / 2
-    assert "a unit turned off 25 min after cooling started in Day" in block_events()[-1]
+    assert round(rt.margin("main_room"), 6) == 6.225, rt.margin("main_room")
+    assert block_events()[n:] == [
+        "Main Room: block margin stays 6.23: a unit turned off 25 min after cooling started in "
+        "Day 2026-08-04, unblocked, but the margin already learned from this section (a "
+        "too_cold vote at 08:20), so this teaches nothing"], block_events()[n:]
+    await rt.replay_room("main_room", "nightly")
+    assert len(block_events()) == n + 1, "a skipped lesson was logged twice"
     print("margin: in Day (unblocked, delta max 5.9) a too_cold vote 20 min after the scene "
-          "started cooling moves it to 6.225, and an off 25 min after maintenance woke the unit "
-          "(dated by its last rest heartbeat, 08:35) to 6.0625 - OK")
+          "started cooling moves it to 6.225; an off 25 min after maintenance woke the unit "
+          "(dated by its last rest heartbeat, 08:35), in the same run, teaches nothing and is "
+          "logged once, \"already learned from this section\" (decision 144) - OK")
 
     # --- block_mode off: never blocked, and nothing to learn from ---
     config["outdoor"]["block_mode"] = "off"
@@ -1561,7 +1569,7 @@ async def check_conditions() -> None:
                                          "forecast max 17.0"), block_events()[-1]
     n = len(block_events())
     await vote(rt, 4, 14, 10, "too_hot")
-    assert round(rt.margin("main_room"), 6) == 6.0625 and len(block_events()) == n
+    assert round(rt.margin("main_room"), 6) == 6.225 and len(block_events()) == n
     # --- too late: an off 46 min after the scene started cooling ---
     config["outdoor"]["block_mode"] = "shadow"
     await cross(rt, "sunset", 4, 16)
@@ -1569,7 +1577,7 @@ async def check_conditions() -> None:
         await beat(rt, 4, 16, minute, "cool")
     n = len(block_events())
     await person(rt, 4, 16, 46, "cool", "off")
-    assert round(rt.margin("main_room"), 6) == 6.0625 and len(block_events()) == n, block_events()[n:]
+    assert round(rt.margin("main_room"), 6) == 6.225 and len(block_events()) == n, block_events()[n:]
     print("margin: nothing learned from a too_hot vote in Afternoon, decided with block_mode "
           "off (which blocks nothing, at delta max 6.9), nor from an off in Sunset 46 min "
           "after its scene started cooling - OK")
@@ -1579,14 +1587,14 @@ async def check_conditions() -> None:
     await cross(rt, "night", 4, 20, 30)
     night = pushes(rest)[-1][1]
     assert (night["section"], night["blocked"], night["would_block"], night["margin"]) == \
-        ("night", True, True, 6.06), night
+        ("night", True, True, 6.23), night
     assert block_events()[-1].startswith(
-        "Main Room: blocking Night: forecast max 17.0, comfort 23.7, margin 6.06;"), \
+        "Main Room: blocking Night: forecast max 17.0, comfort 23.7, margin 6.23;"), \
         block_events()[-1]
     assert run("2026-08-04", "night")[1:] == (17.0, 23.7, 0.67, 1, "active")
     print("conditions: in active mode Night's block reaches control: blocked = true (the "
           "too_hot vote last night moved Night's comfort point to 23.7: delta max 6.7 >= the "
-          "learned 6.06) - OK")
+          "learned 6.23) - OK")
 
     # --- re-pushed on reconnect, on homeassistant_start and by the almanac timer ---
     count = len(pushes(rest))

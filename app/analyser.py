@@ -67,6 +67,12 @@ forecast max, teaches nothing), moving M at reaction_rate, within -3 to 10
   unblocked  a too_cold vote, or a person turning a unit off, within 30
              minutes of the system starting to cool: toward delta_max
 
+At most once per section run (decision 144): only a run's first event that
+contradicts its decision teaches; any later one in the same run is kept as
+a skipped step ("already learned from this section") and moves nothing, so
+one wrong block (or one wrong unblock) moves M halfway once, not again for
+every press that morning.
+
 The system started cooling a unit at the run's planned start (the scene)
 if every heartbeat since showed it cooling (cool or boost), or when
 maintenance woke it from rest, dated by the last heartbeat that showed it
@@ -502,6 +508,13 @@ class MarginStep:
     before: float
     after: float
     cooling_since: datetime | None = None   # unblocked: when the system started cooling
+    first: MarginStep | None = None         # skipped (decision 144): the run's step that taught;
+                                            # this one moves nothing (before == after)
+
+    @property
+    def skipped(self) -> bool:
+        """Already learned from this section run: logged, teaches nothing."""
+        return self.first is not None
 
 
 @dataclass(frozen=True)
@@ -622,13 +635,16 @@ def _config_off(room: dict, section: str) -> set[str]:
 def learn_margin(conn, room: dict, cfg: MarginConfig,
                  as_of: datetime) -> tuple[float, list[MarginStep]]:
     """Replay the room's block margin as of `as_of`: (M, the steps that
-    moved it). A deterministic replay of the stored section runs, reactions
-    and heartbeats, so it rebuilds from CSV alone."""
+    moved it, with each skipped one: an event that would have taught in a
+    run that had already taught once, decision 144). A deterministic replay
+    of the stored section runs, reactions and heartbeats, so it rebuilds
+    from CSV alone."""
     room_id = room["id"]
     until = _utc(as_of)
     runs = _runs(conn, room_id, until)
     starts = [r.start for r in runs]
     margin, steps = float(cfg.initial), []
+    taught: dict[int, MarginStep] = {}      # run index -> the one step it taught
     for at, kind, units in _margin_events(conn, room_id, until, runs):
         i = bisect.bisect_right(starts, at) - 1
         if i < 0 or runs[i].delta_max is None:
@@ -657,7 +673,13 @@ def learn_margin(conn, room: dict, cfg: MarginConfig,
             target, since = run.delta_max, max(starts_cooling)
         else:
             continue
+        if i in taught:                     # once per run: already learned from it
+            steps.append(MarginStep(at, what, run.section, run.local_date, run.blocked,
+                                    run.block_mode, run.delta_max, target, margin, margin,
+                                    since, first=taught[i]))
+            continue
         before, margin = margin, margin_step(margin, target, cfg.rate)
-        steps.append(MarginStep(at, what, run.section, run.local_date, run.blocked,
-                                run.block_mode, run.delta_max, target, before, margin, since))
+        taught[i] = MarginStep(at, what, run.section, run.local_date, run.blocked,
+                               run.block_mode, run.delta_max, target, before, margin, since)
+        steps.append(taught[i])
     return margin, steps

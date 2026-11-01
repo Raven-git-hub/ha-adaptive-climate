@@ -113,6 +113,11 @@ def forced_id(room: str, unit: str) -> str:
 def section_rest_id(room: str, unit: str) -> str:
     return f"input_boolean.ac_section_rest_{room}_{unit}"
 
+def chosen_id(room: str, unit: str) -> str:
+    """The unit's forced boost is at the value a person chose on its remote:
+    no boost step (decision 145). Only the vote paths write it."""
+    return f"input_boolean.ac_chosen_{room}_{unit}"
+
 # A person's vote: one button per direction per room. Anything may press
 # them (a dashboard, a physical button's automation, the knob); a remote's
 # setpoint change votes too.
@@ -219,6 +224,7 @@ def build_helpers(config: dict) -> list[dict]:
             specs.append(spec(unblocked_id(r, u)))
             specs.append(spec(forced_id(r, u)))
             specs.append(spec(section_rest_id(r, u)))
+            specs.append(spec(chosen_id(r, u)))
         for unit in _leak_units(room):
             specs.append(spec(leak_id(r, unit["id"])))
             specs.append(spec(leak_confirm_id(r, unit["id"])))
@@ -374,6 +380,20 @@ def _read_unit(room: dict, unit: dict, sa: str, leak: str) -> str:
         LO=repr(control.DEFAULT_MIN_TEMP), HI=repr(control.DEFAULT_MAX_TEMP))
 
 
+def _read_chosen(room: dict, unit: dict) -> str:
+    """The unit's chosen marker (control.Unit.chosen), after _read_unit, for
+    the vote paths, the only ones that write it or read it (a delayed echo
+    of a remote's forced boost at its chosen value is ours): ch, and
+    r.chosen starting as it is."""
+    return _fill("{%- set ch = states('<<CH>>') == 'on' -%}{%- set r.chosen = ch -%}",
+                 CH=chosen_id(room["id"], unit["id"]))
+
+
+# control.boost_step, after _read_unit and _read_chosen
+def _boost_step(boost: float) -> str:
+    return f"(0 if ch and frc and st in {list(control.FORCED_STATES)!r} else {boost!r})"
+
+
 _RESULT = ("{{ {'go': r.go, 'state': r.state, 'offset': r.offset, 'base': r.base, "
            "'since': r.since, 'grace': r.grace, 'unb': r.unb, 'forced': r.forced, "
            "'srest': r.srest, 'cmd': r.cmd} }}")
@@ -383,6 +403,9 @@ _RESULT = ("{{ {'go': r.go, 'state': r.state, 'offset': r.offset, 'base': r.base
 # cool), for the ac_user_off_wake event, and whether the room's overrule
 # woke the unit from a rest the block held (control.overruled_step), for the
 # ac_block_overruled event.
+# The vote paths' result also carries the chosen marker (_read_chosen).
+_RESULT_VOTE = _RESULT[:-len("} }}")] + ", 'chosen': r.chosen} }}"
+
 _RESULT_MAINTENANCE = (_RESULT[:-len("} }}")]
                        + ", 'woke': st == 'user_off' and r.state == 'cool'"
                        + ", 'overrule_woke': overrule and held} }}")
@@ -392,9 +415,10 @@ def _clamp(value: str) -> str:
     return f"[[{value}, lo] | max, hi] | min"
 
 
-def _command(state: str, base: str, offset: str, boost: float) -> str:
+def _command(state: str, base: str, offset: str, boost: float, step: str | None = None) -> str:
     """control.command_for as one Jinja expression; state, base and offset
-    are Jinja expressions."""
+    are Jinja expressions, and step the boost step's (boost_degrees unless
+    given: control.boost_step)."""
     return _fill(
         "({'hvac_mode': 'cool', 'fan_mode': 'low', "
         "'temperature': (none if <<B>> is none else <<COOL>>) } if <<S>> == 'cool' "
@@ -404,7 +428,8 @@ def _command(state: str, base: str, offset: str, boost: float) -> str:
         "if <<S>> in ['rest', 'config_off', 'user_off', 'leak'] "
         "else none)",
         S=state, B=base, COOL=_clamp(f"{base} + {offset}"),
-        BOOST=_clamp(f"{base} + {offset} - {boost!r}"))
+        BOOST=_clamp(f"{base} + {offset} - {boost!r}" if step is None
+                     else f"{base} + {offset} - {step}"))
 
 
 def _go(state: str, cfg: control.ControlConfig, offset: str | None = None) -> str:
@@ -556,6 +581,7 @@ def _vote(config: dict, direction: str, chosen: str) -> str:
         "{%- set nb = <<CLAMP>> -%}"
         "{%- set r.base = nb -%}{%- set r.offset = 0 -%}{%- set r.grace = now_ts -%}"
         "{%- set r.srest = false -%}{%- set r.go = true -%}"
+        "{%- set r.chosen = vd == 'too_hot' and vc is not none -%}"
         "{%- if vd == 'too_hot' and blocked -%}{%- set r.unb = true -%}{%- endif -%}"
         "{%- set into = 'rest' if vd == 'too_cold' else 'boost' -%}"
         "{%- if not (vd == 'too_cold' and st == 'user_off') -%}"
@@ -566,7 +592,8 @@ def _vote(config: dict, direction: str, chosen: str) -> str:
         "{%- endif -%}",
         D=direction, C=chosen, STEP=repr(control.SETPOINT_STEP),
         ALONE=list(control.VOTE_HANDS_OFF), CLAMP=_clamp("nb"),
-        CMD=_command("into", "nb", "0", cfg.boost_degrees))
+        CMD=_command("into", "nb", "0", cfg.boost_degrees,
+                     step=f"(0 if r.chosen else {cfg.boost_degrees!r})"))
 
 
 def _episode(room: dict) -> str:
@@ -601,7 +628,8 @@ def _change_kind(config: dict) -> str:
         "{%- set vote = (('too_cold' if after.temperature > before.temperature else 'too_hot') "
         "if kind == 'setpoint' and not ours else none) -%}"
         "{{ {'ours': ours, 'kind': kind, 'vote': vote} }}",
-        CMD=_command("st", "tb", "off", cfg.boost_degrees), MOVED=moved, MD=md)
+        CMD=_command("st", "tb", "off", cfg.boost_degrees, step=_boost_step(cfg.boost_degrees)),
+        MOVED=moved, MD=md)
 
 
 def _person_change(config: dict) -> str:
@@ -647,9 +675,12 @@ def _when(expr: str, sequence: list, default: list | None = None) -> dict:
             "default": default or []}
 
 
-def _write_unit(room: dict, unit: dict) -> dict:
-    """Write a unit's result back to its helpers, when it has one."""
+def _write_unit(room: dict, unit: dict, chosen: bool = False) -> dict:
+    """Write a unit's result back to its helpers, when it has one; chosen:
+    its chosen marker too (the vote paths, whose result carries it)."""
     r, u, v = room["id"], unit["id"], _unit_var(unit)
+    marker = [_when(f"{{{{ {v}.chosen }}}}", [_set("input_boolean.turn_on", chosen_id(r, u))],
+                    [_set("input_boolean.turn_off", chosen_id(r, u))])] if chosen else []
     return _when(f"{{{{ {v}.go }}}}", [
         _when(f"{{{{ {v}.state in {list(control.STATES)!r} }}}}", [
             _set("input_select.select_option", state_id(r, u), {"option": f"{{{{ {v}.state }}}}"})]),
@@ -667,6 +698,7 @@ def _write_unit(room: dict, unit: dict) -> dict:
               [_set("input_boolean.turn_off", forced_id(r, u))]),
         _when(f"{{{{ {v}.srest }}}}", [_set("input_boolean.turn_on", section_rest_id(r, u))],
               [_set("input_boolean.turn_off", section_rest_id(r, u))]),
+        *marker,
     ])
 
 
@@ -717,7 +749,7 @@ def _apply_vote(room: dict) -> dict:
     any_go = " or ".join(f"{_unit_var(u)}.go" for u in room["units"])
     return _when(f"{{{{ not episode and states('{hold_id(r)}') == 'off' and ({any_go}) }}}}", [
         _set("input_boolean.turn_on", guard_id(r)),
-        *[_write_unit(room, unit) for unit in room["units"]],
+        *[_write_unit(room, unit, chosen=True) for unit in room["units"]],
         *[_send_command(unit) for unit in room["units"]],
         _set("input_boolean.turn_off", guard_id(r)),
     ])
@@ -1041,9 +1073,9 @@ def build_vote_automation(config: dict, room: dict) -> dict:
     }
     for unit in room["units"]:
         variables[_unit_var(unit)] = (
-            _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
+            _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit)) + _read_chosen(room, unit)
             + "{%- if not episode -%}" + _vote(config, "direction", "none") + "{%- endif -%}"
-            + _RESULT)
+            + _RESULT_VOTE)
     return {
         "id": vote_automation_id(r),
         "alias": f"AC {room.get('name', r)} — person vote",
@@ -1091,7 +1123,7 @@ def build_manual_change_automation(config: dict, room: dict, unit: dict) -> dict
         "before": _climate_snapshot("trigger.from_state"),
         "after": _climate_snapshot("trigger.to_state"),
         "change": _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
-                  + _change_kind(config),
+                  + _read_chosen(room, unit) + _change_kind(config),
         "episode": _episode(room),
     }
     for other in room["units"]:
@@ -1103,7 +1135,8 @@ def build_manual_change_automation(config: dict, room: dict, unit: dict) -> dict
             body += "{%- elif change.kind is not none and not change.ours -%}" + _person_change(config)
         body += "{%- endif -%}"
         variables[_unit_var(other)] = (
-            _read_unit(room, other, _sa_live(other), _leak_on(room, other)) + body + _RESULT)
+            _read_unit(room, other, _sa_live(other), _leak_on(room, other))
+            + _read_chosen(room, other) + body + _RESULT_VOTE)
     return {
         "id": manual_automation_id(r, u),
         "alias": f"AC {room.get('name', r)} — manual change ({unit.get('name', u)})",

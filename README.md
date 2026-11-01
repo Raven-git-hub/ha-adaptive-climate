@@ -120,7 +120,7 @@ cools a unit or turns it off, apart from leak protection:
 | State | When | AC mode | Fan | Setpoint |
 |---|---|---|---|---|
 | **cool** | the default while a section is running | COOL | LOW | base + offset |
-| **boost** | the quorum says too warm, or you pressed **too hot** | COOL | MEDIUM | base + offset − 2°C |
+| **boost** | the quorum says too warm, or you pressed **too hot** | COOL | MEDIUM | base + offset − 2°C (a too hot from the remote: the value you chose there) |
 | **rest** | the quorum says too cold, you pressed **too cold**, cooling is blocked, or the section started with the room cold and the forecast cooler | OFF | — | — |
 | **user_off** | a person turned the unit off; it stays off until someone turns it on or presses **too hot**, or the room gets too warm | OFF | — | — |
 | **manual** | a person chose another mode or fan | theirs | theirs | theirs |
@@ -139,7 +139,10 @@ hot**, or when the room reaches a too-warm quorum (then **cool** at the base,
 logged with why; `system.control.user_off_wakes_on_warm` turns that off). A
 rest or boost you forced with a press (or a setpoint change on the remote) ends
 by the same rules, but returns to **cool** at the new base, without the offset
-step; until it does, further presses are ignored. A section starts in **rest**
+step; until it does, further presses are ignored. Lowering the setpoint on a
+remote boosts that unit at the number you chose, without going 2° under it. The
+cooling block's margin learns at most once per section: the first press or
+turn-on that says a block was wrong teaches it, later ones that morning don't. A section starts in **rest**
 instead of **cool** when at least a quorum of the room's sensors are below their
 comfort readings and the section's forecast mean is below the room's comfort
 point; that rest also wakes at the base, without the +1, and a press during it
@@ -205,7 +208,8 @@ foreign automation:
   are sent (only a person turns it on or off)
 - per unit, its control state: `input_select.ac_state_<room>_<unit>`,
   `input_number.ac_base_…` and `ac_offset_…`, `input_datetime.ac_since_…` and
-  `ac_grace_until_…`, `input_boolean.ac_unblocked_…`
+  `ac_grace_until_…`, `input_boolean.ac_unblocked_…`, `ac_forced_…`,
+  `ac_section_rest_…` and `ac_chosen_…`
 - `input_boolean.ac_leak_<room>_<unit>` / `_confirmed_...` — leak latch (per leak unit)
 - `sensor.ac_almanac_<room>` — the learned model, pushed over REST
 - `sensor.ac_conditions_<room>` — the section's outdoor conditions (the lean of

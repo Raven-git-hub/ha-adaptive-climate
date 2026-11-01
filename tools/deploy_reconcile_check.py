@@ -203,7 +203,7 @@ async def main() -> int:
         for s in r["sensors"]:
             entities.add(s["entity_id"])
     rooms, units = len(cfg["rooms"]), sum(len(r["units"]) for r in cfg["rooms"])
-    n_helpers = 5 * rooms + 8 * units          # guard, hold, scene, 2 vote buttons; 8 per unit
+    n_helpers = 5 * rooms + 9 * units          # guard, hold, scene, 2 vote buttons; 9 per unit
     n_automations = 9 * rooms + units          # 6 scenes, maintenance, watchdog, vote; manual per unit
 
     entities.add("input_boolean.ac_hold_main_bedroom")      # left on by v1
@@ -249,13 +249,14 @@ async def main() -> int:
     assert f"ac_unblocked_{room}_{unit}" in ws.store["input_boolean"]
     assert f"ac_forced_{room}_{unit}" in ws.store["input_boolean"]
     assert f"ac_section_rest_{room}_{unit}" in ws.store["input_boolean"]
+    assert f"ac_chosen_{room}_{unit}" in ws.store["input_boolean"]
     assert sorted(ws.store["input_button"]) == sorted(
         f"ac_{d}_{r['id']}" for r in cfg["rooms"] for d in ("too_cold", "too_hot"))
     assert all(spec == {"name": oid} for oid, spec in ws.store["input_button"].items())
     assert not any("initial" in spec for dom in ws.store.values() for spec in dom.values())
     print("deploy 1: per unit an input_select state, input_number offset (-cap..cap) and base "
-          "(from 0), input_datetime since and grace_until, input_boolean unblocked, forced "
-          "and section_rest; per room the input_button too_cold and too_hot; none has an "
+          "(from 0), input_datetime since and grace_until, input_boolean unblocked, forced, "
+          "section_rest and chosen; per room the input_button too_cold and too_hot; none has an "
           "initial - OK")
 
     # starting values: since now, offset 0, state manual - for what was just
@@ -417,13 +418,13 @@ async def main() -> int:
     r4 = await check_then_deploy(cfg4, rest, ws, tmp)
     assert len(r4.automations_removed) == 10, r4.automations_removed
     assert all("baby_room" in a for a in r4.automations_removed)
-    assert len(r4.helpers_removed) == 13, r4.helpers_removed
+    assert len(r4.helpers_removed) == 14, r4.helpers_removed
     assert all("baby_room" in h for h in r4.helpers_removed)
     assert not any("main_room" in a or "main_bedroom" in a for a in r4.automations_removed)
     assert "foreign_clock" in ws.store["input_datetime"]
     assert "input_button.ac_too_cold_baby_room" in r4.helpers_removed
     assert "ac_vote_baby_room" in r4.automations_removed
-    print("deploy 4 (baby_room removed): pruned exactly its 10 automations + 13 helpers "
+    print("deploy 4 (baby_room removed): pruned exactly its 10 automations + 14 helpers "
           "(its vote automation and buttons among them), other rooms and foreign helpers "
           "untouched - OK")
 

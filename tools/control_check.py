@@ -158,6 +158,12 @@ def climate(mode: str, temperature: float | None = None, fan: str | None = None)
 # forecast, its warm edge leaned to +1.7.
 BLOCK = conditions({"blocked": True, "warm_edge": 1.7}, comfort=24.0, mean=17.0, max=17.0,
                    block_mode="active")
+REMOTE_AT_CHOSEN = ("a remote too_hot boosts at the value chosen on it, fan medium, no boost "
+                    "step; the room's other units boost as for a press; its echo is ours")
+REMOTE_RIGHT_BACK = ("a remote too_hot at 22 is sent 22: nothing for the person to put back "
+                     "(the live case)")
+BUTTON_AFTER_REMOTE = ("a press after a remote's boost takes the boost step again: a vote "
+                       "rewrites the marker")
 OVERRULE_WAKES = ("the room overrules the block: a blocked room that warms to a quorum wakes "
                   "and cools at its base, the block lifted for the section")
 OVERRULE_REST_MIN = "the room doesn't overrule the block before the rest minimum time"
@@ -877,9 +883,52 @@ SCENARIOS = [
       unit={"since": -m(60)}),
     s("a remote setpoint down is too_hot, with the chosen value as the base", [
         change(("cool", 22.0, "low"), ("cool", 20.0, "low"),
-               {"state": "boost", "base": 20.0, "offset": 0, "forced": True},
-               command=cmd("cool", "medium", 18.0), vote=vote("too_hot"))],
+               {"state": "boost", "base": 20.0, "offset": 0, "forced": True, "chosen": True},
+               command=cmd("cool", "medium", 20.0), vote=vote("too_hot"))],
       unit={"since": -m(60)}),
+    # Decision 145: a remote's vote doesn't undercut the number chosen on it.
+    s(REMOTE_AT_CHOSEN, [
+        change(("cool", 24.0, "low"), ("cool", 22.0, "low"),
+               {"state": "boost", "base": 22.0, "offset": 0, "forced": True, "chosen": True,
+                "since": 0}, command=cmd("cool", "medium", 22.0), vote=vote("too_hot"),
+               peers={"v": {"state": "boost", "base": 21.0, "forced": True, "chosen": False}},
+               peer_commands={"v": cmd("cool", "medium", 19.0)}),
+        change(("cool", 22.0, "low"), ("cool", 22.0, "medium"),
+               {"state": "boost", "base": 22.0, "forced": True, "chosen": True}, at=m(1),
+               command=None, vote=None),
+        step("hot", {"state": "boost"}, None, at=m(10)),
+        step("settled_cool", {"state": "cool", "base": 22.0, "offset": 0, "forced": False},
+             cmd("cool", "low", 22.0), at=m(20)),
+        step("very_hot", {"state": "boost", "offset": 0, "chosen": True},
+             cmd("cool", "medium", 20.0), at=m(30)),
+        # a system boost with the marker left over takes the step, and its echo is ours
+        change(("cool", 22.0, "low"), ("cool", 20.0, "medium"),
+               {"state": "boost", "forced": False, "since": m(30)}, at=m(31), command=None,
+               vote=None)],
+      unit={"base": 24.0, "since": -m(60)}, peers={"v": {"since": -m(60)}}),
+    s(REMOTE_RIGHT_BACK, [
+        change(("cool", 24.0, "low"), ("cool", 22.0, "low"),
+               {"state": "boost", "base": 22.0, "forced": True}, command=cmd("cool", "medium", 22.0),
+               vote=vote("too_hot")),
+        change(("cool", 22.0, "medium"), ("cool", 22.0, "medium"),
+               {"state": "boost", "base": 22.0, "forced": True}, at=m(1), command=None,
+               vote=None),
+        step("hot", {"state": "boost", "base": 22.0}, None, at=m(10))],
+      unit={"base": 24.0, "since": -m(60)}),
+    s(BUTTON_AFTER_REMOTE, [
+        press("too_hot", {"state": "boost", "base": 21.0, "forced": True, "chosen": False},
+              cmd("cool", "medium", 19.0))],
+      unit={"base": 22.0, "chosen": True, "since": -m(60)}),
+    s("a remote too_hot on a person's off: a forced boost at the chosen value", [
+        change(("off", 24.0, "low"), ("off", 23.0, "low"),
+               {"state": "boost", "base": 23.0, "forced": True, "chosen": True},
+               command=cmd("cool", "medium", 23.0), vote=vote("too_hot"))],
+      unit={"state": "user_off", "since": -m(30)}),
+    s("a remote too_cold is a forced rest, as before, with no chosen marker", [
+        change(("cool", 22.0, "low"), ("cool", 24.0, "low"),
+               {"state": "rest", "base": 24.0, "forced": True, "chosen": False},
+               command=OFF, vote=vote("too_cold"))],
+      unit={"since": -m(60), "chosen": True}),
     s("a remote setpoint change during a forced state is ignored", [
         press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
         change(("off", 22.0, "low"), ("off", 25.0, "low"),
@@ -961,14 +1010,14 @@ def _unit(d: dict) -> control.Unit:
                         base=d.get("base", 0.0), since=_time(d.get("since", -m(60))),
                         grace_until=_time(d.get("grace_until")),
                         unblocked=d.get("unblocked", False), forced=d.get("forced", False),
-                        section_rest=d.get("section_rest", False))
+                        section_rest=d.get("section_rest", False), chosen=d.get("chosen", False))
 
 
 def _view(unit: control.Unit) -> dict:
     return {"state": unit.state, "offset": unit.offset, "base": unit.base or None,
             "since": _secs(unit.since), "grace_until": _secs(unit.grace_until),
             "unblocked": unit.unblocked, "forced": unit.forced,
-            "section_rest": unit.section_rest}
+            "section_rest": unit.section_rest, "chosen": unit.chosen}
 
 
 def _ctx(*layers: dict) -> control.Context:
@@ -1231,6 +1280,27 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
             "a person's off that a person unblocked wakes while cooling is blocked"]
 
     return [
+        ("a remote's forced boost runs at the chosen value (the boost step instead)",
+         {"boost_step": lambda unit, ctx: ctx.config.boost_degrees},
+         [REMOTE_AT_CHOSEN, REMOTE_RIGHT_BACK,
+          "a remote setpoint down is too_hot, with the chosen value as the base",
+          "a remote too_hot on a person's off: a forced boost at the chosen value"]),
+        ("the chosen value counts only while the boost is the forced one (the marker alone "
+         "instead)",
+         {"boost_step": lambda unit, ctx: 0.0 if unit.chosen else ctx.config.boost_degrees},
+         [REMOTE_AT_CHOSEN]),
+        ("only the unit with a chosen value boosts at it (every too_hot vote instead)",
+         {"at_chosen": lambda direction, chosen: direction == c.TOO_HOT},
+         [REMOTE_AT_CHOSEN, BUTTON_AFTER_REMOTE, "a delayed echo of a forced boost is ours"]),
+        ("only a too_hot vote carries the marker (a remote too_cold too instead)",
+         {"at_chosen": lambda direction, chosen: chosen is not None},
+         ["a remote too_cold is a forced rest, as before, with no chosen marker"]),
+        ("a vote rewrites the chosen marker (left on instead)",
+         {"on_person_vote": lambda direction, unit, now, ctx, chosen=None: (lambda r: (
+             dataclasses.replace(r[0], chosen=r[0].chosen or unit.chosen), r[1]))(
+                 _PERSON_VOTE(direction, unit, now, ctx, chosen))},
+         [BUTTON_AFTER_REMOTE,
+          "a remote too_cold is a forced rest, as before, with no chosen marker"]),
         ("the room overrules the block on a too-warm quorum",
          {"overrules_block": lambda *a: False},
          [OVERRULE_WAKES, OVERRULE_REST_MIN, OVERRULE_EVERY_REST, OVERRULE_PLAIN_EDGE,

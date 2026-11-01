@@ -355,6 +355,7 @@ def _seed(ha: HA, unit: control.Unit, ctx: control.Context, uid: str = UNIT) -> 
     ha.set(g.unblocked_id(ROOM, uid), "on" if unit.unblocked else "off")
     ha.set(g.forced_id(ROOM, uid), "on" if unit.forced else "off")
     ha.set(g.section_rest_id(ROOM, uid), "on" if unit.section_rest else "off")
+    ha.set(g.chosen_id(ROOM, uid), "on" if unit.chosen else "off")
     implied = control.implied_command(unit, ctx)
     mode = "fan_only" if implied is None else implied.hvac_mode
     ha.set(entity_of(uid), mode, temperature=(implied and implied.temperature) or 22.0,
@@ -423,7 +424,8 @@ def _view(ha: HA, now: datetime, uid: str = UNIT) -> dict:
             "grace_until": grace if grace is not None and grace > table._secs(now) else None,
             "unblocked": ha.states(g.unblocked_id(ROOM, uid)) == "on",
             "forced": ha.states(g.forced_id(ROOM, uid)) == "on",
-            "section_rest": ha.states(g.section_rest_id(ROOM, uid)) == "on"}
+            "section_rest": ha.states(g.section_rest_id(ROOM, uid)) == "on",
+            "chosen": ha.states(g.chosen_id(ROOM, uid)) == "on"}
 
 
 def _control_view(unit: control.Unit, now: datetime) -> dict:
@@ -761,7 +763,7 @@ class Replay:
             unit_helpers = [h(ROOM, uid) for h in (g.state_id, g.offset_id, g.base_id,
                                                    g.since_id, g.grace_until_id,
                                                    g.unblocked_id, g.forced_id,
-                                                   g.section_rest_id)]
+                                                   g.section_rest_id, g.chosen_id)]
             if news[uid] == olds[uid] and not automation["id"].startswith("ac_scene_") and any(
                     e in unit_helpers for _, e, _, _ in ha.calls):
                 return f"{uid} helpers written without a transition"

@@ -25,7 +25,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from app import control
-from app.generator import (SECTIONS, base_id, conditions_id, forced_id, grace_until_id,
+from app.generator import (SECTIONS, base_id, chosen_id, conditions_id, forced_id,
+                           grace_until_id,
                            guard_id, hold_id, leak_confirm_id, leak_id, offset_id,
                            scene_select_id, since_id, state_id, unblocked_id)
 
@@ -168,11 +169,13 @@ def _unit(config: dict, room: dict, unit: dict, states: dict, section_units: dic
                           unit_max=_num(a.get("max_temp")) or control.DEFAULT_MAX_TEMP,
                           config=control.ControlConfig.from_config(config))
     target = control.target_base(control.Unit(base=base), ctx)
-    command = control.command_for(helper, target, offset, ctx) \
-        if helper in ("cool", "boost") else None
+    record = control.Unit(state=helper or "unknown", base=base, offset=offset,
+                          forced=on(forced_id(r, u)), chosen=on(chosen_id(r, u)))
+    command = control.implied_command(record, ctx) if helper in ("cool", "boost") else None
     # What the unit is set to now: our command's target in cool or boost
-    # (base + offset, minus boost_degrees in boost), the person's own setpoint
-    # in manual, nothing while it is off. The correction is its distance from
+    # (base + offset, minus boost_degrees in boost; a remote's forced boost
+    # at the value chosen there, decision 145), the person's own setpoint in
+    # manual, nothing while it is off. The correction is its distance from
     # the learned setpoint_applied: the offset, a vote's moved base, a boost.
     off = helper in OFF_STATES or (helper not in ("cool", "boost") and hvac == "off")
     if command is not None:

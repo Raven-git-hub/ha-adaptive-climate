@@ -551,18 +551,17 @@ def check_margin() -> None:
        "inside the range it is halfway, across 0 either way")
 
     def decided(sc: Scenario, start: datetime, section: str, comfort: float, mx: float,
-                blocked: bool, starts: dict | None = None) -> None:
-        """A section run decided in shadow mode at its crossover; starts:
-        what the scene started each unit in (None: a run recorded before
-        storage migration 4)."""
+                blocked: bool, starts: dict | None = None, mode: str = "shadow") -> None:
+        """A section run decided in shadow mode (or `mode`) at its crossover;
+        starts: what the scene started each unit in (None: a run recorded
+        before storage migration 4)."""
         day = start.date().isoformat()
         sc.store.record_section_run("lounge", day, section,
                                     planned_start=start.isoformat(timespec="seconds"),
                                     actual_start=start.isoformat(timespec="seconds"),
                                     unit_starts=starts)
         sc.store.record_section_outdoor("lounge", day, section, mx - 1.0, mx)
-        sc.store.record_section_conditions("lounge", day, section, comfort, 0.1, blocked,
-                                           "shadow")
+        sc.store.record_section_conditions("lounge", day, section, comfort, 0.1, blocked, mode)
 
     def margin(sc: Scenario, as_of: datetime, initial: float = -1.0) -> tuple[float, list]:
         return learn_margin(sc.store._conn, ROOM, MarginConfig(initial=initial), as_of)
@@ -588,16 +587,16 @@ def check_margin() -> None:
     ok("then a too_cold vote 15 min after Day's scene started cooling, delta max -2, moves it "
        "halfway to -2: 0.75 -> -0.625, positive to negative")
     # Sunset, unblocked at -0.625: the max 29.0 is 5 above the comfort point.
-    # Two too_cold votes pull M toward -5: the first to -2.81, the second
-    # would take it to -3.91 and stops at -3.
-    decided(sc, t(3, 16), "sunset", 24.0, 29.0, False)
-    sc.beat(t(3, 16, 5), state="cool")
-    sc.vote(t(3, 16, 10), "too_cold", section="sunset")
-    sc.vote(t(3, 16, 20), "too_cold", section="sunset")
-    m, steps = margin(sc, t(3, 16, 21))
+    # A too_cold vote in each of two such Sunsets pulls M toward -5: the
+    # first to -2.81, the second would take it to -3.91 and stops at -3.
+    for day in (3, 4):
+        decided(sc, t(day, 16), "sunset", 24.0, 29.0, False)
+        sc.beat(t(day, 16, 5), state="cool")
+        sc.vote(t(day, 16, 10), "too_cold", section="sunset")
+    m, steps = margin(sc, t(4, 16, 21))
     assert [st.after for st in steps[-2:]] == [-2.8125, -3.0] and m == -3.0, steps[-2:]
-    ok("and in a Sunset whose max was 5 above the comfort point, two too_cold votes take it "
-       "to -2.81, then to -3, no lower (blocking at a max up to comfort + 3)")
+    ok("and a too_cold vote in each of two Sunsets whose max was 5 above the comfort point "
+       "takes it to -2.81, then to -3, no lower (blocking at a max up to comfort + 3)")
 
     sc = Scenario()
     decided(sc, t(4, 20, 30), "night", 24.0, 12.0, True)
@@ -663,10 +662,11 @@ def check_margin() -> None:
     assert overruled(None) == (-1.0, [])
     ok("the same Night with no overrule recorded teaches nothing")
     m, steps = overruled(t(6, 21, 10), vote=t(6, 21, 40))
-    assert [(st.kind, st.after) for st in steps] == [("overruled", 0.75), ("too_hot", 1.625)], \
-        steps
-    ok("an overrule then a too_hot vote in the same blocked Night each teach, in time order: "
-       "-1 -> 0.75 -> 1.625")
+    assert m == 0.75 and [(st.kind, st.after, st.skipped) for st in steps] == [
+        ("overruled", 0.75, False), ("too_hot", 0.75, True)] and \
+        steps[1].first is steps[0], steps
+    ok("an overrule then a too_hot vote in the same blocked Night: the overrule teaches "
+       "(-1 -> 0.75), the vote is skipped, already learned from this section (decision 144)")
     sc = Scenario()
     decided(sc, t(6, 20, 30), "night", 24.0, 22.0, True)
     assert sc.store.record_section_overruled("lounge", "2026-08-06", "night",
@@ -699,6 +699,69 @@ def check_margin() -> None:
         margin(sc, t(6, 23))
     ok("the overrule's own CSV row carries only overruled_at, and the run's rows rebuild the "
        "same margin from CSV alone")
+    # Decision 144: at most one lesson per section run. Live, 1 Nov: Main
+    # Room's Sunrise was blocked (delta max 1.95); a person turned the unit on
+    # at 06:17 and again at 07:19, then voted too_hot on the remote at 07:27.
+    # Each taught: -1 -> 0.73 -> 1.59 -> 2.02, one wrong block moving the
+    # margin 3 degrees. Only the first teaches now.
+    def sunrise_morning() -> Scenario:
+        sc = Scenario()
+        decided(sc, t(7, 5, 30), "sunrise", 23.95, 22.0, True, mode="active")
+        for hh, mm in ((6, 17), (7, 19)):
+            when = t(7, hh, mm)
+            sc.store.record_reactive(
+                "lounge", when.isoformat(timespec="seconds"),
+                when.astimezone(timezone.utc).isoformat(timespec="seconds"),
+                "2026-08-07", "sunrise", 120,
+                units={"ac": ReactiveUnitSample(None, 22.0, True, kind="on",
+                                                power_before=False, power_after=True)},
+                sensors=dict(STEADY), kind="on")
+        sc.vote(t(7, 7, 27), "too_hot", chosen=22.0, section="sunrise")
+        return sc
+
+    sc = sunrise_morning()
+    m, steps = margin(sc, t(7, 8))
+    assert [(st.kind, st.at.astimezone(HK).strftime("%H:%M"), round(st.before, 6),
+             round(st.after, 6), st.skipped) for st in steps] == [("on", "06:17", -1.0, 0.725, False),
+                                 ("on", "07:19", 0.725, 0.725, True),
+                                 ("too_hot", "07:27", 0.725, 0.725, True)], steps
+    assert round(m, 6) == 0.725 and all(st.first is steps[0] for st in steps[1:]), steps
+    ok("Sunrise blocked at delta max 1.95, a person's on at 06:17 and 07:19 and a remote "
+       "too_hot at 07:27: the 06:17 on teaches (-1 -> 0.73), the other two are skipped, "
+       "already learned from this section (each taught before this: -1 -> 0.73 -> 1.59 -> "
+       "2.02)")
+    assert round(margin(sc, t(7, 7, 20))[0], 6) == round(margin(sc, t(7, 6, 18))[0], 6) == 0.725
+    ok("the replay applies it as of any time: after the second on, still 0.73")
+
+    sc = sunrise_morning()                      # the next morning's Sunrise teaches again
+    decided(sc, t(8, 5, 30), "sunrise", 23.95, 22.0, True, mode="active")
+    sc.vote(t(8, 6, 40), "too_hot", section="sunrise")
+    m, steps = margin(sc, t(8, 8))
+    assert [st.skipped for st in steps] == [False, True, True, False] and \
+        round(steps[-1].before, 6) == 0.725 and round(m, 6) == 1.5875, steps
+    ok("a section run's lesson is its own: the next day's blocked Sunrise teaches once more "
+       "(0.73 -> 1.59)")
+
+    sc = Scenario()                             # the opposite lesson: once per run too
+    decided(sc, t(9, 8), "day", 24.0, 26.0, False)
+    sc.beat(t(9, 8, 5), state="cool")
+    sc.vote(t(9, 8, 10), "too_cold")
+    sc.vote(t(9, 8, 25), "too_cold")
+    m, steps = margin(sc, t(9, 9))
+    assert m == -1.5 and [(st.kind, st.after, st.skipped) for st in steps] == [
+        ("too_cold", -1.5, False), ("too_cold", -1.5, True)], steps
+    ok("two too_cold votes 10 and 25 min after Day's scene started cooling: the first teaches "
+       "(-1 -> -1.5), the second is skipped")
+    sc = Scenario()
+    decided(sc, t(9, 8), "day", 24.0, 26.0, False)
+    sc.beat(t(9, 8, 5), state="cool")
+    sc.vote(t(9, 8, 45), "too_cold")            # outside the 30 min: not a lesson at all
+    sc.vote(t(9, 9, 0), "too_cold")
+    m, steps = margin(sc, t(9, 9, 30))
+    assert (m, steps) == (-1.0, []), steps
+    ok("a vote that teaches nothing (45 min after cooling started) doesn't use the run's "
+       "lesson up, and isn't listed as skipped")
+
     m, steps = overruled(t(6, 21, 10), blocked=False)
     assert (m, steps) == (-1.0, []), steps
     ok("an overruled_at on a run not decided blocked teaches nothing (only a blocked run's "

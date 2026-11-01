@@ -155,7 +155,12 @@ def main_() -> int:
     # --- what a unit is set to: off while resting, its own setpoint in manual ---
     for st, extra, want in (("rest", {}, (None, True, None)),
                             ("manual", {"unit_setpoint": 25.0}, (25.0, False, 2.0)),
-                            ("boost", {"forced": True, "base": 22.0}, (20.0, False, -3.0))):
+                            ("boost", {"forced": True, "base": 22.0}, (20.0, False, -3.0)),
+                            # decision 145: a remote's forced boost, at the value chosen there
+                            ("boost", {"forced": True, "base": 22.0, "chosen": True},
+                             (22.0, False, -1.0)),
+                            # the marker left over on a system boost: the boost step again
+                            ("boost", {"base": 22.0, "chosen": True}, (20.0, False, -3.0))):
         cfg_u, states_u, almanacs_u, _ = world(st, now=now, **extra)
         client = setup(StubRest(states_u), cfg_u)
         main.state.store.current_almanac = lambda room_id, as_of=None: almanacs_u.get(room_id)

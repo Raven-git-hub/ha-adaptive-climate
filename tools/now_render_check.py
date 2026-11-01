@@ -82,6 +82,12 @@ def cases() -> list[dict]:
                               "fan": "fast", "centre": "20\u00b0", "steps": -3,
                               "correction": "\u22123\u00b0", "learned": "learned 23\u00b0"},
              **FORCED_BOOST),
+        # Decision 145: a too-hot vote from the remote, set to 22 there, boosts
+        # at 22 itself (no boost step): one degree under the learned 23.
+        case("remote-boost", {"label": "Boost \u00b7 Medium", "sub": "you said too hot",
+                              "fan": "fast", "centre": "22\u00b0", "steps": -1,
+                              "correction": "\u22121\u00b0", "learned": "learned 23\u00b0"},
+             **FORCED_BOOST, chosen=True),
         case("user-off", {"label": "Off (by you)", "sub": "", "fan": "stopped", **off},
              state="user_off", readings=COOL),
         # In manual the unit's own setpoint is what it is set to: 25, two over.

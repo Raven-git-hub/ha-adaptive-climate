@@ -42,6 +42,7 @@ def example_config() -> dict:
 
 
 def world(state: str = "cool", *, offset: int = 0, base: float = 0.0, forced: bool = False,
+          chosen: bool = False,
           readings=(24.3, 23.8, 24.6), comfort=24.0, band=1.0, trust=(0.8, 0.5, 0.1),
           forecast: tuple | None = (27.0, 29.0), block_mode: str = "shadow",
           was_blocked: bool = False, margin: float = -1.0, stale: dict | None = None,
@@ -51,6 +52,8 @@ def world(state: str = "cool", *, offset: int = 0, base: float = 0.0, forced: bo
           now: datetime = NOW) -> tuple[dict, dict, dict, dict]:
     """(config, states, almanacs, margins) for one Main Room situation.
     forecast: (mean, max) for the conditions entity, None for no entity.
+    chosen: the unit's chosen marker (a remote's forced boost at the value
+    chosen there, decision 145).
     stale: {sensor_id: minutes since last reported}. rooms "all" keeps the
     example's other rooms (with nothing in HA for them). now: the time the
     states are reported against (the API test uses the real clock)."""
@@ -83,22 +86,24 @@ def world(state: str = "cool", *, offset: int = 0, base: float = 0.0, forced: bo
         put(sensor["entity_id"], "unavailable" if value is None else str(value),
             now - timedelta(minutes=age if age is not None else 2),
             unit_of_measurement="°C")
-    for unit, st, frc in ((room["units"][0], state, forced),
-                          *(((room["units"][1], second_unit, False),) if second_unit else ())):
+    for unit, st, frc, ch in ((room["units"][0], state, forced, chosen),
+                              *(((room["units"][1], second_unit, False, False),)
+                                if second_unit else ())):
         u = unit["id"]
         mode, fan = SHOWS[st]
         put(g.state_id(ROOM, u), st, options=list(control.STATES))
         put(g.base_id(ROOM, u), str(float(base)))
         put(g.offset_id(ROOM, u), str(float(offset)))
         put(g.forced_id(ROOM, u), "on" if frc else "off")
+        put(g.chosen_id(ROOM, u), "on" if ch else "off")
         put(g.unblocked_id(ROOM, u), "off")
         put(g.since_id(ROOM, u), "2026-08-03 20:30:00",
             timestamp=(now - timedelta(minutes=10)).timestamp())
         put(g.grace_until_id(ROOM, u), "2026-08-03 00:00:00",
             timestamp=now.replace(hour=0, minute=0).timestamp())
         ctx = control.Context(setpoint_applied=applied)
-        cmd = control.command_for(st, control.target_base(control.Unit(base=base or None), ctx),
-                                  offset, ctx)
+        cmd = control.implied_command(control.Unit(state=st, base=base or None, offset=offset,
+                                                   forced=frc, chosen=ch), ctx)
         shown = unit_setpoint if unit_setpoint is not None and unit["id"] == UNIT else \
             cmd.temperature if cmd and cmd.temperature else applied
         put(unit["entity_id"], mode if unit_available else "unavailable",

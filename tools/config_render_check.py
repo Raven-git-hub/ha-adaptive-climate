@@ -165,7 +165,7 @@ def case_preview() -> dict:
         ["text", f'{PANEL} [data-group="automations_written"] h4', f"Automations written {n}"],
         ["count", f'{PANEL} [data-group="automations_written"] li', n],
         ["count", f"{PANEL} .plan-group", 1],
-        ["text", PANEL, "Unchanged: 39 helpers, " f"{30 - n} automations."],
+        ["text", PANEL, "Unchanged: 42 helpers, " f"{30 - n} automations."],
         ["text", PANEL, "Problems: none."],
         ["text", f'{PANEL} button[data-action="apply-confirm"]', "Confirm and deploy"],
         ["text", f'{PANEL} button[data-action="apply-cancel"]', "Cancel"],

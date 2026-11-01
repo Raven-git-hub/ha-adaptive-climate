@@ -23,7 +23,9 @@ rule is a small named function, written the way a template can say it.
                       for the section run
   on_room_vote        a person's too_cold / too_hot vote for the room (a
                       button press, or a setpoint change on a remote): one
-                      per episode, forcing a rest or a boost
+                      per episode, forcing a rest or a boost (the unit
+                      changed on a remote boosts at the value chosen there,
+                      no boost step: boost_step)
   on_person_change    what a person turning a unit on or off, or changing
                       its mode or fan, does to the unit's record (no
                       command: the person already moved the unit)
@@ -37,8 +39,8 @@ rule is a small named function, written the way a template can say it.
                       sensor.ac_conditions_<room> for the templates to read
 
 A unit's state lives in its helpers (phase 3b): ac_state, ac_base,
-ac_offset, ac_since, ac_grace_until, ac_unblocked, ac_forced and
-ac_section_rest.
+ac_offset, ac_since, ac_grace_until, ac_unblocked, ac_forced,
+ac_section_rest and ac_chosen.
 """
 
 from __future__ import annotations
@@ -119,6 +121,9 @@ class Unit:
     unblocked: bool = False             # a person turned it on during a block
     forced: bool = False                # this rest or boost is a person's vote
     section_rest: bool = False          # a section change began this rest: the room was cold
+    chosen: bool = False                # a remote's vote set this unit's forced boost at the
+                                        # value a person chose: no boost step (decision 145).
+                                        # Only votes write it; it counts only while forced
 
 
 @dataclass(frozen=True)
@@ -338,14 +343,25 @@ def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def command_for(state: str, base: float | None, offset: int, ctx: Context) -> Command | None:
-    """What the unit is told to do in a state, clamped to its range."""
+def boost_step(unit: Unit, ctx: Context) -> float:
+    """How far below base + offset a unit's boost runs: boost_degrees, or
+    nothing for a forced boost at the setpoint a person chose on the unit's
+    remote (decision 145), which a boost must not undercut. The marker
+    counts only while the boost is still the forced one."""
+    return 0.0 if unit.chosen and forced_now(unit) else ctx.config.boost_degrees
+
+
+def command_for(state: str, base: float | None, offset: int, ctx: Context,
+                step: float | None = None) -> Command | None:
+    """What the unit is told to do in a state, clamped to its range. step:
+    the boost step (boost_step), boost_degrees unless given."""
     lo, hi = ctx.unit_min, ctx.unit_max
     if state == "cool":
         return Command("cool", "low", None if base is None else clamp(base + offset, lo, hi))
     if state == "boost":
+        step = ctx.config.boost_degrees if step is None else step
         return Command("cool", "medium", None if base is None
-                       else clamp(base + offset - ctx.config.boost_degrees, lo, hi))
+                       else clamp(base + offset - step, lo, hi))
     if state in ("rest", "config_off", "user_off", "leak"):
         return Command("off")            # leak too: dry still runs the compressor
     return None                          # manual: the person's settings stand
@@ -384,9 +400,11 @@ def setpoint_moved(before: float | None, after: float | None, min_delta: float) 
 
 def implied_command(unit: Unit, ctx: Context) -> Command | None:
     """The command the unit's state stands for, which a delayed echo of
-    our own command would show. None in manual (or an unknown state):
-    then every change is a person's."""
-    return command_for(unit.state, target_base(unit, ctx), unit.offset, ctx)
+    our own command would show (a remote's forced boost at its chosen
+    value included). None in manual (or an unknown state): then every
+    change is a person's."""
+    return command_for(unit.state, target_base(unit, ctx), unit.offset, ctx,
+                       boost_step(unit, ctx))
 
 
 def _off_matches(before: Climate, after: Climate, min_delta: float) -> bool:
@@ -475,13 +493,14 @@ def _keeps_since(unit: Unit, state: str) -> bool:
 
 
 def _force(unit: Unit, state: str, now: datetime, ctx: Context) -> tuple[Unit, Command | None]:
-    """Into a forced rest or boost at the voted base, offset 0. A unit
+    """Into a forced rest or boost at the voted base, offset 0 (a boost at
+    a remote's chosen value with no boost step: boost_step). A unit
     already resting is already off, so it is sent nothing."""
     since = unit.since if _keeps_since(unit, state) else now
     new = replace(unit, state=state, since=since, forced=True)
     if unit.state == "rest" and state == "rest":
         return new, None
-    return new, command_for(state, target_base(new, ctx), 0, ctx)
+    return new, command_for(state, target_base(new, ctx), 0, ctx, boost_step(new, ctx))
 
 
 def on_person_vote(direction: str, unit: Unit, now: datetime, ctx: Context,
@@ -490,18 +509,28 @@ def on_person_vote(direction: str, unit: Unit, now: datetime, ctx: Context,
     unit rests (off), a resting one stays resting, both forced; user_off
     stays off with the new base. too_hot: a unit cooling, resting, boosting
     or in user_off boosts, forced, and is unblocked if cooling is blocked.
-    Base = vote_base, offset 0, no grace."""
+    Base = vote_base, offset 0, no grace. The unit changed on a remote
+    boosts at the value chosen there, with no boost step (at_chosen); every
+    unit the vote moves has its chosen marker written."""
     if _votes_alone(unit, ctx):
         return _stay(unit, ctx)
     base = vote_base(direction, unit, ctx, chosen)
     if base is None:
         return _stay(unit, ctx)
-    voted = replace(unit, base=base, offset=0, grace_until=None, section_rest=False)
+    voted = replace(unit, base=base, offset=0, grace_until=None, section_rest=False,
+                    chosen=at_chosen(direction, chosen))
     if direction == TOO_COLD:
         if unit.state == "user_off":
             return voted, None               # the person's off stands
         return _force(voted, "rest", now, ctx)
     return _force(unblock_for_vote(voted, ctx), "boost", now, ctx)
+
+
+def at_chosen(direction: str, chosen: float | None) -> bool:
+    """A too_hot vote that carries a value a person chose on this unit's
+    remote boosts at that value (decision 145): the chosen marker. A button
+    press, a too_cold vote and the room's other units carry none."""
+    return direction == TOO_HOT and chosen is not None
 
 
 def unblock_for_vote(unit: Unit, ctx: Context) -> Unit:
