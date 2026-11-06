@@ -118,6 +118,19 @@ def chosen_id(room: str, unit: str) -> str:
     no boost step (decision 145). Only the vote paths write it."""
     return f"input_boolean.ac_chosen_{room}_{unit}"
 
+# The reversal window (decision 146): the last accepted vote's direction and
+# time for the room, "too_cold 1730000000" (not a Python literal, so Home
+# Assistant passes it to input_text as the string it is), and each unit's
+# record before that vote with what the vote left it in, as JSON (always
+# with true/false, so never parsed as a literal either).
+INPUT_TEXT_MAX = 255
+
+def vote_window_id(room: str) -> str:
+    return f"input_text.ac_vote_window_{room}"
+
+def prevote_id(room: str, unit: str) -> str:
+    return f"input_text.ac_prevote_{room}_{unit}"
+
 # A person's vote: one button per direction per room. Anything may press
 # them (a dashboard, a physical button's automation, the knob); a remote's
 # setpoint change votes too.
@@ -213,6 +226,7 @@ def build_helpers(config: dict) -> list[dict]:
         specs.append(spec(scene_select_id(r), options=list(SECTIONS)))
         for direction in control.PERSON_VOTES:
             specs.append(spec(button_id(r, direction)))
+        specs.append(spec(vote_window_id(r), max=INPUT_TEXT_MAX))
         for unit in room["units"]:
             u = unit["id"]
             specs.append(spec(state_id(r, u), options=list(control.STATES)))
@@ -225,6 +239,7 @@ def build_helpers(config: dict) -> list[dict]:
             specs.append(spec(forced_id(r, u)))
             specs.append(spec(section_rest_id(r, u)))
             specs.append(spec(chosen_id(r, u)))
+            specs.append(spec(prevote_id(r, u), max=INPUT_TEXT_MAX))
         for unit in _leak_units(room):
             specs.append(spec(leak_id(r, unit["id"])))
             specs.append(spec(leak_confirm_id(r, unit["id"])))
@@ -403,8 +418,15 @@ _RESULT = ("{{ {'go': r.go, 'state': r.state, 'offset': r.offset, 'base': r.base
 # cool), for the ac_user_off_wake event, and whether the room's overrule
 # woke the unit from a rest the block held (control.overruled_step), for the
 # ac_block_overruled event.
-# The vote paths' result also carries the chosen marker (_read_chosen).
-_RESULT_VOTE = _RESULT[:-len("} }}")] + ", 'chosen': r.chosen} }}"
+# The vote paths' result also carries the chosen marker (_read_chosen) and
+# the unit's part in the reversal window it opens (control.Prevote, written
+# to ac_prevote_<room>_<unit> by an accepted vote): its record as the vote
+# found it (restored, for a reversal) and the state, since and base the vote
+# left it in.
+_PRE = ("{'st': st, 'b': b, 'o': off, 'f': frc, 'sr': srest, 'u': unb, 'c': ch, "
+        "'s': (none if since is none else since | int), 'ps': r.state, "
+        "'pt': (none if r.since is none else r.since | int), 'pb': r.base}")
+_RESULT_VOTE = _RESULT[:-len("} }}")] + ", 'chosen': r.chosen, 'pre': " + _PRE + "} }}"
 
 _RESULT_MAINTENANCE = (_RESULT[:-len("} }}")]
                        + ", 'woke': st == 'user_off' and r.state == 'cool'"
@@ -605,6 +627,69 @@ def _episode(room: dict) -> str:
         for u in room["units"]) + " }}"
 
 
+def _window(room: dict) -> str:
+    """The room's reversal window (control.VoteWindow) from its helper:
+    {d, at}, or {} with none."""
+    return _fill("{%- set w = states('<<W>>').split(' ') -%}"
+                 "{{ {'d': w[0], 'at': w[1] | int(0)} if w | length == 2 and "
+                 "w[0] in <<VOTES>> else {} }}",
+                 W=vote_window_id(room["id"]), VOTES=list(control.PERSON_VOTES))
+
+
+def _window_variables(config: dict, direction: str) -> dict:
+    """control.window_open, reverses, repeats and vote_accepted for a vote
+    in `direction` (a Jinja expression; none: no vote), after `episode` and
+    `window`."""
+    secs = control.ControlConfig.from_config(config).vote_reversal_seconds
+    return {
+        "in_window": ("{{ " + (f"window.at is defined and 0 <= now_ts - window.at <= {secs!r}"
+                               if secs > 0 else "false") + " }}"),
+        "reversal": f"{{{{ in_window and {direction} is not none and window.d != {direction} }}}}",
+        "accepted": (f"{{{{ {direction} is not none and (reversal or (not episode and not "
+                     f"(in_window and window.d == {direction}))) }}}}"),
+    }
+
+
+def _restore(room: dict, unit: dict) -> str:
+    """control.restore, after _read_unit and _read_chosen, for a reversal:
+    the unit's record before the reversed vote, from its prevote helper,
+    unless its leak latch is on or it no longer has the state, since and
+    base that vote left it in (control.untouched). The record read becomes
+    the one the vote applies to (st, off, b, tb, since, unb, frc, srest,
+    ch) and r starts from it. cur: the state the unit is in now
+    (control.reversal_command)."""
+    return _fill(
+        "{%- set cur = st -%}"
+        "{%- if reversal and not leak -%}"
+        "{%- set raw = states('<<PV>>') -%}"
+        "{%- set pv = raw | from_json if raw[:1] == '{' else {} -%}"
+        "{%- set now_s = none if since is none else since | int -%}"
+        "{%- if pv.ps is defined and pv.ps == st and pv.pt == now_s "
+        "and ((pv.pb or 0) - b) | abs < 0.01 and [pv.st, pv.o, pv.b, pv.s, pv.u, pv.f, pv.sr, "
+        "pv.c] != [st, off, b, now_s, unb, frc, srest, ch] -%}"
+        "{%- set st = pv.st -%}{%- set off = pv.o | int -%}{%- set b = pv.b | float(0) -%}"
+        "{%- set since = pv.s -%}{%- set unb = pv.u -%}{%- set frc = pv.f -%}"
+        "{%- set srest = pv.sr -%}{%- set ch = pv.c -%}{%- set tb = b if b else sa -%}"
+        "{%- set r.state = st -%}{%- set r.offset = off -%}{%- set r.base = b -%}"
+        "{%- set r.since = since -%}{%- set r.unb = unb -%}{%- set r.forced = frc -%}"
+        "{%- set r.srest = srest -%}{%- set r.chosen = ch -%}{%- set r.go = true -%}"
+        "{%- endif -%}{%- endif -%}",
+        PV=prevote_id(room["id"], unit["id"]))
+
+
+def _reversal_command(config: dict) -> str:
+    """control.reversal_command: a reversal whose vote sends nothing but
+    leaves the unit in another state than `cur` sends that state's
+    command (control.implied_command)."""
+    cfg = control.ControlConfig.from_config(config)
+    step = (f"(0 if r.chosen and r.forced and r.state in {list(control.FORCED_STATES)!r} "
+            f"else {cfg.boost_degrees!r})")
+    return ("{%- if reversal and r.cmd is none and r.state != cur -%}"
+            "{%- set r.cmd = " + _command("r.state", "(r.base if r.base else sa)", "r.offset",
+                                          cfg.boost_degrees, step=step) + " -%}"
+            "{%- set r.go = true -%}{%- endif -%}")
+
+
 def _change_kind(config: dict) -> str:
     """control.person_change_kind (implied_command, matches_command,
     classify_change) and setpoint_direction, over the trigger's `before`
@@ -733,13 +818,31 @@ def _hold_off(room: dict) -> str:
 
 def _vote_event(room: dict, direction: str, source: str, **remote: str) -> dict:
     """The ac_person_vote event: the room, the vote's direction, whether it
-    was accepted (no episode running) and its source; a remote vote adds
-    the unit changed and the setpoint chosen. The runtime records an
+    was accepted (control.vote_accepted), its source, and whether it
+    reversed the vote whose window was open (reversal, and that vote's time,
+    reverses_at, in epoch seconds); a remote vote adds the unit changed and
+    the setpoint chosen. The runtime records an
     accepted vote as a reaction and logs an ignored one, and judges
     nothing itself."""
     return {"event": PERSON_VOTE_EVENT,
             "event_data": {"room": room["id"], "direction": direction,
-                           "accepted": "{{ not episode }}", "source": source, **remote}}
+                           "accepted": "{{ accepted }}", "source": source,
+                           "reversal": "{{ reversal }}",
+                           "reverses_at": "{{ window.at if reversal else none }}", **remote}}
+
+
+def _open_window(room: dict, direction: str) -> dict:
+    """An accepted vote opens the room's reversal window: its direction and
+    time, and each unit's part (its result's `pre`). Written even while
+    ac_hold is on: a vote under the hold is still reported, and a reversal
+    of it must still be."""
+    r = room["id"]
+    return _when("{{ accepted }}", [
+        _set("input_text.set_value", vote_window_id(r),
+             {"value": f"{{{{ {direction} ~ ' ' ~ now_ts }}}}"}),
+        *[_set("input_text.set_value", prevote_id(r, u["id"]),
+               {"value": f"{{{{ {_unit_var(u)}.pre | to_json }}}}"}) for u in room["units"]],
+    ])
 
 
 def _apply_vote(room: dict) -> dict:
@@ -747,7 +850,7 @@ def _apply_vote(room: dict) -> dict:
     guard; nothing while ac_hold is on (the vote is still reported)."""
     r = room["id"]
     any_go = " or ".join(f"{_unit_var(u)}.go" for u in room["units"])
-    return _when(f"{{{{ not episode and states('{hold_id(r)}') == 'off' and ({any_go}) }}}}", [
+    return _when(f"{{{{ accepted and states('{hold_id(r)}') == 'off' and ({any_go}) }}}}", [
         _set("input_boolean.turn_on", guard_id(r)),
         *[_write_unit(room, unit, chosen=True) for unit in room["units"]],
         *[_send_command(unit) for unit in room["units"]],
@@ -1070,11 +1173,15 @@ def build_vote_automation(config: dict, room: dict) -> dict:
         **_conditions_variables(config, room, "section"),
         "direction": "{{ trigger.id }}",
         "episode": _episode(room),
+        "window": _window(room),
+        **_window_variables(config, "direction"),
     }
     for unit in room["units"]:
         variables[_unit_var(unit)] = (
             _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit)) + _read_chosen(room, unit)
-            + "{%- if not episode -%}" + _vote(config, "direction", "none") + "{%- endif -%}"
+            + _restore(room, unit)
+            + "{%- if accepted -%}" + _vote(config, "direction", "none")
+            + _reversal_command(config) + "{%- endif -%}"
             + _RESULT_VOTE)
     return {
         "id": vote_automation_id(r),
@@ -1091,7 +1198,8 @@ def build_vote_automation(config: dict, room: dict) -> dict:
             "trigger.from_state.state != 'unavailable' and "
             "trigger.to_state.state not in ['unavailable', 'unknown'] }}")],
         "variables": variables,
-        "action": [_vote_event(room, "{{ direction }}", "button"), _apply_vote(room)],
+        "action": [_vote_event(room, "{{ direction }}", "button"),
+                   _open_window(room, "direction"), _apply_vote(room)],
     }
 
 
@@ -1125,12 +1233,15 @@ def build_manual_change_automation(config: dict, room: dict, unit: dict) -> dict
         "change": _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
                   + _read_chosen(room, unit) + _change_kind(config),
         "episode": _episode(room),
+        "window": _window(room),
+        **_window_variables(config, "change.vote"),
     }
     for other in room["units"]:
         mine = other["id"] == u
-        body = ("{%- if change.vote is not none -%}{%- if not episode -%}"
+        body = ("{%- if change.vote is not none -%}" + _restore(room, other)
+                + "{%- if accepted -%}"
                 + _vote(config, "change.vote", "after.temperature" if mine else "none")
-                + "{%- endif -%}")
+                + _reversal_command(config) + "{%- endif -%}")
         if mine:
             body += "{%- elif change.kind is not none and not change.ours -%}" + _person_change(config)
         body += "{%- endif -%}"
@@ -1167,6 +1278,7 @@ def build_manual_change_automation(config: dict, room: dict, unit: dict) -> dict
         "action": [_when("{{ change.vote is not none }}", [
             _vote_event(room, "{{ change.vote }}", "remote",
                         chosen="{{ after.temperature }}", unit=u),
+            _open_window(room, "change.vote"),
             _apply_vote(room),
         ], [_write_unit(room, unit)])],
     }

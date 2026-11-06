@@ -476,10 +476,10 @@ def check_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store_mod.MIGRATIONS) == 5
+    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store_mod.MIGRATIONS) == 6
     assert _backups(db) == [store.backup_path], (_backups(db), store.backup_path)
     assert _dump(store.backup_path) == v1_dump, "backup is not a copy of the v1 database"
-    print(f"migration: v1 database backed up to {store.backup_path.name}, now at version 5 - OK")
+    print(f"migration: v1 database backed up to {store.backup_path.name}, now at version 6 - OK")
 
     def n(table: str) -> int:
         return c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -507,7 +507,7 @@ def check_migration() -> None:
     assert sorted(cats) == ["connection", "crossover", "reactive", "storage"], cats
     storage = store.recent_events(category="storage")[0]
     assert str(store.backup_path) in storage["message"], storage
-    assert storage["detail"] == {"from": 0, "to": 5, "backup": str(store.backup_path)}
+    assert storage["detail"] == {"from": 0, "to": 6, "backup": str(store.backup_path)}
     assert store.current_almanac("main_room", as_of=date(2026, 8, 1)) == \
         {"room_id": "main_room", "sections": {}}
     assert c.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -578,7 +578,7 @@ def check_failed_migration() -> None:
 
 def check_phase0_database() -> None:
     """A database left at storage version 1 (v2 phase 0, before the section
-    run fix) gets migrations 2 to 5, behind its own backup."""
+    run fix) gets migrations 2 to 6, behind its own backup."""
     real = store_mod.MIGRATIONS
     tmp = Path(tempfile.mkdtemp())
     db = build_v1_db(tmp)
@@ -595,12 +595,12 @@ def check_phase0_database() -> None:
     assert still_open == 6, still_open
 
     store = Store(tmp, SCHEMA)
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 6
     assert _backups(db, "phase0") == [store.backup_path], store.backup_path
     assert _dump(store.backup_path) == phase0
     assert _runs(store._conn) == EXPECTED_RUNS, _runs(store._conn)
     details = [e["detail"] for e in store.recent_events(category="storage")]
-    assert {"from": 1, "to": 5, "backup": str(store.backup_path)} in details, details
+    assert {"from": 1, "to": 6, "backup": str(store.backup_path)} in details, details
     store.close()
     print(f"phase 0 database: backed up to {store.backup_path.name}, migration 2 closes its "
           f"open runs - OK")
@@ -642,7 +642,7 @@ def check_votes_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 6
     assert _backups(db, "pre-votes") == [store.backup_path], store.backup_path
     assert _dump(store.backup_path) == v2
     assert [tuple(r) for r in c.execute(
@@ -696,7 +696,7 @@ def check_starts_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 6
     assert _backups(db, "pre-starts") == [store.backup_path], store.backup_path
     assert _dump(store.backup_path) == v3
     assert [tuple(r) for r in c.execute(
@@ -760,7 +760,7 @@ def check_overrule_migration() -> None:
 
     store = Store(tmp, SCHEMA)
     c = store._conn
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 6
     assert _backups(db, "pre-overrule") == [store.backup_path], store.backup_path
     assert _dump(store.backup_path) == v4
     assert [tuple(r) for r in c.execute(
@@ -781,6 +781,81 @@ def check_overrule_migration() -> None:
     print(f"migration 5: a version 4 database backed up to {store.backup_path.name}, its "
           "section run kept with overruled_at NULL (unit_starts and the decision as they were); "
           "an overrule recorded after it lands in SQLite and as the CSV's last column, and the "
+          "database matches a fresh one - OK")
+
+
+def check_reversal_migration() -> None:
+    """A database at storage version 5, whose reactions have no reverses or
+    reversed_at, gets migration 6 alone: every reaction kept with its unit
+    and sensor rows still attached, the columns NULL, and the shape a fresh
+    database's. A reversal recorded after it names the vote it reversed
+    (also as the CSV's last column) and marks that vote reversed_at, and
+    only a vote of the room is marked."""
+    tmp = Path(tempfile.mkdtemp())
+    old_schema = tmp / "storage.v5.schema.sql"
+    text = SCHEMA.read_text()
+    start = text.index("    -- a vote's reversal (decision 146)")
+    end = text.index("    reversed_at         TEXT,\n") + len("    reversed_at         TEXT,\n")
+    old_schema.write_text(text[:start] + text[end:])
+    real = store_mod.MIGRATIONS
+    store_mod.MIGRATIONS = real[:5]
+    try:
+        old = Store(tmp, old_schema)            # a fresh database at storage version 5
+    finally:
+        store_mod.MIGRATIONS = real
+    rd = "2026-08-01"
+    cur = old._conn.execute(
+        "INSERT INTO reactive(room_id,ts,ts_utc,local_date,section,window_seconds,kind) "
+        "VALUES(?,?,?,?,?,?,?)", ("main_room", f"{rd}T20:40:00+08:00",
+                                  f"{rd}T12:40:00+00:00", rd, "night", 0, "too_cold"))
+    old._conn.execute("INSERT INTO reactive_unit(reactive_id,unit_id,setpoint_after,changed,"
+                      "kind) VALUES(?,?,?,?,?)", (cur.lastrowid, "main_room_ac", 24.0, 1,
+                                                  "too_cold"))
+    old._conn.execute("INSERT INTO reactive_sensor(reactive_id,sensor_id,temperature) "
+                      "VALUES(?,?,?)", (cur.lastrowid, "wall", 23.0))
+    old._conn.commit()
+    assert "reverses" not in [r[1] for r in old._conn.execute("PRAGMA table_info(reactive)")]
+    old.close()
+    db = tmp / "db" / "adaptive_climate.db"
+    v5 = _dump(db)
+    assert v5[0] == 5
+
+    store = Store(tmp, SCHEMA)
+    c = store._conn
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert _backups(db, "pre-reversal") == [store.backup_path], store.backup_path
+    assert _dump(store.backup_path) == v5
+    assert [tuple(r) for r in c.execute(
+        "SELECT r.kind, r.reverses, r.reversed_at, u.setpoint_after, s.temperature "
+        "FROM reactive r JOIN reactive_unit u ON u.reactive_id = r.id "
+        "JOIN reactive_sensor s ON s.reactive_id = r.id")] == [
+            ("too_cold", None, None, 24.0, 23.0)]
+    assert store.last_vote("main_room", "too_cold", f"{rd}T12:39:00+00:00") == \
+        f"{rd}T12:40:00+00:00"
+    assert store.last_vote("main_room", "too_hot", f"{rd}T12:39:00+00:00") is None
+    store.record_reactive("main_room", f"{rd}T20:40:12+08:00", f"{rd}T12:40:12+00:00", rd,
+                          "night", 0, {}, {"wall": 23.1}, kind="too_hot",
+                          reverses=f"{rd}T12:40:00+00:00")
+    assert [tuple(r) for r in c.execute(
+        "SELECT kind, reverses, reversed_at FROM reactive ORDER BY ts_utc")] == [
+            ("too_cold", None, f"{rd}T12:40:12+00:00"),
+            ("too_hot", f"{rd}T12:40:00+00:00", None)]
+    assert store.last_vote("main_room", "too_cold", f"{rd}T12:39:00+00:00") is None
+    assert [ts for ts, _, _ in store.reactions_since("main_room", f"{rd}T00:00:00+00:00")] \
+        == [f"{rd}T12:40:12+00:00"]
+    rows = list(csvmod.DictReader((tmp / "csv" / "main_room" / f"{rd}_reactive.csv").open()))
+    assert list(rows[0]) == REACTIVE_CSV and REACTIVE_CSV[-1] == "reverses"
+    assert rows[-1]["reverses"] == f"{rd}T12:40:00+00:00", rows
+    assert c.execute("PRAGMA foreign_key_check").fetchall() == []
+    store.close()
+    fresh = Path(tempfile.mkdtemp())
+    Store(fresh, SCHEMA).close()
+    assert _shape(db) == _shape(fresh / "db" / "adaptive_climate.db"), \
+        "the database migrated from version 5 differs from a fresh one"
+    print(f"migration 6: a version 5 database backed up to {store.backup_path.name}, its vote "
+          "kept with its unit and sensor rows (reverses and reversed_at NULL); a reversal "
+          "recorded after it names the vote it reversed (also the CSV's last column) and marks "
+          "it reversed_at, which last_vote and reactions_since then pass over; and the "
           "database matches a fresh one - OK")
 
 
@@ -807,6 +882,7 @@ def main() -> int:
     check_votes_migration()
     check_starts_migration()
     check_overrule_migration()
+    check_reversal_migration()
     check_newer_database_refused()
     print("\nALL STORE CHECKS PASSED")
     return 0

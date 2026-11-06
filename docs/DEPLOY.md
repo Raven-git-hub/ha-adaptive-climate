@@ -6,7 +6,7 @@ boundaries of what it will and won't touch.
 ## Two reconciliation strategies, because HA has two different APIs
 
 **Helpers** (`input_boolean`, `input_select`, `input_number`, `input_datetime`,
-`input_button`) live in HA's storage collections, which expose a reliable `{domain}/list` over
+`input_button`, `input_text`) live in HA's storage collections, which expose a reliable `{domain}/list` over
 WebSocket. So helpers are reconciled by **list-diff**: list what exists, create
 what's missing, update ours whose settings changed (`{domain}/update`: the
 offset helper's range after an `offset_cap` change, say, or a select's

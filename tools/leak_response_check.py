@@ -128,7 +128,8 @@ def main() -> int:
         assert _sent(ha.calls) is None, (after, ha.calls)
         votes = [d for kind, d in ha.events if kind == g.PERSON_VOTE_EVENT]
         assert votes == ([{"room": ROOM, "direction": "too_hot", "accepted": True,
-                           "source": "remote", "chosen": 20.0, "unit": UNIT}]
+                           "source": "remote", "reversal": False, "reverses_at": None,
+                           "chosen": 20.0, "unit": UNIT}]
                          if after.mode == "off" else []), votes
     assert ran == [1, 1, 1], ran        # each change went on once, and changed nothing
     echo = _trigger(control.Climate("cool", went_off.temperature, went_off.fan), went_off,

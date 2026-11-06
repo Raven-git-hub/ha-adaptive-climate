@@ -117,12 +117,18 @@ def person(kind: str, expect_unit: dict, setpoint=None, at: int = 0) -> dict:
 
 
 def press(direction: str, expect_unit: dict, command, accepted: bool = True, at: int = 0,
-          **room) -> dict:
+          reversal: bool | None = None, ctx: dict | None = None, **room) -> dict:
     """A press of the room's too_cold or too_hot button; accepted or
-    ignored (an episode is running). room: peers / peer_commands."""
+    ignored (an episode is running, or it repeats the vote whose reversal
+    window is open). reversal: whether it reverses that vote (decision 146;
+    unchecked if None). ctx: the step's own context. room: peers /
+    peer_commands."""
     assert set(room) <= set(_ROOM), room
-    return {"do": "press", "at": at, "direction": direction,
-            "expect": {"unit": expect_unit, "command": command, "accepted": accepted, **room}}
+    expect = {"unit": expect_unit, "command": command, "accepted": accepted, **room}
+    if reversal is not None:
+        expect["reversal"] = reversal
+    return {"do": "press", "at": at, "direction": direction, "expect": expect,
+            **({"ctx": ctx} if ctx else {})}
 
 
 def change(before: tuple, after: tuple, expect_unit: dict, at: int = 0, **expect) -> dict:
@@ -134,8 +140,10 @@ def change(before: tuple, after: tuple, expect_unit: dict, at: int = 0, **expect
             "expect": {"unit": expect_unit, **expect}}
 
 
-def vote(direction: str, accepted: bool = True) -> dict:
-    return {"direction": direction, "accepted": accepted}
+def vote(direction: str, accepted: bool = True, reversal: bool | None = None) -> dict:
+    """A climate change's expected vote; reversal unchecked if None."""
+    want = {"direction": direction, "accepted": accepted}
+    return want if reversal is None else {**want, "reversal": reversal}
 
 
 def conditions(expect: dict, **inputs) -> dict:
@@ -180,6 +188,35 @@ OVERRULE_LIFTS_ALL = ("the overrule lifts the block for every unit: a person's o
                       "wake is unblocked, and wakes by its own rule")
 OVERRULE_FORCED_REST = ("the overrule wakes a forced rest: a too_cold vote under the block "
                         "doesn't hold a room that has since warmed")
+
+# Decision 146: the reversal window.
+REVERSAL = ("reversal: too_cold then too_hot within the window is a single too_hot from the "
+            "original record")
+REVERSAL_AFTER = "reversal: the same pair after the window: the second is ignored, as before"
+REVERSAL_EDGE = "reversal: 20 s after the vote is still within the window"
+REVERSAL_SAME = ("reversal: a same-direction press within the window is ignored, even with no "
+                 "episode; after it, it counts")
+REVERSAL_SECTION_REST = ("reversal: inside a section-start rest, too_cold then too_hot is a "
+                         "single too_hot from the section rest")
+REVERSAL_SECTION_REST_BACK = ("reversal: inside a section-start rest, too_hot then too_cold "
+                              "puts the section rest back and rests it, forced, sending off")
+REVERSAL_BLOCK = ("reversal: inside a block, too_hot then too_cold takes the unblock back: the "
+                  "block holds the rest again")
+REVERSAL_BLOCK_HOT = ("reversal: inside a block, too_cold then too_hot is a single too_hot: "
+                      "unblocked, boosting")
+REVERSAL_USER_OFF = ("reversal: too_hot on a person's off then too_cold keeps it off at base+1 "
+                     "and sends off: the boost is undone")
+REVERSAL_TOUCHED = ("reversal: a unit moved since the vote (a person's off) isn't put back; "
+                    "the new vote applies to it as it is")
+REVERSAL_CHAIN = "reversal: a reversal can itself be reversed: only the last vote stands"
+REVERSAL_REMOTE = ("reversal: a remote too_hot within the window of a press reverses it, "
+                   "boosting at the value chosen")
+REVERSAL_BUTTON_AFTER_REMOTE = ("reversal: a press within the window of a remote too_cold "
+                                "reverses it: the chosen base goes too")
+REVERSAL_LEAK = ("reversal: a unit whose leak latch came on is left to the leak, not put back "
+                 "or sent anything")
+REVERSAL_OFF = "reversal: vote_reversal_seconds 0 turns the window off"
+REVERSAL_PEERS = "reversal: every unit in the room is put back and takes the new vote"
 
 
 SCENARIOS = [
@@ -990,6 +1027,122 @@ SCENARIOS = [
         change(("dry", 22.0, None), ("dry", 22.2, None), {"state": "manual", "since": -m(10)},
                vote=None)],
       unit={"state": "manual", "since": -m(10)}),
+    # --- the reversal window (decision 146) ------------------------------------------
+    s(REVERSAL, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF, reversal=False),
+        press("too_hot", {"state": "boost", "base": 21.0, "offset": 0, "forced": True,
+                          "since": 10, "section_rest": False, "unblocked": False,
+                          "chosen": False, "grace_until": None},
+              cmd("cool", "medium", 19.0), at=10, reversal=True),
+        step("hot", {"state": "boost", "forced": True}, None, at=m(10)),
+        step("settled_cool", {"state": "cool", "base": 21.0, "offset": 0, "forced": False},
+             cmd("cool", "low", 21.0), at=m(20))],
+      unit={"since": -m(60)}),
+    s(REVERSAL_AFTER, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        press("too_hot", {"state": "rest", "base": 23.0, "forced": True, "since": 0}, None,
+              accepted=False, at=21, reversal=False)],
+      unit={"since": -m(60)}),
+    s(REVERSAL_EDGE, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        press("too_hot", {"state": "boost", "base": 21.0, "forced": True}, cmd("cool", "medium", 19.0),
+              at=20, reversal=True)],
+      unit={"since": -m(60)}),
+    s(REVERSAL_SAME, [
+        press("too_cold", {"state": "user_off", "base": 23.0, "forced": False}, None),
+        press("too_cold", {"state": "user_off", "base": 23.0}, None, accepted=False, at=5,
+              reversal=False),
+        press("too_cold", {"state": "user_off", "base": 24.0}, None, at=30)],
+      unit={"state": "user_off", "since": -m(30)}),
+    s(REVERSAL_SECTION_REST, [
+        conditions({"delta_mean": 6.0}, comfort=24.0, mean=18.0, max=19.0),
+        section({"state": "rest", "section_rest": True}, OFF, readings="cold"),
+        press("too_cold", {"state": "rest", "forced": True, "section_rest": False,
+                           "base": 23.0, "since": 0}, None, at=m(5)),
+        press("too_hot", {"state": "boost", "forced": True, "section_rest": False,
+                          "base": 21.0, "offset": 0, "since": m(5, 10)},
+              cmd("cool", "medium", 19.0), at=m(5, 10), reversal=True),
+        step("settled_cool", {"state": "cool", "offset": 0, "forced": False, "base": 21.0},
+             cmd("cool", "low", 21.0), at=m(15))]),
+    s(REVERSAL_SECTION_REST_BACK, [
+        conditions({"delta_mean": 6.0}, comfort=24.0, mean=18.0, max=19.0),
+        section({"state": "rest", "section_rest": True}, OFF, readings="cold"),
+        press("too_hot", {"state": "boost", "forced": True, "base": 21.0},
+              cmd("cool", "medium", 19.0), at=m(5)),
+        press("too_cold", {"state": "rest", "forced": True, "section_rest": False,
+                           "base": 23.0, "since": 0}, OFF, at=m(5, 10), reversal=True),
+        step("settled_warm", {"state": "cool", "offset": 0, "base": 23.0},
+             cmd("cool", "low", 23.0), at=m(20))]),
+    s(REVERSAL_BLOCK, [
+        conditions({"blocked": True}, comfort=24.0, mean=17.0, max=17.0, block_mode="active"),
+        section({"state": "rest", "unblocked": False}, OFF),
+        press("too_hot", {"state": "boost", "forced": True, "unblocked": True, "base": 21.0},
+              cmd("cool", "medium", 19.0), at=m(5)),
+        press("too_cold", {"state": "rest", "forced": True, "unblocked": False, "base": 23.0,
+                           "since": 0}, OFF, at=m(5, 15), reversal=True),
+        step("settled_warm", {"state": "rest", "unblocked": False}, None, at=m(15))]),
+    s(REVERSAL_BLOCK_HOT, [
+        conditions({"blocked": True}, comfort=24.0, mean=17.0, max=17.0, block_mode="active"),
+        section({"state": "rest", "unblocked": False}, OFF),
+        press("too_cold", {"state": "rest", "forced": True, "unblocked": False, "base": 23.0,
+                           "since": 0}, None, at=m(5)),
+        press("too_hot", {"state": "boost", "forced": True, "unblocked": True, "base": 21.0,
+                          "since": m(5, 5)}, cmd("cool", "medium", 19.0), at=m(5, 5),
+              reversal=True),
+        step("hot", {"state": "boost", "unblocked": True}, None, at=m(15))]),
+    s(REVERSAL_USER_OFF, [
+        press("too_hot", {"state": "boost", "base": 21.0, "forced": True},
+              cmd("cool", "medium", 19.0)),
+        press("too_cold", {"state": "user_off", "base": 23.0, "offset": 0, "forced": False,
+                           "since": -m(30)}, OFF, at=10, reversal=True)],
+      unit={"state": "user_off", "offset": 1, "since": -m(30)}),
+    s(REVERSAL_TOUCHED, [
+        press("too_hot", {"state": "boost", "base": 21.0}, cmd("cool", "medium", 19.0)),
+        person("off", {"state": "user_off", "since": 5, "forced": False}, at=5),
+        press("too_cold", {"state": "user_off", "base": 22.0, "since": 5}, None, at=10,
+              reversal=True)],
+      unit={"since": -m(60)}),
+    s(REVERSAL_CHAIN, [
+        press("too_cold", {"state": "rest", "base": 23.0}, OFF),
+        press("too_hot", {"state": "boost", "base": 21.0}, cmd("cool", "medium", 19.0), at=10,
+              reversal=True),
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True, "since": 25}, OFF,
+              at=25, reversal=True),
+        press("too_hot", {"state": "rest", "base": 23.0}, None, accepted=False, at=m(1))],
+      unit={"since": -m(60)}),
+    s(REVERSAL_REMOTE, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        change(("off", 22.0, "low"), ("off", 20.0, "low"),
+               {"state": "boost", "base": 20.0, "offset": 0, "forced": True, "chosen": True,
+                "since": 10}, at=10, command=cmd("cool", "medium", 20.0),
+               vote=vote("too_hot", reversal=True))],
+      unit={"since": -m(60)}),
+    s(REVERSAL_BUTTON_AFTER_REMOTE, [
+        change(("cool", 22.0, "low"), ("cool", 24.0, "low"),
+               {"state": "rest", "base": 24.0, "forced": True}, command=OFF,
+               vote=vote("too_cold", reversal=False)),
+        press("too_hot", {"state": "boost", "base": 21.0, "forced": True, "chosen": False},
+              cmd("cool", "medium", 19.0), at=10, reversal=True)],
+      unit={"since": -m(60)}),
+    s(REVERSAL_LEAK, [
+        press("too_hot", {"state": "boost", "base": 21.0}, cmd("cool", "medium", 19.0)),
+        press("too_cold", {"state": "boost", "base": 21.0, "forced": True}, None, at=10,
+              reversal=True, ctx={"leak_on": True})],
+      unit={"since": -m(60)}),
+    s(REVERSAL_OFF, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        press("too_hot", {"state": "rest", "base": 23.0}, None, accepted=False, at=5,
+              reversal=False)],
+      unit={"since": -m(60)}, ctx={"control": {"vote_reversal_seconds": 0}}),
+    s(REVERSAL_PEERS, [
+        press("too_cold", {"state": "rest", "base": 23.0}, OFF,
+              peers={"v": {"state": "rest", "base": 23.0, "since": 0}}, peer_commands={"v": OFF}),
+        press("too_hot", {"state": "boost", "base": 21.0}, cmd("cool", "medium", 19.0), at=10,
+              reversal=True,
+              peers={"v": {"state": "boost", "base": 21.0, "offset": 0, "forced": True,
+                           "since": -m(10)}},
+              peer_commands={"v": cmd("cool", "medium", 19.0)})],
+      unit={"since": -m(60)}, peers={"v": {"state": "boost", "offset": -1, "since": -m(10)}}),
 ]
 
 
@@ -1092,13 +1245,15 @@ def plain_votes(st: dict, now: datetime = T0,
     return _votes({**st, "edges": control.PLAIN_EDGES}, now, stale_minutes)
 
 
-def apply(st: dict, units: dict[str, control.Unit], now: datetime, ctx: control.Context
+def apply(st: dict, units: dict[str, control.Unit], now: datetime, ctx: control.Context,
+          window: control.VoteWindow | None = None
           ) -> tuple[dict[str, control.Unit], dict[str, control.Command | None] | None,
                      control.PersonVote | None, bool]:
     """One step on the room through app.control: the units after it, each
     unit's command (None for a person's on/off/manual, which sends
     nothing), the vote, if the step was one, and whether a heartbeat's room
-    overruled the block."""
+    overruled the block. window: the room's reversal window, which a vote
+    reads; an accepted vote's pv.opens is the next one (next_window)."""
     ctxs = _ctxs(ctx, units)
     do, results, pv, overruled = st["do"], None, None, False
     if do == "step":
@@ -1114,14 +1269,23 @@ def apply(st: dict, units: dict[str, control.Unit], now: datetime, ctx: control.
         new = control.on_person_change(st["kind"], units[MAIN], st.get("setpoint"), now, ctx)
         return {**units, MAIN: new}, None, None, False
     elif do == "press":
-        results, pv = control.on_button(st["direction"], units, now, ctxs)
+        results, pv = control.on_button(st["direction"], units, now, ctxs, window)
     elif do == "change":
         results, pv = control.on_climate_change(units, MAIN, control.Climate(**st["before"]),
-                                                control.Climate(**st["after"]), now, ctxs)
+                                                control.Climate(**st["after"]), now, ctxs,
+                                                window)
     else:
         raise AssertionError(do)
     return ({uid: r[0] for uid, r in results.items()},
             {uid: r[1] for uid, r in results.items()}, pv, overruled)
+
+
+def next_window(window: control.VoteWindow | None, pv: control.PersonVote | None
+                ) -> control.VoteWindow | None:
+    """The room's reversal window after a step: the one an accepted vote
+    opens, else as it was (it lives in its helpers, which nothing else
+    writes)."""
+    return pv.opens if pv is not None and pv.accepted else window
 
 
 def _command(command: control.Command | None) -> dict | None:
@@ -1148,8 +1312,13 @@ def compare(expect: dict, units: dict[str, control.Unit], commands: dict | None,
             return f"{uid} command {got}, expected {want}"
     if "accepted" in expect and (pv is None or pv.accepted != expect["accepted"]):
         return f"vote {pv}, expected accepted={expect['accepted']}"
+    if "reversal" in expect and (pv is None or pv.reversal != expect["reversal"]):
+        return f"vote {pv}, expected reversal={expect['reversal']}"
     if "vote" in expect:
-        got = None if pv is None else {"direction": pv.direction, "accepted": pv.accepted}
+        got = None if pv is None else {"direction": pv.direction, "accepted": pv.accepted,
+                                       "reversal": pv.reversal}
+        if got is not None and "reversal" not in (expect["vote"] or {}):
+            got.pop("reversal")
         if got != expect["vote"]:
             return f"vote {got}, expected {expect['vote']}"
     if "overruled" in expect and overruled != expect["overruled"]:
@@ -1160,7 +1329,7 @@ def compare(expect: dict, units: dict[str, control.Unit], commands: dict | None,
 def run(scenario: dict) -> list[str]:
     """The scenario's failures (empty when it passes)."""
     try:
-        units, cond = _room(scenario), None
+        units, cond, window = _room(scenario), None, None
         for i, st in enumerate(scenario["steps"], 1):
             now, expect = _time(st.get("at", 0)), st["expect"]
             if st["do"] == "conditions":
@@ -1177,7 +1346,8 @@ def run(scenario: dict) -> list[str]:
                 if got != expect:
                     return [f"step {i}: votes {got}, expected {expect}"]
                 continue
-            units, commands, pv, overruled = apply(st, units, now, ctx)
+            units, commands, pv, overruled = apply(st, units, now, ctx, window)
+            window = next_window(window, pv)
             why = compare(expect, units, commands, pv, overruled=overruled)
             if why:
                 return [f"step {i}: {why}"]
@@ -1580,6 +1750,31 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
           "at the voted base",
           "section start: a too_cold vote in a section rest is taken: forced, since kept, "
           "nothing sent"]),
+        ("a reversal restores the record from before the vote",
+         {"restore": lambda unit, prevote, ctx: unit},
+         [REVERSAL, REVERSAL_SECTION_REST, REVERSAL_SECTION_REST_BACK, REVERSAL_BLOCK,
+          REVERSAL_USER_OFF, REVERSAL_CHAIN, REVERSAL_PEERS]),
+        ("an opposite vote within the window reverses (one per episode instead)",
+         {"reverses": lambda direction, window, now, config: False},
+         [REVERSAL, REVERSAL_EDGE, REVERSAL_SECTION_REST, REVERSAL_BLOCK_HOT, REVERSAL_CHAIN,
+          REVERSAL_REMOTE, REVERSAL_BUTTON_AFTER_REMOTE, REVERSAL_PEERS]),
+        ("a same-direction vote within the window is ignored",
+         {"repeats": lambda direction, window, now, config: False}, [REVERSAL_SAME]),
+        ("the window closes after vote_reversal_seconds",
+         {"window_open": lambda window, now, config: window is not None},
+         [REVERSAL_AFTER, REVERSAL_OFF]),
+        ("the window closes at vote_reversal_seconds itself (< instead of <=)",
+         {"window_open": lambda window, now, config: window is not None and timedelta(0) <= (
+             now - window.at) < timedelta(seconds=config.vote_reversal_seconds)},
+         [REVERSAL_EDGE]),
+        ("only a unit untouched since the vote is put back",
+         {"untouched": lambda unit, prevote: True}, [REVERSAL_TOUCHED]),
+        ("a leak-latched unit isn't put back",
+         {"restore": lambda unit, prevote, ctx: unit if prevote is None else prevote.unit},
+         [REVERSAL_LEAK]),
+        ("a reversal sends the command of the state it leaves the unit in",
+         {"reversal_command": lambda current, new, command, ctx: command},
+         [REVERSAL_SECTION_REST_BACK, REVERSAL_BLOCK, REVERSAL_USER_OFF]),
         ("the reactive_min_delta tolerance (exact setpoint instead)",
          {"_same_setpoint": lambda shown, commanded, min_delta: shown == commanded},
          ["a setpoint within reactive_min_delta of our command is ours"]),
@@ -1619,6 +1814,49 @@ def check_unit_start() -> int:
     return len(bad)
 
 
+def check_reversals() -> int:
+    """Decision 146 over a grid: every state, section rest, unblocked,
+    forced, chosen, offset and base, a block or none, a leak latch or none,
+    and both orders. The first vote, then the opposite one 10 s later, must
+    leave each unit exactly as the second vote alone would have from the
+    original record (grace aside, which a vote clears either way), and send
+    the same command, or, where that vote alone sends nothing (the unit
+    already doing it), the command of the state it is left in when that
+    isn't the state the first vote put it in."""
+    bad, n = [], 0
+    later = T0 + timedelta(seconds=10)
+    for state in control.STATES:
+        for flags in ({}, {"section_rest": True}, {"unblocked": True}, {"forced": True},
+                      {"chosen": True, "forced": True}, {"offset": -2}, {"base": 24.0}):
+            for layer in ({}, {"blocked": True, "block_mode": "active"}, {"leak_on": True},
+                          {"setpoint_applied": None}):
+                for first, second in ((control.TOO_COLD, control.TOO_HOT),
+                                      (control.TOO_HOT, control.TOO_COLD)):
+                    ctx = _ctx(layer)
+                    units = {MAIN: _unit({"state": state, **flags})}
+                    ctxs = _ctxs(ctx, units)
+                    one = control.room_vote(first, units, T0, ctxs)
+                    if not one.accepted:
+                        continue                # an episode already running: no window
+                    mid = {uid: r[0] for uid, r in one.results.items()}
+                    two = control.room_vote(second, mid, later, ctxs, window=one.opens)
+                    alone = control.room_vote(second, units, later, ctxs)
+                    n += 1
+                    got, cmd = two.results[MAIN]
+                    want, want_cmd = alone.results[MAIN]
+                    if want_cmd is None and want.state != mid[MAIN].state:
+                        want_cmd = control.implied_command(want, ctx)
+                    if not two.reversal or dataclasses.replace(got, grace_until=None) != \
+                            dataclasses.replace(want, grace_until=None) or cmd != want_cmd:
+                        bad.append(f"{state} {flags} {layer} {first}->{second}: {got}, {cmd}; "
+                                   f"alone {want}, {want_cmd}")
+    for line in bad[:5]:
+        print(f"[FAIL] {line}")
+    print(f"a reversal within the window equals the second vote alone from the original "
+          f"record: {n - len(bad)}/{n} cases")
+    return len(bad)
+
+
 @contextlib.contextmanager
 def _patched(patches: dict):
     saved = {name: getattr(control, name) for name in patches}
@@ -1641,7 +1879,7 @@ def main() -> int:
     passed = sum(1 for why in failures.values() if not why)
     steps = sum(len(sc["steps"]) for sc in SCENARIOS)
     print(f"{passed}/{len(SCENARIOS)} scenarios ({steps} steps) match app.control")
-    if passed != len(SCENARIOS) or check_unit_start():
+    if passed != len(SCENARIOS) or check_unit_start() + check_reversals():
         return 1
 
     print("\nrules removed one at a time:")

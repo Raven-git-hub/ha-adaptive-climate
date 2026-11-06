@@ -293,22 +293,30 @@ def _sensor_seeds(conn, room_id: str, until: str) -> dict[tuple[str, str], float
     return {(sec, sid): t for sec, sid, t in rows}
 
 
+# A vote reversed within the reversal window (decision 146), as of the
+# replay's `until`, is no reaction at all: it moves no comfort, setpoint,
+# band or margin and breaks no quiet run. One parameter: `until`.
+LEARNED = "(r.reversed_at IS NULL OR r.reversed_at > ?)"
+
+
 def _reactions(conn, room_id: str, until: str) -> list[_Reaction]:
-    """Every reaction in the room up to `until`, in time order."""
+    """Every reaction in the room up to `until` that teaches something (a
+    reversed vote doesn't: LEARNED), in time order."""
     head = conn.execute(
-        "SELECT id, ts_utc, section, local_date, kind FROM reactive "
-        "WHERE room_id = ? AND ts_utc <= ? ORDER BY ts_utc, id", (room_id, until)).fetchall()
+        f"SELECT id, ts_utc, section, local_date, kind FROM reactive r "
+        f"WHERE room_id = ? AND ts_utc <= ? AND {LEARNED} ORDER BY ts_utc, id",
+        (room_id, until, until)).fetchall()
     units: dict[int, dict] = {}
     for rid, uid, before, after in conn.execute(
             "SELECT ru.reactive_id, ru.unit_id, ru.setpoint_before, ru.setpoint_after "
             "FROM reactive_unit ru JOIN reactive r ON r.id = ru.reactive_id "
-            "WHERE r.room_id = ? AND r.ts_utc <= ?", (room_id, until)):
+            f"WHERE r.room_id = ? AND r.ts_utc <= ? AND {LEARNED}", (room_id, until, until)):
         units.setdefault(rid, {})[uid] = (before, after)
     sensors: dict[int, dict] = {}
     for rid, sid, t in conn.execute(
             "SELECT rs.reactive_id, rs.sensor_id, rs.temperature "
             "FROM reactive_sensor rs JOIN reactive r ON r.id = rs.reactive_id "
-            "WHERE r.room_id = ? AND r.ts_utc <= ?", (room_id, until)):
+            f"WHERE r.room_id = ? AND r.ts_utc <= ? AND {LEARNED}", (room_id, until, until)):
         sensors.setdefault(rid, {})[sid] = t
     return [_Reaction(rid, _at(ts), sec, d, kind, units.get(rid, {}), sensors.get(rid, {}))
             for rid, ts, sec, d, kind in head]
@@ -559,16 +567,16 @@ def _runs(conn, room_id: str, until: str) -> list[_Run]:
 
 def _margin_reactions(conn, room_id: str, until: str) -> list[tuple]:
     """(at, room kind, {unit_id: (kind, power_before)}) in time order: the
-    people's reactions."""
+    people's reactions, a reversed vote left out (LEARNED)."""
     units: dict[int, dict] = {}
     for rid, uid, kind, power in conn.execute(
             "SELECT ru.reactive_id, ru.unit_id, ru.kind, ru.power_before FROM reactive_unit ru "
-            "JOIN reactive r ON r.id = ru.reactive_id WHERE r.room_id = ? AND r.ts_utc <= ?",
-            (room_id, until)):
+            "JOIN reactive r ON r.id = ru.reactive_id WHERE r.room_id = ? AND r.ts_utc <= ? "
+            f"AND {LEARNED}", (room_id, until, until)):
         units.setdefault(rid, {})[uid] = (kind, power)
     return [(_at(ts), kind, units.get(rid, {})) for rid, ts, kind in conn.execute(
-        "SELECT id, ts_utc, kind FROM reactive WHERE room_id = ? AND ts_utc <= ? "
-        "ORDER BY ts_utc, id", (room_id, until))]
+        f"SELECT id, ts_utc, kind FROM reactive r WHERE room_id = ? AND ts_utc <= ? "
+        f"AND {LEARNED} ORDER BY ts_utc, id", (room_id, until, until))]
 
 
 OVERRULED = "overruled"     # the room overruled a run's block (decision 143)

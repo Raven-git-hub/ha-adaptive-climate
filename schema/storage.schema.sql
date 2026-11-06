@@ -12,7 +12,9 @@
 -- this file. So: never edit a CREATE here without adding a migration,
 -- and fresh and migrated databases stay byte-identical in sqlite_master
 -- (tools/store_check.py checks this). user_version 0 = v1 (v1.0-poc),
--- 1 = v2 phase 0, 2 = phase 1 (open section runs closed; data only).
+-- 1 = v2 phase 0, 2 = phase 1 (open section runs closed; data only),
+-- 3 = the vote kinds, 4 = unit_starts, 5 = overruled_at, 6 = a vote's
+-- reversal (reactive.reverses and reversed_at).
 --
 -- Design notes:
 --   * Sensor readings and unit states are stored LONG, not wide. Rooms
@@ -170,6 +172,13 @@ CREATE TABLE reactive (
                                         'too_cold','too_hot')
                                OR kind IS NULL),   -- NULL (pre-v2 rows) reads as 'setpoint'
     outdoor_temp        REAL,                -- v2: outdoor value when the person reacted
+    -- a vote's reversal (decision 146): on the vote that reversed another
+    -- within system.control.vote_reversal_seconds, the reversed vote's
+    -- ts_utc (the CSV's `reverses` column, so a rebuild finds it again); on
+    -- the reversed vote, the ts_utc of the vote that reversed it. The
+    -- replay skips a reversed vote entirely.
+    reverses            TEXT,
+    reversed_at         TEXT,
     UNIQUE (room_id, ts)
 );
 CREATE INDEX idx_reactive_scan ON reactive(room_id, local_date, section);

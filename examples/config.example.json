@@ -21,7 +21,8 @@
       "person_grace_minutes": 30,
       "offset_cap": 3,
       "person_step_degrees": 1.0,
-      "user_off_wakes_on_warm": true
+      "user_off_wakes_on_warm": true,
+      "vote_reversal_seconds": 20
     }
   },
   "learning": {

@@ -782,6 +782,9 @@ function controlHtml() {
       ${setting("system.control.person_step_degrees", "Vote step",
         "A too cold or too hot vote moves each sensor's comfort reading this far from its reading.",
         { unit: "\u00b0", step: "0.5" })}
+      ${setting("system.control.vote_reversal_seconds", "Vote undo window",
+        "A vote the other way this soon after a vote undoes it: the room goes back to how it was, takes the new vote, and the first one teaches nothing. 0 turns it off.",
+        { unit: "s", step: "5" })}
       ${setting("system.control.boost_degrees", "Boost step",
         "Boost cools this many degrees below the unit's base and offset.", { unit: "\u00b0", step: "0.5" })}
       ${setting("system.control.boost_max_minutes", "Boost cap",

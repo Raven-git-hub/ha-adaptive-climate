@@ -110,6 +110,7 @@ Store (no Home Assistant, no network). Verifies:
 from __future__ import annotations
 
 import asyncio
+import datetime as dt_mod
 import json
 import sys
 import tempfile
@@ -242,10 +243,12 @@ def _state_changed(entity_id, before, after, parent_id=None, state="cool",
 
 
 def vote_event(room: str, direction: str, accepted=True, source: str = "button",
-               chosen: float | None = None, unit: str | None = None) -> dict:
+               chosen: float | None = None, unit: str | None = None, reversal=False,
+               reverses_at: int | None = None) -> dict:
     """An ac_person_vote event as HA's vote or manual-change automation
     fires it."""
-    data = {"room": room, "direction": direction, "accepted": accepted, "source": source}
+    data = {"room": room, "direction": direction, "accepted": accepted, "source": source,
+            "reversal": reversal, "reverses_at": reverses_at}
     if source == "remote":
         data.update(chosen=chosen, unit=unit)
     return {"event_type": "ac_person_vote", "data": data,
@@ -613,6 +616,39 @@ async def main() -> int:
     print("vote: an accepted flag sent as a string still counts; an unknown room or "
           "direction is a warning, not a reaction; the button's own state change is not a "
           "reaction (only HA's event is) - OK")
+
+    # --- decision 146: a reversal marks the vote it reverses, which teaches nothing ---
+    import time as _time
+
+    def votes_of(room_id: str) -> list:
+        return [tuple(r) for r in c.execute(
+            "SELECT kind, reverses, reversed_at, ts_utc FROM reactive WHERE room_id = ? AND "
+            "kind IN ('too_cold','too_hot') ORDER BY id", (room_id,))]
+    await asyncio.sleep(1.05)
+    n_replays = len(replays(store, "main_bedroom", "vote"))
+    first_at = int(_time.time())
+    # pressed the wrong way, then at once the right way: HA reports both
+    # back to back, the second a reversal of the first in the same second
+    vote_cb(vote_event("main_bedroom", "too_hot"))
+    vote_cb(vote_event("main_bedroom", "too_cold", reversal="True", reverses_at=first_at))
+    await eventually(lambda: n_reactions("main_bedroom") == count + 2, "the pair")
+    await eventually(lambda: len(replays(store, "main_bedroom", "vote")) == n_replays + 2,
+                     "both replays")
+    (k1, rv1, rd1, t1), (k2, rv2, rd2, t2) = votes_of("main_bedroom")[-2:]
+    assert (k1, rv1, k2, rv2, rd2) == ("too_hot", None, "too_cold", t1, None), \
+        votes_of("main_bedroom")[-2:]
+    assert rd1 == t2 and t2 > t1, (t1, t2, rd1)
+    events = store.recent_events(limit=5, room_id="main_bedroom", category="reactive")
+    msg = next(e["message"] for e in events if (e.get("detail") or {}).get("reversal"))
+    assert msg == "Main Bedroom: too_hot reversed to too_cold within 20 s; the first vote " \
+                  "teaches nothing", msg
+    assert rt.last_votes["main_bedroom"]["reversal"] is True, rt.last_votes["main_bedroom"]
+    since = (dt_mod.datetime.now(dt_mod.timezone.utc) - dt_mod.timedelta(hours=1)).isoformat()
+    assert t1 not in [ts for ts, _, _ in store.reactions_since("main_bedroom", since)]
+    print(f"vote: a reversal reported in the same second as its vote is recorded a second "
+          f"later, after it (one vote at a time), names it, and marks it reversed_at; logged "
+          f"\"{msg}\"; the Now view's last vote says reversal - OK")
+    count = n_reactions("main_bedroom")
 
     # --- section runs: a sleep run crossing midnight, with a restart inside it ---
     from datetime import datetime as dt

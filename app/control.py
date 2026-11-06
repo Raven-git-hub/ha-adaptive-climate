@@ -25,7 +25,11 @@ rule is a small named function, written the way a template can say it.
                       button press, or a setpoint change on a remote): one
                       per episode, forcing a rest or a boost (the unit
                       changed on a remote boosts at the value chosen there,
-                      no boost step: boost_step)
+                      no boost step: boost_step); room_vote adds the
+                      reversal window (decision 146): an opposite vote
+                      within vote_reversal_seconds of an accepted one puts
+                      each unit back as it was before it (restore), then
+                      applies itself, and the first teaches nothing
   on_person_change    what a person turning a unit on or off, or changing
                       its mode or fan, does to the unit's record (no
                       command: the person already moved the unit)
@@ -40,7 +44,10 @@ rule is a small named function, written the way a template can say it.
 
 A unit's state lives in its helpers (phase 3b): ac_state, ac_base,
 ac_offset, ac_since, ac_grace_until, ac_unblocked, ac_forced,
-ac_section_rest and ac_chosen.
+ac_section_rest and ac_chosen; the reversal window in ac_vote_window_<room>
+(the last accepted vote's direction and time) and each unit's
+ac_prevote_<room>_<unit> (its record before that vote, and what the vote
+left it in).
 """
 
 from __future__ import annotations
@@ -102,6 +109,7 @@ class ControlConfig:
     person_grace_minutes: int = 30
     offset_cap: int = 3
     user_off_wakes_on_warm: bool = True     # a too-warm quorum ends a person's off
+    vote_reversal_seconds: int = 20         # an opposite vote this soon reverses (0: never)
 
     @classmethod
     def from_config(cls, config: dict) -> ControlConfig:
@@ -160,15 +168,42 @@ class Climate:
 
 
 @dataclass(frozen=True)
+class Prevote:
+    """One unit's part in the reversal window (ac_prevote_<room>_<unit>):
+    its record before the accepted vote, and the state, since and base the
+    vote left it in, so a reversal restores only a unit nothing else has
+    moved since (untouched)."""
+    unit: Unit
+    state: str
+    since: datetime | None
+    base: float | None
+
+
+@dataclass(frozen=True)
+class VoteWindow:
+    """The reversal window an accepted vote opens (ac_vote_window_<room>):
+    its direction and time, and each unit's Prevote."""
+    at: datetime
+    direction: str
+    prevotes: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class PersonVote:
     """A person's vote as the ac_person_vote event reports it: accepted, or
-    ignored because an episode is running. source is button or remote; a
-    remote vote also names the unit changed and the setpoint chosen."""
+    ignored because an episode is running (or it repeats the vote whose
+    window is open). source is button or remote; a remote vote also names
+    the unit changed and the setpoint chosen. reversal: it reversed the
+    vote at reverses_at (decision 146). opens: the window an accepted vote
+    opens, which the next vote reads (not part of the event)."""
     direction: str                      # too_cold | too_hot
     accepted: bool
     source: str
     unit: str | None = None
     chosen: float | None = None
+    reversal: bool = False
+    reverses_at: datetime | None = None
+    opens: VoteWindow | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -543,15 +578,110 @@ def unblock_for_vote(unit: Unit, ctx: Context) -> Unit:
 def on_room_vote(direction: str, units: dict[str, Unit], now: datetime,
                  ctxs: dict[str, Context], chosen: dict[str, float] | None = None
                  ) -> tuple[bool, dict[str, tuple[Unit, Command | None]]]:
-    """A person's vote for the whole room: (accepted, {unit_id: (unit,
-    command)}). Ignored, changing nothing, while an episode is running;
-    else every unit takes its part. chosen: {unit_id: setpoint} for a unit
-    changed on its remote."""
-    if in_episode(units.values()):
-        return False, {uid: (u, None) for uid, u in units.items()}
+    """A person's vote for the whole room with no reversal window open:
+    (accepted, {unit_id: (unit, command)}). room_vote has the whole rule."""
+    outcome = room_vote(direction, units, now, ctxs, chosen)
+    return outcome.accepted, outcome.results
+
+
+# ---------------------------------------------------------------------
+# The reversal window (decision 146): a person who pressed the wrong way
+# can put it right at once, instead of being locked out by the episode.
+# ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class VoteOutcome:
+    accepted: bool
+    reversal: bool
+    reverses_at: datetime | None
+    results: dict                       # {unit_id: (unit, command)}
+    opens: VoteWindow | None            # the window an accepted vote opens
+
+
+def window_open(window: VoteWindow | None, now: datetime, config: ControlConfig) -> bool:
+    """The last accepted vote was at most vote_reversal_seconds ago."""
+    return window is not None and \
+        timedelta(0) <= now - window.at <= timedelta(seconds=config.vote_reversal_seconds)
+
+
+def reverses(direction: str, window: VoteWindow | None, now: datetime,
+             config: ControlConfig) -> bool:
+    """A vote against the one whose window is open reverses it."""
+    return window_open(window, now, config) and window.direction != direction
+
+
+def repeats(direction: str, window: VoteWindow | None, now: datetime,
+            config: ControlConfig) -> bool:
+    """A vote the same way as the one whose window is open is a second
+    press of it: ignored, episode or not."""
+    return window_open(window, now, config) and window.direction == direction
+
+
+def vote_accepted(direction: str, units: Iterable[Unit], now: datetime,
+                  window: VoteWindow | None, config: ControlConfig) -> bool:
+    """A reversal is accepted whatever the episode; any other vote only
+    with no episode running, and not as a repeat inside the window."""
+    return reverses(direction, window, now, config) or (
+        not in_episode(units) and not repeats(direction, window, now, config))
+
+
+def untouched(unit: Unit, prevote: Prevote) -> bool:
+    """Nothing has moved the unit since the vote: it still has the state,
+    since and base the vote left it in (a section change, a person, a leak
+    or a heartbeat's transition would have changed one)."""
+    return (unit.state == prevote.state and unit.since == prevote.since
+            and abs((unit.base or 0.0) - (prevote.base or 0.0)) < 0.01)
+
+
+def restore(unit: Unit, prevote: Prevote | None, ctx: Context) -> Unit:
+    """A reversal puts the unit back to its exact record before the
+    reversed vote (state, base, offset, forced, section_rest, unblocked,
+    chosen, since), unless something has moved it since or its leak latch
+    is on; then the new vote applies to it as it is."""
+    if prevote is None or ctx.leak_on or not untouched(unit, prevote):
+        return unit
+    return replace(prevote.unit, grace_until=unit.grace_until)
+
+
+def reversal_command(current: Unit, new: Unit, command: Command | None,
+                     ctx: Context) -> Command | None:
+    """After a reversal the unit may still be doing what the reversed vote
+    told it: a vote that sends nothing (a rest into a forced rest, a
+    person's off kept) but leaves the unit in another state than it is in
+    now sends that state's command."""
+    if command is None and new.state != current.state:
+        return implied_command(new, ctx)
+    return command
+
+
+def room_vote(direction: str, units: dict[str, Unit], now: datetime, ctxs: dict[str, Context],
+              chosen: dict[str, float] | None = None,
+              window: VoteWindow | None = None) -> VoteOutcome:
+    """A person's vote for the whole room. Ignored, changing nothing, while
+    an episode is running or as a repeat inside the window
+    (vote_accepted). A reversal first restores every unit (restore), then
+    the vote applies to each from there, with reversal_command. Every
+    accepted vote opens a new window, recording each unit's record as the
+    vote found it (restored, for a reversal) and what it left. chosen:
+    {unit_id: setpoint} for a unit changed on its remote."""
+    config = next(iter(ctxs.values())).config
+    if not vote_accepted(direction, units.values(), now, window, config):
+        return VoteOutcome(False, False, None, {uid: (u, None) for uid, u in units.items()},
+                           None)
+    reversal = reverses(direction, window, now, config)
     chosen = chosen or {}
-    return True, {uid: on_person_vote(direction, u, now, ctxs[uid], chosen.get(uid))
-                  for uid, u in units.items()}
+    found = {uid: restore(u, window.prevotes.get(uid), ctxs[uid]) if reversal else u
+             for uid, u in units.items()}
+    results = {}
+    for uid, unit in found.items():
+        new, command = on_person_vote(direction, unit, now, ctxs[uid], chosen.get(uid))
+        if reversal:
+            command = reversal_command(units[uid], new, command, ctxs[uid])
+        results[uid] = (new, command)
+    opens = VoteWindow(now, direction, {
+        uid: Prevote(found[uid], new.state, new.since, new.base)
+        for uid, (new, _) in results.items()})
+    return VoteOutcome(True, reversal, window.at if reversal else None, results, opens)
 
 
 def setpoint_direction(before: Climate, after: Climate) -> str:
@@ -852,29 +982,37 @@ def person_change_kind(unit: Unit, before: Climate, after: Climate, ctx: Context
     return classify_change(before, after, ctx.min_delta)
 
 
+def _person_vote(outcome: VoteOutcome, direction: str, source: str, unit: str | None = None,
+                 chosen: float | None = None) -> PersonVote:
+    return PersonVote(direction, outcome.accepted, source, unit, chosen, outcome.reversal,
+                      outcome.reverses_at, outcome.opens)
+
+
 def on_button(direction: str, units: dict[str, Unit], now: datetime,
-              ctxs: dict[str, Context]) -> tuple[dict[str, tuple[Unit, Command | None]],
-                                                 PersonVote]:
+              ctxs: dict[str, Context], window: VoteWindow | None = None
+              ) -> tuple[dict[str, tuple[Unit, Command | None]], PersonVote]:
     """The vote automation: a press of the room's too_cold or too_hot
-    button."""
-    accepted, results = on_room_vote(direction, units, now, ctxs)
-    return results, PersonVote(direction, accepted, "button")
+    button, with the room's reversal window."""
+    outcome = room_vote(direction, units, now, ctxs, window=window)
+    return outcome.results, _person_vote(outcome, direction, "button")
 
 
 def on_climate_change(units: dict[str, Unit], uid: str, before: Climate, after: Climate,
-                      now: datetime, ctxs: dict[str, Context]
+                      now: datetime, ctxs: dict[str, Context], window: VoteWindow | None = None
                       ) -> tuple[dict[str, tuple[Unit, Command | None]], PersonVote | None]:
     """The manual-change automation for unit `uid`, once it knows the change
     carries no parent context, the guard is off and the unit is reporting.
     Our own command showing up late changes nothing. A setpoint change is a
-    vote for the room, with the value chosen as that unit's new base; on,
-    off and manual change that unit's record alone."""
+    vote for the room, with the value chosen as that unit's new base (and
+    the room's reversal window, as for a press); on, off and manual change
+    that unit's record alone."""
     results = {u: (x, None) for u, x in units.items()}
     kind = person_change_kind(units[uid], before, after, ctxs[uid])
     if kind == "setpoint":
         direction = setpoint_direction(before, after)
-        accepted, results = on_room_vote(direction, units, now, ctxs, {uid: after.temperature})
-        return results, PersonVote(direction, accepted, "remote", uid, after.temperature)
+        outcome = room_vote(direction, units, now, ctxs, {uid: after.temperature}, window)
+        return outcome.results, _person_vote(outcome, direction, "remote", uid,
+                                             after.temperature)
     if kind is not None:
         results[uid] = (on_person_change(kind, units[uid], after.temperature, now, ctxs[uid]),
                         None)

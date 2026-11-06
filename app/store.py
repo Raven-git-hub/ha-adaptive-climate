@@ -53,7 +53,11 @@ HEARTBEAT_CSV = ["ts", "ts_utc", "section", "occupied", "any_unit_on",
                  "outdoor_temp"]                                    # v2
 REACTIVE_CSV = ["ts", "ts_utc", "section", "window_seconds", "occupied",
                 "suspended_maint", "units", "sensors",
-                "kind", "outdoor_temp"]                             # v2
+                "kind", "outdoor_temp",                             # v2
+                "reverses"]                                         # migration 6
+# A vote's row names the vote it reversed (its ts_utc) in `reverses`; the
+# reversed vote's own row was written before, so re-ingest marks it from
+# here (reactive.reversed_at = this row's ts_utc), as record_reactive does.
 # One row when a section run starts, one when its forecast has been read
 # (outdoor_mean and outdoor_max only), one when its conditions are decided
 # (comfort_point, lean, blocked and block_mode only), one if the room
@@ -261,6 +265,18 @@ def _migration_5(conn: sqlite3.Connection, schema: _Schema) -> None:
     _rebuild_table(conn, schema, "section_run")
 
 
+def _migration_6(conn: sqlite3.Connection, schema: _Schema) -> None:
+    """A vote's reversal (decision 146).
+
+    reactive is rebuilt with its rows and two new nullable columns:
+    reverses (on a vote that reversed another within the reversal window,
+    the reversed vote's ts_utc) and reversed_at (on the reversed vote, when
+    it was reversed), which the replay reads to skip it. Older rows keep
+    NULL: no vote was reversed before there was a window. reactive_unit and
+    reactive_sensor keep their rows, still attached by id."""
+    _rebuild_table(conn, schema, "reactive")
+
+
 # (label for the pre-migration backup file, migration). Migration n takes
 # storage version n-1 to n; the label names the shape it upgrades from.
 # Append only.
@@ -270,7 +286,14 @@ MIGRATIONS: list[tuple[str, Callable[[sqlite3.Connection, _Schema], None]]] = [
     ("pre-votes", _migration_3),
     ("pre-starts", _migration_4),
     ("pre-overrule", _migration_5),
+    ("pre-reversal", _migration_6),
 ]
+
+VOTE_KINDS_SQL = "('too_cold','too_hot')"
+# The reactions the replay learns from: not a vote reversed by `until` (one
+# parameter, the replay's as-of ts_utc).
+NOT_REVERSED_SQL = "(reversed_at IS NULL OR reversed_at > ?)"
+
 
 def _now_pair() -> tuple[str, str]:
     n = datetime.now().astimezone()
@@ -445,24 +468,32 @@ class Store:
                         occupied: bool | None = None,
                         suspended_maint: bool = False,
                         kind: str | None = None,
-                        outdoor_temp: float | None = None) -> int:
+                        outdoor_temp: float | None = None,
+                        reverses: str | None = None) -> int:
+        """One reaction, CSV first. reverses: for a vote that reversed
+        another (decision 146), that vote's ts_utc; its row is marked
+        reversed_at this one's ts_utc in the same transaction."""
         self._append_csv(
             room_id, local_date, "reactive", REACTIVE_CSV,
             [ts, ts_utc, section, window_seconds,
              "" if occupied is None else int(occupied), int(suspended_maint),
              json.dumps({uid: u.__dict__ for uid, u in units.items()}),
              json.dumps(sensors),
-             kind, outdoor_temp])
+             kind, outdoor_temp, reverses or ""])
         with self._lock:
             try:
                 cur = self._conn.execute(
                     "INSERT INTO reactive(room_id,ts,ts_utc,local_date,section,"
-                    "window_seconds,occupied,suspended_maint,kind,outdoor_temp) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "window_seconds,occupied,suspended_maint,kind,outdoor_temp,reverses) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (room_id, ts, ts_utc, local_date, section, window_seconds,
                      None if occupied is None else int(occupied), int(suspended_maint),
-                     kind, outdoor_temp))
+                     kind, outdoor_temp, reverses))
                 rid = cur.lastrowid
+                if reverses is not None:
+                    self._conn.execute(
+                        f"UPDATE reactive SET reversed_at=? WHERE room_id=? AND ts_utc=? "
+                        f"AND kind IN {VOTE_KINDS_SQL}", (ts_utc, room_id, reverses))
                 self._conn.executemany(
                     "INSERT INTO reactive_unit(reactive_id,unit_id,setpoint_before,"
                     "setpoint_after,changed,kind,power_before,power_after) "
@@ -692,14 +723,25 @@ class Store:
                 runs.append((at, r["blocked"] and r["overruled_at"] is None))
         return bool(max(runs, key=lambda x: x[0])[1]) if runs else False
 
+    def last_vote(self, room_id: str, kind: str, since_utc: str) -> str | None:
+        """The ts_utc of the room's latest vote of this kind at or after
+        since_utc that nothing has reversed: the vote a reversal reverses."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ts_utc FROM reactive WHERE room_id=? AND kind=? AND ts_utc>=? "
+                "AND reversed_at IS NULL ORDER BY ts_utc DESC, id DESC LIMIT 1",
+                (room_id, kind, since_utc)).fetchone()
+        return None if row is None else row[0]
+
     def reactions_since(self, room_id: str, since_utc: str) -> list[tuple[str, str | None, dict]]:
         """(ts_utc, kind, {unit_id: (setpoint_before, setpoint_after)}) of the
-        room's reactions at or after since_utc, oldest first. The runtime uses
-        it at startup to re-arm comfort replays."""
+        room's reactions at or after since_utc, oldest first, a reversed vote
+        left out (it teaches nothing). The runtime uses it at startup to re-arm
+        comfort replays."""
         with self._lock:
             heads = self._conn.execute(
                 "SELECT id, ts_utc, kind FROM reactive WHERE room_id=? AND ts_utc>=? "
-                "ORDER BY ts_utc, id", (room_id, since_utc)).fetchall()
+                "AND reversed_at IS NULL ORDER BY ts_utc, id", (room_id, since_utc)).fetchall()
             return [(h["ts_utc"], h["kind"], {
                 u["unit_id"]: (u["setpoint_before"], u["setpoint_after"])
                 for u in self._conn.execute(

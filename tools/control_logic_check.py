@@ -32,8 +32,11 @@ fallback. The room's heat source is a switch, on when the scenario says.
 
 A scenario's room may have more than one unit: every unit's helpers and
 commands must be control's. A vote's ac_person_vote event must say what
-control says - accepted exactly when control.in_episode found no forced
-state in the room - and anything else must fire none. A heartbeat fires
+control says - accepted exactly when control.vote_accepted says so (a
+reversal of the vote whose window is open, or no forced state in the room
+and not a repeat inside the window; decision 146), a reversal with the
+reversed vote's time - and anything else must fire none. The reversal
+window lives in its helpers across a scenario's steps, as control's does. A heartbeat fires
 ac_block_overruled exactly when control.on_heartbeat says the room
 overruled the block (decision 143), with control's un-leaned votes and the
 units it woke, and ac_user_off_wake once per unit control woke from a
@@ -65,6 +68,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import json
 import random
 import re
 import sys
@@ -146,10 +150,19 @@ class _States:
         return Domain()
 
 
+def _ha_environment() -> Environment:
+    """Plain Jinja2 with Home Assistant's from_json and to_json filters
+    (to_json as compact as HA's orjson)."""
+    env = Environment()
+    env.filters["from_json"] = json.loads
+    env.filters["to_json"] = lambda value: json.dumps(value, separators=(",", ":"))
+    return env
+
+
 class HA:
     """Entity states, the services our automations call, and a runner."""
 
-    _env = Environment()
+    _env = _ha_environment()
     _compiled: dict[str, object] = {}
 
     def __init__(self, room: str = ROOM, entity: str = ENTITY, lag: bool = False) -> None:
@@ -164,6 +177,10 @@ class HA:
         self.pending_mode: str | None = None
         self.waits: list[bool] = []
         self.events: list[tuple[str, dict]] = []                # event type, data
+
+    def calls_but_window(self) -> list:
+        """The run's service calls other than the reversal window's."""
+        return [c for c in self.calls if c[0] != "input_text.set_value"]
 
     def settle(self) -> None:
         """Time passes: a lagging unit now reports the mode it was sent."""
@@ -226,6 +243,12 @@ class HA:
             value = float(data["value"])
             assert a["min"] <= value <= a["max"], (entity_id, value)
             e["state"] = str(value)
+        elif service == "input_text.set_value":
+            # HA hands input_text the rendered value; one that parsed as a
+            # literal would arrive as a dict or number, not the text we wrote
+            assert isinstance(data["value"], str), (entity_id, data)
+            assert len(data["value"]) <= g.INPUT_TEXT_MAX, (entity_id, data)
+            e["state"] = data["value"]
         elif service == "input_datetime.set_datetime":
             a["timestamp"] = float(int(data["timestamp"]))     # whole seconds
             e["state"] = datetime.fromtimestamp(a["timestamp"], table.T0.tzinfo).strftime(
@@ -536,7 +559,8 @@ def _event_says(pv: control.PersonVote | None) -> dict | None:
     if pv is None:
         return None
     data = {"room": ROOM, "direction": pv.direction, "accepted": pv.accepted,
-            "source": pv.source}
+            "source": pv.source, "reversal": pv.reversal,
+            "reverses_at": None if pv.reverses_at is None else int(pv.reverses_at.timestamp())}
     if pv.source == "remote":
         data.update(chosen=pv.chosen, unit=pv.unit)
     return data
@@ -549,12 +573,13 @@ def _event_says(pv: control.PersonVote | None) -> dict | None:
 class Replay:
     def __init__(self) -> None:
         self.steps = self.runs = self.echoes = self.kinds = self.ours = self.twice = 0
-        self.events = self.ignored = self.wakes = self.overrules = 0
+        self.events = self.ignored = self.wakes = self.overrules = self.reversals = 0
         self.last_vars: dict | None = None
         self.first_rendered: dict | None = None
 
     def scenario(self, sc: dict) -> list[str]:
         units = table._room(sc)
+        self.window = None                  # the room's reversal window, as control has it
         ha = HA()
         first = table._ctx(sc["ctx"])
         for uid, unit in units.items():
@@ -626,7 +651,9 @@ class Replay:
         if do == "person":
             before, after = _person_event(st["kind"], ha, st.get("setpoint"))
             st = {**st, "before": dataclasses.asdict(before), "after": dataclasses.asdict(after)}
-        new, commands, pv, overruled = table.apply(st, units, now, ctx)
+        self.now, self.before = now, self.window
+        new, commands, pv, overruled = table.apply(st, units, now, ctx, self.window)
+        self.window = table.next_window(self.window, pv)
         commands = commands or {}
 
         if do == "step":
@@ -794,17 +821,22 @@ class Replay:
 
     def check_event(self, ha: HA, olds: dict, pv: control.PersonVote | None) -> str | None:
         """The run's ac_person_vote events: exactly control's vote, if any,
-        accepted exactly when control.in_episode found no forced rest or
-        boost in the room before it."""
+        accepted exactly when control.vote_accepted says so: a reversal of the
+        vote whose window is open, or no forced rest or boost in the room
+        before it and not a repeat inside the window."""
         events = [data for kind, data in ha.events if kind == g.PERSON_VOTE_EVENT]
         want = _event_says(pv)
         if want is None:
             return None if not events else f"a vote event {events} where control has no vote"
         if events != [want]:
             return f"vote events {events}, control {want}"
-        if events[0]["accepted"] != (not control.in_episode(olds.values())):
-            return (f"the event says accepted={events[0]['accepted']}, but control.in_episode "
-                    f"is {control.in_episode(olds.values())}")
+        cfg = next(iter(self.ctxs.values())).config
+        accepted = control.vote_accepted(pv.direction, olds.values(), self.now, self.before,
+                                         cfg)
+        if events[0]["accepted"] != accepted:
+            return (f"the event says accepted={events[0]['accepted']}, but "
+                    f"control.vote_accepted is {accepted}")
+        self.reversals += events[0]["reversal"]
         self.events += 1
         self.ignored += not events[0]["accepted"]
         return None
@@ -1178,10 +1210,20 @@ def _extra_cases() -> int:
     ha.set(g.hold_id(ROOM), "on")
     ha.run(vote, fired(vote, _press("too_cold"))[0])
     expect(vote_events(ha) == [{"room": ROOM, "direction": "too_cold", "accepted": True,
-                                "source": "button"}]
-           and not ha.calls and _view(ha, table.T0) == snapshot,
+                                "source": "button", "reversal": False, "reverses_at": None}]
+           and not ha.calls_but_window() and _view(ha, table.T0) == snapshot,
            "hold on: a press is reported (accepted, so it is learned) but changes and sends "
-           "nothing")
+           "nothing (it still opens its reversal window)")
+    ha.now = table.T0 + timedelta(seconds=10)
+    ha.calls = []
+    ha.run(vote, fired(vote, _press("too_hot"))[0])
+    expect(vote_events(ha)[-1] == {"room": ROOM, "direction": "too_hot", "accepted": True,
+                                   "source": "button", "reversal": True,
+                                   "reverses_at": int(table.T0.timestamp())}
+           and not ha.calls_but_window() and _view(ha, table.T0) == snapshot,
+           "hold on: an opposite press 10 s later is reported as a reversal (so the first is "
+           "not learned), and still changes and sends nothing")
+    ha.now = table.T0
     ha, config, room = world(cool)
     ha.set(g.hold_id(ROOM), "on")
     manual = g.build_manual_change_automation(config, room, room["units"][0])
@@ -1190,7 +1232,7 @@ def _extra_cases() -> int:
     for t in fired(manual, _trigger(*up)):
         ha.run(manual, t)
     expect([(d["direction"], d["accepted"], d["source"]) for d in vote_events(ha)]
-           == [("too_cold", True, "remote")] and not ha.calls
+           == [("too_cold", True, "remote")] and not ha.calls_but_window()
            and ha.states(g.state_id(ROOM, UNIT)) == "cool",
            "hold on: a remote setpoint change is reported but changes and sends nothing")
 
@@ -1237,10 +1279,18 @@ def _extra_cases() -> int:
     ha.run(vote, fired(vote, _press("too_hot"))[0])
     climate = [i for i, sv in enumerate(order) if sv.startswith("climate.")]
     helpers = [i for i, sv in enumerate(order) if sv.startswith("input_select.")]
-    expect(order[:2] == [g.PERSON_VOTE_EVENT, "input_boolean.turn_on"] and climate and helpers
+    window = [i for i, sv in enumerate(order) if sv == "input_text.set_value"]
+    expect(order[0] == g.PERSON_VOTE_EVENT and window == [1, 2]
+           and order[3] == "input_boolean.turn_on" and climate and helpers
            and helpers[0] < climate[0] and order[-1] == "input_boolean.turn_off",
-           "a press: the event first, then the guard up, the helpers, the commands, the guard "
-           "down")
+           "a press: the event first, then its reversal window (the room's, then each unit's "
+           "record), the guard up, the helpers, the commands, the guard down")
+    pre = json.loads(ha.states(g.prevote_id(ROOM, UNIT)))
+    expect(ha.states(g.vote_window_id(ROOM)) == f"too_hot {int(table.T0.timestamp())}"
+           and pre["st"] == "cool" and pre["ps"] == "boost" and pre["pb"] == 21.0
+           and pre["pt"] == int(table.T0.timestamp()),
+           "the window reads 'too_hot <epoch>'; the unit's record is the cool it was, and what "
+           f"the vote left (boost at 21): {pre}")
     return fails
 
 
@@ -1255,8 +1305,8 @@ def main() -> int:
           f"app.control ({replay.steps} template runs, {replay.echoes} echoes ignored, "
           f"{replay.kinds} changes' kind and is-this-ours checked, {replay.ours} of them ours, "
           f"{replay.twice} firing two triggers, run once; {replay.events} vote events, "
-          f"{replay.ignored} of them ignored, each accepted exactly when control.in_episode "
-          f"found no forced state; {replay.wakes} wake events, each exactly a user_off "
+          f"{replay.reversals} of them reversals, {replay.ignored} ignored, each accepted "
+          f"exactly when control.vote_accepted says so; {replay.wakes} wake events, each exactly a user_off "
           f"control woke; {replay.overrules} overrule events, each exactly a heartbeat whose "
           f"room overruled the block in control)")
     fuzz = _fuzz_votes(40)

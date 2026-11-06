@@ -155,6 +155,14 @@ def cases() -> list[dict]:
             step("too_hot", {"accepted": False}, "Already correcting, ignored",
                  label="Resting", sub="you said too cold"),
             step("too_cold", None, "Sent")]),
+        # Decision 146: the other button just after an accepted vote reverses
+        # it, and the card says what the room changed to.
+        case("vote-reversal", {"label": "Cool \u00b7 Low"}, readings=COOL, shot_step=1, steps=[
+            step("too_cold", {"accepted": True}, "Got it, resting", after=FORCED_REST,
+                 label="Resting", sub="you said too cold", centre="Off"),
+            step("too_hot", {"accepted": True, "reversal": True}, "Changed to Cooling",
+                 after=FORCED_BOOST, label="Boost \u00b7 Medium", sub="you said too hot",
+                 centre="20\u00b0")]),
         case("overview", {"strip_kinds": ["hold", "stale"], "rooms": 3}, full=True,
              rooms="all", hold=True, readings=COOL, stale={"living2": 180}),
     ]

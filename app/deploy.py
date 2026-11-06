@@ -4,7 +4,8 @@ Adaptive Climate - deployment to Home Assistant.
 Two different reconciliation strategies, because Home Assistant exposes
 two different APIs:
 
-  * HELPERS (input_boolean/input_select/input_number/input_datetime) use
+  * HELPERS (input_boolean/input_select/input_number/input_datetime/
+    input_button/input_text) use
     HA's storage collection WebSocket commands, which include a reliable
     `{domain}/list`. So helpers are reconciled by LIST-DIFF: list what
     exists, create what's missing, update ours whose settings changed (a
@@ -54,7 +55,7 @@ from app.ha import HAError, HARest, HAWebSocket
 
 MANIFEST_FILENAME = "deploy_manifest.json"
 HELPER_DOMAINS = ("input_boolean", "input_select", "input_number", "input_datetime",
-                  "input_button")
+                  "input_button", "input_text")
 # A newly created unit is hands off until its room's next section change,
 # so deploying sends no command to any unit.
 NEW_UNIT_STATE = "manual"

@@ -14,7 +14,9 @@ Observation (passive):
     nothing itself. An accepted vote is recorded straight away as a
     reaction of kind too_cold / too_hot with every sensor's reading, and
     the room replayed; an ignored one is logged as an "ignored press" and
-    teaches nothing.
+    teaches nothing. A reversal (an opposite vote within
+    system.control.vote_reversal_seconds, decision 146) is recorded the same
+    way and marks the vote it reversed, which the replay then skips.
   * reactive detection - a state_changed subscription; a person's change
     to a unit (NOT automation-caused) - turning it on or off, or a mode or
     fan change while on - opens a consolidation window, snapshots every
@@ -201,10 +203,21 @@ def _deg(value: float) -> str:
     return text + "0" if text.endswith(".") else text
 
 
-def _accepted(data: dict) -> bool:
-    """ac_person_vote's accepted flag, which a template may render as a
+def _flag(data: dict, key: str) -> bool:
+    """A boolean in an event's data, which a template may render as a
     string."""
-    return data.get("accepted") is True or str(data.get("accepted")).lower() == "true"
+    return data.get(key) is True or str(data.get(key)).lower() == "true"
+
+
+def _accepted(data: dict) -> bool:
+    """ac_person_vote's accepted flag."""
+    return _flag(data, "accepted")
+
+
+# How far before HA's time for a reversed vote (reverses_at) the runtime
+# looks for its record: the runtime stamps a vote when it records it, a
+# moment after HA's, and the two clocks may differ a little.
+REVERSAL_LOOKBACK = timedelta(seconds=60)
 
 
 def _number(state: str | None, default: float | None = 0.0) -> float | None:
@@ -321,6 +334,9 @@ class Runtime:
         self._margin_skips: dict[str, set] = {}              # room -> skipped steps already seen
         self.last_votes: dict[str, dict] = {}                # room -> HA's latest ac_person_vote
         self._vote_seq = 0                                   # counts them, for the vote endpoint
+        # votes are recorded one at a time, in the order HA reported them, so
+        # a reversal always finds the vote it reverses already recorded
+        self._vote_lock = asyncio.Lock()
         self._stopping = False
         # One lock: a crossover, a replay and a config reload never run at
         # the same time, so a reload never swaps the rooms out from under a
@@ -745,7 +761,8 @@ class Runtime:
             self.last_votes[data["room"]] = {
                 "seq": self._vote_seq, "direction": data.get("direction"),
                 "accepted": _accepted(data), "source": data.get("source"),
-                "unit": data.get("unit"), "at": self._now()[0]}
+                "unit": data.get("unit"), "reversal": _flag(data, "reversal"),
+                "at": self._now()[0]}
         task = asyncio.create_task(self._record_vote(event))
         self._followups.add(task)
         task.add_done_callback(self._followups.discard)
@@ -888,7 +905,28 @@ class Runtime:
     async def _record_vote(self, event: dict) -> None:
         """Record an accepted vote as a reaction (too_cold / too_hot, every
         sensor's reading, a remote's unit and chosen setpoint) and replay the
-        room at once; log an ignored one. HA decided which it is."""
+        room at once; log an ignored one. HA decided which it is. A
+        reversal (decision 146) also marks the vote it reversed, which then
+        teaches nothing. One vote at a time, in the order they came."""
+        async with self._vote_lock:
+            await self._record_vote_locked(event)
+
+    def _reversed_vote(self, room_id: str, direction: str, data: dict,
+                       now: datetime) -> str | None:
+        """The ts_utc of the recorded vote a reversal reverses: the room's
+        latest unreversed vote the other way since HA's reverses_at (less
+        REVERSAL_LOOKBACK), or None if it was never recorded."""
+        other = control.TOO_HOT if direction == control.TOO_COLD else control.TOO_COLD
+        at = _number(data.get("reverses_at"), None)
+        start = (datetime.fromtimestamp(at, ZoneInfo("UTC")) if at is not None
+                 else now - timedelta(seconds=self._reversal_seconds()))
+        since = (start - REVERSAL_LOOKBACK).astimezone(ZoneInfo("UTC"))
+        return self.store.last_vote(room_id, other, since.isoformat(timespec="seconds"))
+
+    def _reversal_seconds(self) -> int:
+        return control.ControlConfig.from_config(self.config).vote_reversal_seconds
+
+    async def _record_vote_locked(self, event: dict) -> None:
         data = event.get("data") or {}
         room_id, direction = data.get("room"), data.get("direction")
         source, unit_id, chosen = data.get("source"), data.get("unit"), data.get("chosen")
@@ -906,29 +944,51 @@ class Runtime:
             self.store.log_event(
                 ts, ts_utc, "info", "reactive",
                 f"{name}: ignored press: {direction} from {via}, during a forced rest or "
-                "boost (one correction per episode); nothing changed or learned",
+                "boost (one correction per episode), or a second press the same way just "
+                "after the first; nothing changed or learned",
                 room_id=room_id, detail={"vote": data, "ignored": True})
             return
+        reversal = _flag(data, "reversal")
+        reverses = self._reversed_vote(room_id, direction, data, now) if reversal else None
         states = {s["entity_id"]: s for s in await self.rest.states()}
         sensors = {s["id"]: self._sensor_reading(s, rs.room, states) for s in rs.room["sensors"]}
         units = {}
         if source == "remote" and unit_id in {u["id"] for u in rs.room["units"]}:
             units[unit_id] = ReactiveUnitSample(None, _number(chosen, None), True,
                                                 kind=direction)
+        if reverses is not None and reverses >= ts_utc:
+            # a reversal in the same second as the vote it reverses (a quick
+            # double tap): reactions are one per room and second, so it is
+            # stamped a second later rather than lost
+            later = now + timedelta(seconds=1)
+            ts, ts_utc = (later.isoformat(timespec="seconds"),
+                          later.astimezone(ZoneInfo("UTC")).isoformat(timespec="seconds"))
         try:
             self.store.record_reactive(room_id, ts, ts_utc, local_date, rs.section or "day",
                                        0, units, sensors, kind=direction,
-                                       outdoor_temp=self._outdoor_temp(states))
+                                       outdoor_temp=self._outdoor_temp(states),
+                                       reverses=reverses)
         except sqlite3.IntegrityError as e:
             self.store.log_event(ts, ts_utc, "warning", "reactive",
                                  f"{name}: a {direction} vote from {via} came in the same second "
                                  f"as another reaction and was not recorded ({e})",
                                  room_id=room_id, detail={"vote": data})
             return
-        self.store.log_event(ts, ts_utc, "info", "reactive",
-                             f"{name}: a person voted {direction} ({via})", room_id=room_id,
-                             detail={"kind": direction, "vote": data, "sensors": sensors})
-        log.info("vote (%s, %s) recorded for %s", direction, source, room_id)
+        if reversal:
+            other = control.TOO_HOT if direction == control.TOO_COLD else control.TOO_COLD
+            message = (f"{name}: {other} reversed to {direction} within "
+                       f"{self._reversal_seconds()} s; the first vote teaches nothing")
+            if reverses is None:
+                message += " (it was never recorded)"
+            self.store.log_event(ts, ts_utc, "info", "reactive", message, room_id=room_id,
+                                 detail={"kind": direction, "vote": data, "sensors": sensors,
+                                         "reversal": True, "reverses": reverses})
+        else:
+            self.store.log_event(ts, ts_utc, "info", "reactive",
+                                 f"{name}: a person voted {direction} ({via})", room_id=room_id,
+                                 detail={"kind": direction, "vote": data, "sensors": sensors})
+        log.info("vote (%s, %s%s) recorded for %s", direction, source,
+                 ", a reversal" if reversal else "", room_id)
         await self.replay_room(room_id, "vote")
         self._schedule_comfort_replay(room_id, now + COMFORT_REPLAY_DELAY)
 

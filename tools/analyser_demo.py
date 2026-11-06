@@ -108,16 +108,20 @@ class Scenario:
             sensors=dict(STEADY if readings is None else readings), kind=kind)
 
     def vote(self, when: datetime, kind: str, readings: dict | None = None,
-             chosen: float | None = None, section: str = "day") -> None:
+             chosen: float | None = None, section: str = "day",
+             reverses: datetime | None = None) -> None:
         """A person's vote as the runtime records HA's ac_person_vote event:
-        no unit rows for a button, the value chosen for a remote."""
+        no unit rows for a button, the value chosen for a remote. reverses:
+        the time of the vote this one reversed (decision 146)."""
         units = {} if chosen is None else {"ac": ReactiveUnitSample(None, chosen, True,
                                                                     kind=kind)}
         self.store.record_reactive(
             "lounge", when.isoformat(timespec="seconds"),
             when.astimezone(timezone.utc).isoformat(timespec="seconds"),
             when.date().isoformat(), section, 0, units=units,
-            sensors=dict(STEADY if readings is None else readings), kind=kind)
+            sensors=dict(STEADY if readings is None else readings), kind=kind,
+            reverses=None if reverses is None else
+            reverses.astimezone(timezone.utc).isoformat(timespec="seconds"))
 
     def run(self, start: datetime, end: datetime | None, section: str = "day") -> None:
         self.store.record_section_run(
@@ -429,6 +433,80 @@ def check_votes() -> None:
     assert day.sensor_band == {"wall": 3.5, "door": 5.0}
     ok("a `setpoint` row recorded before the votes moves no comfort straight away (only its "
        "window does), but its band nudge is the same rule")
+
+
+def check_reversed_vote() -> None:
+    """Decision 146: a vote reversed within the window teaches nothing.
+    The replay of too_cold then too_hot 10 s later (marked a reversal) must
+    equal the replay of the too_hot alone: comfort, setpoint, applied
+    setpoint, bands, trust, confidence (the quiet count) and status, and
+    the block margin. As of a moment before the reversal, the first vote
+    still counts. The reversal is in the CSV, so a rebuild finds it."""
+    print("a reversed vote (decision 146)")
+    cold = {"wall": 23.0, "door": 26.0}
+    hot = {"wall": 26.0, "door": 25.0}
+    first, second = t(2, 20, 40), t(2, 20, 40) + timedelta(seconds=10)
+
+    def world(reversed_pair: bool) -> Scenario:
+        sc = Scenario()
+        sc.beat(t(1, 8), setpoint=22.0, section="night")
+        for day in (1, 2, 3):                       # quiet runs before, and one after
+            sc.run(t(day, 20), t(day, 23, 59), section="night")
+            sc.beat(t(day, 21), setpoint=22.0, section="night")
+        sc.run(t(4, 20), t(4, 23, 59), section="night")
+        sc.beat(t(4, 21), setpoint=22.0, section="night")
+        # Night 2 blocked at -1 with delta max 2 (as in check_margin)
+        sc.store.record_section_outdoor("lounge", t(2, 20).date().isoformat(), "night",
+                                        21.0, 22.0)
+        sc.store.record_section_conditions("lounge", t(2, 20).date().isoformat(), "night",
+                                           24.0, 0.1, True, "shadow")
+        if reversed_pair:
+            sc.vote(first, "too_cold", readings=cold, section="night")
+        sc.vote(second, "too_hot", readings=hot, section="night",
+                reverses=first if reversed_pair else None)
+        return sc
+
+    pair, alone = world(True), world(False)
+    as_of = t(5, 12)
+    got, want = pair.replay(as_of)["night"], alone.replay(as_of)["night"]
+    assert got == want, (got, want)
+    assert got.unit_setpoints_applied == {"ac": 21.0}, got.unit_setpoints_applied
+    margins = [learn_margin(sc.store._conn, ROOM, MarginConfig(), as_of) for sc in (pair, alone)]
+    assert margins[0] == margins[1] and margins[0][0] == 0.75, margins
+    ok("too_cold then too_hot 10 s later, marked a reversal, replays exactly as the too_hot "
+       f"alone: applied {got.unit_setpoints_applied['ac']}, comfort {got.sensor_comfort}, "
+       f"bands {got.sensor_band}, confidence {got.confidence}, margin -1 -> 0.75 once")
+
+    c = pair.store._conn
+    rows = [tuple(r) for r in c.execute(
+        "SELECT kind, reverses, reversed_at FROM reactive ORDER BY ts_utc")]
+    utc = lambda when: when.astimezone(timezone.utc).isoformat(timespec="seconds")
+    assert rows == [("too_cold", None, utc(second)), ("too_hot", utc(first), None)], rows
+    csv_rows = list(csv.DictReader((pair.dir / "csv" / "lounge" /
+                                    f"{first.date().isoformat()}_reactive.csv").open()))
+    assert [r["reverses"] for r in csv_rows] == ["", utc(first)], csv_rows
+    ok("stored: the too_hot names the vote it reversed (reverses, also the CSV's last "
+       "column, so a rebuild finds it) and the too_cold is marked reversed_at")
+
+    between = first + timedelta(seconds=5)
+    early = pair.replay(between)["night"]
+    only_cold = Scenario()
+    only_cold.beat(t(1, 8), setpoint=22.0, section="night")
+    for day in (1, 2):
+        only_cold.run(t(day, 20), t(day, 23, 59), section="night")
+        only_cold.beat(t(day, 21), setpoint=22.0, section="night")
+    only_cold.vote(first, "too_cold", readings=cold, section="night")
+    assert early.unit_setpoints_applied == {"ac": 23.0} and \
+        early.sensor_comfort == only_cold.replay(between)["night"].sensor_comfort, early
+    ok("as of 5 s after the too_cold (before the reversal) it still counts: applied 23")
+
+    # A reversal that names a vote never recorded marks nothing.
+    sc = world(False)
+    sc.vote(second + timedelta(seconds=5), "too_cold", readings=cold, section="night",
+            reverses=first)
+    assert [r[0] for r in sc.store._conn.execute(
+        "SELECT reversed_at FROM reactive")] == [None, None]
+    ok("a reversal of a vote that was never recorded marks nothing")
 
 
 def check_band_nudge() -> None:
@@ -793,6 +871,7 @@ def main() -> int:
     check_deterministic()
     check_comfort_window()
     check_votes()
+    check_reversed_vote()
     check_band_nudge()
     check_on_off_manual()
     check_confidence()

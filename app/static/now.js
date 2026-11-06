@@ -476,13 +476,17 @@ const NowView = (() => {
   }
 
   // What the card says after a press: from Home Assistant's own report of
-  // it (accepted or ignored, and the direction it took), "Sent" when none
-  // came back in time.
+  // it (accepted or ignored, a reversal of the press just before it, and
+  // the direction it took), "Sent" when none came back in time.
   function reply(ok, j, pressed) {
     if (!ok) return [`Not sent: ${j.detail || "error"}`, "err"];
     const o = j.outcome;
     if (!o) return ["Sent", "info"];
     if (!o.accepted) return ["Already correcting, ignored", "warn"];
+    if (o.reversal) {
+      return (o.direction || pressed) === "too_cold"
+        ? ["Changed to Warming", "ok"] : ["Changed to Cooling", "ok"];
+    }
     return (o.direction || pressed) === "too_cold"
       ? ["Got it, resting", "ok"] : ["Got it, cooling harder", "ok"];
   }
