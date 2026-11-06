@@ -993,6 +993,7 @@ class Runtime:
                 room_id=room_id, detail={"vote": data, "ignored": True})
             return
         reversal, ends = _flag(data, "reversal"), _flag(data, "ends")
+        undo = reversal and _flag(data, "resumes")     # decision 148: teaches nothing itself
         reverses = self._reversed_vote(room_id, direction, data, now) if reversal else None
         states = {s["entity_id"]: s for s in await self.rest.states()}
         sensors = {s["id"]: self._sensor_reading(s, rs.room, states) for s in rs.room["sensors"]}
@@ -1011,7 +1012,7 @@ class Runtime:
             self.store.record_reactive(room_id, ts, ts_utc, local_date, rs.section or "day",
                                        0, units, sensors, kind=direction,
                                        outdoor_temp=self._outdoor_temp(states),
-                                       reverses=reverses)
+                                       reverses=reverses, undo=undo)
         except sqlite3.IntegrityError as e:
             self.store.log_event(ts, ts_utc, "warning", "reactive",
                                  f"{name}: a {direction} vote from {via} came in the same second "
@@ -1020,15 +1021,20 @@ class Runtime:
             return
         if reversal:
             other = control.TOO_HOT if direction == control.TOO_COLD else control.TOO_COLD
-            message = (f"{name}: {other} reversed to {direction} within "
-                       f"{self._reversal_seconds()} s; the first vote teaches nothing")
+            if undo:
+                message = (f"{name}: {other} undone by {direction} within "
+                           f"{self._reversal_seconds()} s; the {direction.replace('_', ' ')} "
+                           "correction it ended carries on, and its vote still counts once; "
+                           "neither of these two teaches anything")
+            else:
+                message = (f"{name}: {other} reversed to {direction} within "
+                           f"{self._reversal_seconds()} s; the first vote teaches nothing")
             if reverses is None:
-                message += " (it was never recorded)"
-            if _flag(data, "resumes"):
-                message += f"; the {direction.replace('_', ' ')} correction it ended carries on"
+                message += f" ({other} was never recorded)" if undo else " (it was never recorded)"
             self.store.log_event(ts, ts_utc, "info", "reactive", message, room_id=room_id,
                                  detail={"kind": direction, "vote": data, "sensors": sensors,
-                                         "reversal": True, "reverses": reverses})
+                                         "reversal": True, "reverses": reverses,
+                                         **({"undo": True} if undo else {})})
         else:
             other = control.TOO_HOT if direction == control.TOO_COLD else control.TOO_COLD
             ended = (f"; it ends the {other.replace('_', ' ')} correction, and both votes stand"

@@ -109,10 +109,11 @@ class Scenario:
 
     def vote(self, when: datetime, kind: str, readings: dict | None = None,
              chosen: float | None = None, section: str = "day",
-             reverses: datetime | None = None) -> None:
+             reverses: datetime | None = None, undo: bool = False) -> None:
         """A person's vote as the runtime records HA's ac_person_vote event:
         no unit rows for a button, the value chosen for a remote. reverses:
-        the time of the vote this one reversed (decision 146)."""
+        the time of the vote this one reversed (decision 146); undo: it only
+        put a correction back (decision 148)."""
         units = {} if chosen is None else {"ac": ReactiveUnitSample(None, chosen, True,
                                                                     kind=kind)}
         self.store.record_reactive(
@@ -121,7 +122,7 @@ class Scenario:
             when.date().isoformat(), section, 0, units=units,
             sensors=dict(STEADY if readings is None else readings), kind=kind,
             reverses=None if reverses is None else
-            reverses.astimezone(timezone.utc).isoformat(timespec="seconds"))
+            reverses.astimezone(timezone.utc).isoformat(timespec="seconds"), undo=undo)
 
     def run(self, start: datetime, end: datetime | None, section: str = "day") -> None:
         self.store.record_section_run(
@@ -548,6 +549,50 @@ def check_vote_ending_correction() -> None:
        f"{got.unit_setpoints_applied['ac']:g}")
 
 
+def check_undo_teaches_nothing() -> None:
+    """Decision 148: too_cold at 20:30 (a correction), too_hot at 21:15
+    (ending it), then too_cold 10 s later undoing that too_hot (the
+    correction carries on). The undo teaches nothing, nor the vote it
+    undid: the replay equals the 20:30 too_cold alone, learned once. The
+    CSV says so, for a rebuild."""
+    print("an undo of a vote that ended a correction (decision 148)")
+    cold = {"wall": 23.0, "door": 26.0}
+    hot = {"wall": 26.0, "door": 25.0}
+    first, ending = t(2, 20, 30), t(2, 21, 15)
+    undo = ending + timedelta(seconds=10)
+
+    def world(undone: bool) -> Scenario:
+        sc = Scenario()
+        sc.beat(t(1, 8), setpoint=22.0, section="night")
+        for day in (1, 2, 3):
+            sc.run(t(day, 20), t(day, 23, 59), section="night")
+            sc.beat(t(day, 21), setpoint=22.0, section="night")
+        sc.vote(first, "too_cold", readings=cold, section="night")
+        if undone:
+            sc.vote(ending, "too_hot", readings=hot, section="night")
+            sc.vote(undo, "too_cold", readings=cold, section="night", reverses=ending,
+                    undo=True)
+        return sc
+
+    as_of = t(4, 12)
+    got, want = world(True).replay(as_of)["night"], world(False).replay(as_of)["night"]
+    assert got == want, (got, want)
+    assert got.unit_setpoints_applied == {"ac": 23.0}, got.unit_setpoints_applied
+    sc = world(True)
+    utc = lambda when: when.astimezone(timezone.utc).isoformat(timespec="seconds")
+    rows = [tuple(r) for r in sc.store._conn.execute(
+        "SELECT kind, reverses, reversed_at FROM reactive ORDER BY ts_utc")]
+    assert rows == [("too_cold", None, None), ("too_hot", None, utc(undo)),
+                    ("too_cold", utc(ending), utc(undo))], rows
+    csv_rows = list(csv.DictReader((sc.dir / "csv" / "lounge" /
+                                    f"{first.date().isoformat()}_reactive.csv").open()))
+    assert [r["reverses"] for r in csv_rows] == ["", "", f"{utc(ending)} undo"], csv_rows
+    ok("too_cold, a too_hot ending it, and the undo of that too_hot replay exactly as the "
+       f"too_cold alone (applied {got.unit_setpoints_applied['ac']:g}, comfort "
+       f"{got.sensor_comfort}): the undo and the vote it undid teach nothing; the CSV's "
+       "reverses reads '<ts> undo'")
+
+
 def check_band_nudge() -> None:
     print("bands: one nudge per reaction")
     cfg = LearningConfig()
@@ -912,6 +957,7 @@ def main() -> int:
     check_votes()
     check_reversed_vote()
     check_vote_ending_correction()
+    check_undo_teaches_nothing()
     check_band_nudge()
     check_on_off_manual()
     check_confidence()

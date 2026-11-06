@@ -448,7 +448,24 @@ def _view(ha: HA, now: datetime, uid: str = UNIT) -> dict:
             "unblocked": ha.states(g.unblocked_id(ROOM, uid)) == "on",
             "forced": ha.states(g.forced_id(ROOM, uid)) == "on",
             "section_rest": ha.states(g.section_rest_id(ROOM, uid)) == "on",
-            "chosen": ha.states(g.chosen_id(ROOM, uid)) == "on"}
+            "chosen": ha.states(g.chosen_id(ROOM, uid)) == "on",
+            "forced_at": _forced_at(ha, uid)}
+
+
+def _forced_at(ha: HA, uid: str) -> float | None:
+    """control.Unit.forced_at as the templates read it (_read_forced_at):
+    the prevote record's pf while it still describes the unit, counted only
+    while the unit is in a forced rest or boost; seconds from T0."""
+    state, since = ha.states(g.state_id(ROOM, uid)), ha.state_attr(g.since_id(ROOM, uid),
+                                                                    "timestamp")
+    if ha.states(g.forced_id(ROOM, uid)) != "on" or state not in control.FORCED_STATES:
+        return None
+    raw = ha.states(g.prevote_id(ROOM, uid)) if g.prevote_id(ROOM, uid) in ha.entities else ""
+    pv = json.loads(raw) if raw[:1] == "{" else {}
+    if pv.get("pf") is None or pv.get("ps") != state or pv.get("pt") != (
+            None if since is None else int(since)):
+        return None
+    return pv["pf"] - table.T0.timestamp()
 
 
 def _control_view(unit: control.Unit, now: datetime) -> dict:

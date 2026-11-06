@@ -223,8 +223,8 @@ REVERSAL_OFF = "reversal: vote_reversal_seconds 0 turns the window off"
 REVERSAL_PEERS = "reversal: every unit in the room is put back and takes the new vote"
 
 # Decision 147: a person's correction doesn't lock the room for hours.
-CAP_REST_COOL = ("forced rest cap: at 60 min with the room still cool, an ordinary rest: the "
-                 "marker off, nothing sent, and it wakes later at +1 as any rest")
+CAP_REST_COOL = ("forced rest cap: at 60 min with the room still cool, it rests on: the marker "
+                 "off, nothing sent, and it wakes later at its base, offset 0, not +1")
 CAP_REST_BLOCKED = ("forced rest cap: under a block, an ordinary blocked rest: the marker off, "
                     "still blocked")
 CAP_REST_CONFIG = "forced rest cap: forced_rest_max_minutes is the config's"
@@ -235,6 +235,10 @@ ENDS = ("too_cold then too_hot 45 min later ends the correction: a forced boost 
 ENDS_SAME = "a same-direction press during a correction is still ignored, 45 min in"
 ENDS_RESUMES = ("an undo within the window of the vote that ended a correction puts the "
                 "correction back as it was, the boost switched off")
+CAP_REST_SECTION = ("forced rest cap: a section change clears the wake-at-base mark of a "
+                    "correction's rest past its cap")
+CAP_FROM_VOTE = ("forced rest cap: counted from the vote, so a too_cold 50 min into a blocked "
+                 "rest still gets its full 60 min")
 ENDS_PEERS = ("an opposite vote ends the correction for the whole room: every unit takes it, "
               "one already released included")
 
@@ -1171,21 +1175,38 @@ SCENARIOS = [
         step("cold", {"state": "rest", "forced": True}, None, at=m(10)),
         step("cold", {"state": "rest", "forced": True}, None, at=m(50)),
         step("cold", {"state": "rest", "forced": False, "base": 23.0, "offset": 0,
-                      "since": 0}, None, at=m(60)),
-        step("cold", {"state": "rest", "forced": False}, None, at=m(70)),
-        step("settled_warm", {"state": "cool", "base": 23.0, "offset": 1, "since": m(80)},
-             cmd("cool", "low", 24.0), at=m(80))],
+                      "since": 0, "section_rest": True}, None, at=m(60)),
+        step("cold", {"state": "rest", "forced": False, "section_rest": True}, None, at=m(70)),
+        step("settled_warm", {"state": "cool", "base": 23.0, "offset": 0, "since": m(80),
+                              "section_rest": False}, cmd("cool", "low", 23.0), at=m(80))],
       unit={"since": -m(60)}),
     s(CAP_REST_BLOCKED, [
         conditions({"blocked": True}, comfort=24.0, mean=17.0, max=17.0, block_mode="active"),
         section({"state": "rest", "unblocked": False}, OFF),
         press("too_cold", {"state": "rest", "forced": True, "base": 23.0, "since": 0}, None,
               at=m(5)),
-        step("settled_warm", {"state": "rest", "forced": True}, None, at=m(50),
+        step("settled_warm", {"state": "rest", "forced": True, "forced_at": m(5)}, None,
+             at=m(50), overruled=False),
+        step("settled_warm", {"state": "rest", "forced": True}, None, at=m(60),
              overruled=False),
         step("settled_warm", {"state": "rest", "forced": False, "unblocked": False,
-                              "since": 0}, None, at=m(60), overruled=False),
-        step("settled_warm", {"state": "rest", "forced": False}, None, at=m(70))]),
+                              "since": 0}, None, at=m(65), overruled=False),
+        step("settled_warm", {"state": "rest", "forced": False}, None, at=m(75))]),
+    s(CAP_REST_SECTION, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        step("cold", {"state": "rest", "forced": False, "section_rest": True}, None, at=m(60)),
+        section({"state": "cool", "base": 22.0, "offset": 0, "section_rest": False},
+                cmd("cool", "low", 22.0), at=m(65))],
+      unit={"since": -m(60)}),
+    s(CAP_FROM_VOTE, [
+        conditions({"blocked": True}, comfort=24.0, mean=17.0, max=17.0, block_mode="active"),
+        section({"state": "rest", "unblocked": False}, OFF),
+        press("too_cold", {"state": "rest", "forced": True, "base": 23.0, "since": 0,
+                           "forced_at": m(50)}, None, at=m(50)),
+        step("settled_warm", {"state": "rest", "forced": True}, None, at=m(60)),
+        step("settled_warm", {"state": "rest", "forced": True}, None, at=m(100)),
+        step("settled_warm", {"state": "rest", "forced": False, "since": 0}, None,
+             at=m(110))]),
     s(CAP_REST_CONFIG, [
         press("too_cold", {"state": "rest", "forced": True}, OFF),
         step("cold", {"state": "rest", "forced": True}, None, at=m(60)),
@@ -1261,14 +1282,17 @@ def _unit(d: dict) -> control.Unit:
                         base=d.get("base", 0.0), since=_time(d.get("since", -m(60))),
                         grace_until=_time(d.get("grace_until")),
                         unblocked=d.get("unblocked", False), forced=d.get("forced", False),
-                        section_rest=d.get("section_rest", False), chosen=d.get("chosen", False))
+                        section_rest=d.get("section_rest", False), chosen=d.get("chosen", False),
+                        forced_at=_time(d.get("forced_at")))
 
 
 def _view(unit: control.Unit) -> dict:
     return {"state": unit.state, "offset": unit.offset, "base": unit.base or None,
             "since": _secs(unit.since), "grace_until": _secs(unit.grace_until),
             "unblocked": unit.unblocked, "forced": unit.forced,
-            "section_rest": unit.section_rest, "chosen": unit.chosen}
+            "section_rest": unit.section_rest, "chosen": unit.chosen,
+            # only while forced does it count (control.forced_rest_capped)
+            "forced_at": _secs(unit.forced_at) if control.forced_now(unit) else None}
 
 
 def _ctx(*layers: dict) -> control.Context:
@@ -1463,6 +1487,7 @@ _VOTE_BASE = control.vote_base
 _SECTION_CHANGE = control.on_section_change
 _PERSON_CHANGE = control.on_person_change
 _PERSON_VOTE = control.on_person_vote
+_RESTORE = control.restore
 _COMFORT_POINT = control.comfort_point
 _SECTION_CONDITIONS = control.section_conditions
 _SECTION_START = control.section_start
@@ -1875,7 +1900,16 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
          {"reversal_command": lambda current, new, command, ctx: command},
          [REVERSAL_SECTION_REST_BACK, REVERSAL_BLOCK, REVERSAL_USER_OFF]),
         ("the forced rest cap", {"forced_rest_capped": lambda unit, now, config: False},
-         [CAP_REST_COOL, CAP_REST_BLOCKED, CAP_REST_CONFIG, CAP_REST_NEXT_VOTE]),
+         [CAP_REST_COOL, CAP_REST_BLOCKED, CAP_REST_CONFIG, CAP_REST_NEXT_VOTE,
+          CAP_REST_SECTION, CAP_FROM_VOTE]),
+        ("the cap counts from the vote (from the rest's since instead)",
+         {"forced_rest_capped": lambda unit, now, config: c.forced_now(unit)
+          and unit.state == "rest" and now - unit.since >= timedelta(
+              minutes=config.forced_rest_max_minutes)},
+         [CAP_REST_BLOCKED, CAP_FROM_VOTE]),
+        ("a correction's rest past its cap wakes at its base (+1 instead)",
+         {"end_correction": lambda unit: dataclasses.replace(unit, forced=False)},
+         [CAP_REST_COOL, CAP_REST_SECTION]),
         ("the forced rest cap is forced_rest_max_minutes (the boost cap instead)",
          {"forced_rest_capped": lambda unit, now, config: c.forced_now(unit)
           and unit.state == "rest" and now - unit.since >= timedelta(
@@ -1893,6 +1927,10 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
          [ENDS_SAME, "a forced state on another unit holds the whole room's episode",
           "one correction per episode: a second press the same way is ignored; "
           "one after the release counts"]),
+        ("a reversal puts the vote time back too (keeps the reversed vote's instead)",
+         {"restore": lambda unit, prevote, ctx: (lambda r: dataclasses.replace(
+             r, forced_at=unit.forced_at))(_RESTORE(unit, prevote, ctx))},
+         [ENDS_RESUMES]),
         ("undoing the vote that ended a correction only puts it back",
          {"resumes": lambda direction, window, now, config: False}, [ENDS_RESUMES]),
         ("the reactive_min_delta tolerance (exact setpoint instead)",

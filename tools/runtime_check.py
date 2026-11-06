@@ -655,6 +655,7 @@ async def main() -> int:
     vote_cb(vote_event("main_bedroom", "too_cold"))
     await eventually(lambda: n_reactions("main_bedroom") == count + 1, "the too_cold")
     await asyncio.sleep(1.05)
+    ending_at = int(_time.time())
     vote_cb(vote_event("main_bedroom", "too_hot", ends="True"))
     await eventually(lambda: n_reactions("main_bedroom") == count + 2, "the too_hot ending it")
     (k1, rv1, rd1, _), (k2, rv2, rd2, _) = votes_of("main_bedroom")[-2:]
@@ -669,6 +670,27 @@ async def main() -> int:
     learned = [kind for _, kind, *_ in store.reactions_since("main_bedroom", since)][-2:]
     print(f"vote: too_cold, then a too_hot that ends its correction: both recorded, neither "
           f"reversed, both learned ({learned}); logged \"{msg}\" - OK")
+    count = n_reactions("main_bedroom")
+
+    # --- decision 148: undoing that too_hot within the window teaches nothing ---
+    vote_cb(vote_event("main_bedroom", "too_cold", reversal="True", resumes="True",
+                       reverses_at=ending_at))
+    await eventually(lambda: n_reactions("main_bedroom") == count + 1, "the undo")
+    rows = votes_of("main_bedroom")[-3:]
+    (k0, rv0, rd0, t0), (k1, rv1, rd1, t1), (k2, rv2, rd2, t2) = rows
+    assert (k0, rv0, rd0) == ("too_cold", None, None), rows          # the correction's vote
+    assert (k1, rv1, rd1) == ("too_hot", None, t2), rows               # the ending vote: undone
+    assert (k2, rv2, rd2) == ("too_cold", t1, t2), rows                # the undo: itself too
+    learned = [ts for ts, *_ in store.reactions_since("main_bedroom", since)]
+    assert t0 in learned and t1 not in learned and t2 not in learned, (learned, rows)
+    events = store.recent_events(limit=5, room_id="main_bedroom", category="reactive")
+    msg = next(e["message"] for e in events if (e.get("detail") or {}).get("undo"))
+    assert msg == ("Main Bedroom: too_hot undone by too_cold within 20 s; the too cold "
+                   "correction it ended carries on, and its vote still counts once; neither "
+                   "of these two teaches anything"), msg
+    print(f"vote: an undo of the vote that ended a correction is recorded but teaches nothing, "
+          f"nor does the vote it undoes; the correction's own too_cold is learned once; "
+          f"logged \"{msg}\" - OK")
     count = n_reactions("main_bedroom")
 
     # --- decision 147: HA's maintenance ended a forced rest at its cap ---

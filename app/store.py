@@ -58,6 +58,10 @@ REACTIVE_CSV = ["ts", "ts_utc", "section", "window_seconds", "occupied",
 # A vote's row names the vote it reversed (its ts_utc) in `reverses`; the
 # reversed vote's own row was written before, so re-ingest marks it from
 # here (reactive.reversed_at = this row's ts_utc), as record_reactive does.
+# An undo (decision 148: a reversal that only put a correction back) adds
+# " undo" after the ts_utc ("undo" alone if it names none): it teaches
+# nothing itself either, so re-ingest marks its own row reversed_at its own
+# ts_utc too.
 # One row when a section run starts, one when its forecast has been read
 # (outdoor_mean and outdoor_max only), one when its conditions are decided
 # (comfort_point, lean, blocked and block_mode only), one if the room
@@ -469,26 +473,29 @@ class Store:
                         suspended_maint: bool = False,
                         kind: str | None = None,
                         outdoor_temp: float | None = None,
-                        reverses: str | None = None) -> int:
+                        reverses: str | None = None, undo: bool = False) -> int:
         """One reaction, CSV first. reverses: for a vote that reversed
         another (decision 146), that vote's ts_utc; its row is marked
-        reversed_at this one's ts_utc in the same transaction."""
+        reversed_at this one's ts_utc in the same transaction. undo: the
+        reversal only put back a correction an opposite vote had ended
+        (decision 148), so it teaches nothing itself: its own row is
+        reversed_at its own ts_utc."""
         self._append_csv(
             room_id, local_date, "reactive", REACTIVE_CSV,
             [ts, ts_utc, section, window_seconds,
              "" if occupied is None else int(occupied), int(suspended_maint),
              json.dumps({uid: u.__dict__ for uid, u in units.items()}),
              json.dumps(sensors),
-             kind, outdoor_temp, reverses or ""])
+             kind, outdoor_temp, " ".join(x for x in (reverses, "undo" if undo else None) if x)])
         with self._lock:
             try:
                 cur = self._conn.execute(
                     "INSERT INTO reactive(room_id,ts,ts_utc,local_date,section,"
-                    "window_seconds,occupied,suspended_maint,kind,outdoor_temp,reverses) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "window_seconds,occupied,suspended_maint,kind,outdoor_temp,reverses,"
+                    "reversed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (room_id, ts, ts_utc, local_date, section, window_seconds,
                      None if occupied is None else int(occupied), int(suspended_maint),
-                     kind, outdoor_temp, reverses))
+                     kind, outdoor_temp, reverses, ts_utc if undo else None))
                 rid = cur.lastrowid
                 if reverses is not None:
                     self._conn.execute(

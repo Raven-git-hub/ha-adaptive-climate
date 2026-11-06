@@ -133,10 +133,15 @@ class Unit:
     grace_until: datetime | None = None  # end of a person's grace period
     unblocked: bool = False             # a person turned it on during a block
     forced: bool = False                # this rest or boost is a person's vote
-    section_rest: bool = False          # a section change began this rest: the room was cold
+    section_rest: bool = False          # a rest that wakes at its base: a section change began
+                                        # it (the room was cold), or a person's too_cold
+                                        # correction rests on past its cap (decision 148)
     chosen: bool = False                # a remote's vote set this unit's forced boost at the
                                         # value a person chose: no boost step (decision 145).
                                         # Only votes write it; it counts only while forced
+    forced_at: datetime | None = None   # when the vote that forced this rest or boost came
+                                        # (decision 148; the prevote record's pf). Only votes
+                                        # write it; it counts only while forced
 
 
 @dataclass(frozen=True)
@@ -316,16 +321,21 @@ def boost_capped(unit: Unit, now: datetime, config: ControlConfig) -> bool:
 
 def forced_rest_capped(unit: Unit, now: datetime, config: ControlConfig) -> bool:
     """A person's forced rest has run forced_rest_max_minutes (decision
-    147), counted from its since as the boost cap is: the correction ends."""
-    return (forced_now(unit) and unit.state == "rest" and unit.since is not None
-            and now - unit.since >= timedelta(minutes=config.forced_rest_max_minutes))
+    147) since the vote that forced it (forced_at, decision 148; since if
+    it is unknown): the correction ends. A too_cold during a long rest
+    gets its full window."""
+    start = unit.forced_at or unit.since
+    return (forced_now(unit) and unit.state == "rest" and start is not None
+            and now - start >= timedelta(minutes=config.forced_rest_max_minutes))
 
 
 def end_correction(unit: Unit) -> Unit:
-    """The cap ends a forced rest: the marker clears and the unit is an
-    ordinary rest from here (it still rests while the room is cold or
-    cooling is blocked)."""
-    return replace(unit, forced=False)
+    """The cap ends a forced rest: the marker clears and the unit rests on
+    by the ordinary rules (while the room is cold or cooling is blocked).
+    It still wakes at its base, offset 0 (decision 148): the person's vote
+    already moved the base, so no system +1. The section-rest marker says
+    so; a wake or a section change clears it."""
+    return replace(unit, forced=False, section_rest=True)
 
 
 def correction_capped(unit: Unit, now: datetime, ctx: Context) -> bool:
@@ -344,9 +354,10 @@ def released(side_count: int, required: int) -> bool:
 
 def release_offset(unit: Unit, change: int) -> int:
     """The offset a boost or rest returns to cool with: a system one moves
-    it a step (change, -1 or +1); one a person's vote forced, or a rest the
+    it a step (change, -1 or +1); one a person's vote forced, a rest the
     section started in because the room was cold (nobody said too cold),
-    goes back to cool at its base."""
+    or a too_cold correction's rest past its cap (end_correction) goes back
+    to cool at its base."""
     return 0 if unit.forced or unit.section_rest else unit.offset + change
 
 
@@ -574,7 +585,7 @@ def _force(unit: Unit, state: str, now: datetime, ctx: Context) -> tuple[Unit, C
     a remote's chosen value with no boost step: boost_step). A unit
     already resting is already off, so it is sent nothing."""
     since = unit.since if _keeps_since(unit, state) else now
-    new = replace(unit, state=state, since=since, forced=True)
+    new = replace(unit, state=state, since=since, forced=True, forced_at=now)
     if unit.state == "rest" and state == "rest":
         return new, None
     return new, command_for(state, target_base(new, ctx), 0, ctx, boost_step(new, ctx))

@@ -407,6 +407,22 @@ def _read_chosen(room: dict, unit: dict) -> str:
                  CH=chosen_id(room["id"], unit["id"]))
 
 
+def _read_forced_at(room: dict, unit: dict) -> str:
+    """control.Unit.forced_at (decision 148), after _read_unit: when the
+    vote that forced the unit's rest or boost came, from its prevote
+    record's pf, which every accepted vote writes. Only a record that still
+    describes the unit (its state and since as that vote left them) counts;
+    otherwise none, and the cap falls back to since. fat, and r.fat
+    starting as it is."""
+    return _fill(
+        "{%- set fraw = states('<<PV>>') -%}"
+        "{%- set fpv = fraw | from_json if fraw[:1] == '{' else {} -%}"
+        "{%- set fat = fpv.pf if fpv.pf is defined and fpv.ps == st and "
+        "fpv.pt == (none if since is none else since | int) else none -%}"
+        "{%- set r.fat = fat -%}",
+        PV=prevote_id(room["id"], unit["id"]))
+
+
 # control.boost_step, after _read_unit and _read_chosen
 def _boost_step(boost: float) -> str:
     return f"(0 if ch and frc and st in {list(control.FORCED_STATES)!r} else {boost!r})"
@@ -427,8 +443,8 @@ _RESULT = ("{{ {'go': r.go, 'state': r.state, 'offset': r.offset, 'base': r.base
 # found it (restored, for a reversal) and the state, since and base the vote
 # left it in.
 _PRE = ("{'st': st, 'b': b, 'o': off, 'f': frc, 'sr': srest, 'u': unb, 'c': ch, "
-        "'s': (none if since is none else since | int), 'ps': r.state, "
-        "'pt': (none if r.since is none else r.since | int), 'pb': r.base}")
+        "'s': (none if since is none else since | int), 'fa': fat, 'ps': r.state, "
+        "'pt': (none if r.since is none else r.since | int), 'pb': r.base, 'pf': r.fat}")
 _RESULT_VOTE = _RESULT[:-len("} }}")] + ", 'chosen': r.chosen, 'pre': " + _PRE + "} }}"
 
 _RESULT_MAINTENANCE = (_RESULT[:-len("} }}")]
@@ -546,11 +562,13 @@ def _step(config: dict, room: dict, unit: dict) -> str:
         # ends at its cap, the marker cleared, and rests on as an ordinary one
         # unless it releases by the ordinary rule
         + "{%- elif st == 'rest' -%}"
-        + f"{{%- set r.capped = frc and since is not none and "
-          f"now_ts - since >= {cfg.forced_rest_max_minutes * 60!r} -%}}"
+        + "{%- set fstart = fat if fat is not none else since -%}"
+        + f"{{%- set r.capped = frc and fstart is not none and "
+          f"now_ts - fstart >= {cfg.forced_rest_max_minutes * 60!r} -%}}"
         + f"{{%- if not (blocked and not unb) and {rest_min} and "
           f"votes.cold_side < {release_floor} -%}}" + _go("cool", cfg, _release_offset(+1))
-        + "{%- elif r.capped -%}{%- set r.forced = false -%}{%- set r.go = true -%}"
+        + "{%- elif r.capped -%}{%- set r.forced = false -%}{%- set r.srest = true -%}"
+        + "{%- set r.go = true -%}"
         + "{%- endif -%}"
         + "{%- endif -%}")
 
@@ -617,7 +635,7 @@ def _vote(config: dict, direction: str, chosen: str) -> str:
         "{%- set into = 'rest' if vd == 'too_cold' else 'boost' -%}"
         "{%- if not (vd == 'too_cold' and st == 'user_off') -%}"
         "{%- if st != into -%}{%- set r.since = now_ts -%}{%- endif -%}"
-        "{%- set r.state = into -%}{%- set r.forced = true -%}"
+        "{%- set r.state = into -%}{%- set r.forced = true -%}{%- set r.fat = now_ts -%}"
         "{%- if not (st == 'rest' and into == 'rest') -%}{%- set r.cmd = <<CMD>> -%}{%- endif -%}"
         "{%- endif -%}"
         "{%- endif -%}",
@@ -701,6 +719,7 @@ def _restore(room: dict, unit: dict) -> str:
         "{%- set st = pv.st -%}{%- set off = pv.o | int -%}{%- set b = pv.b | float(0) -%}"
         "{%- set since = pv.s -%}{%- set unb = pv.u -%}{%- set frc = pv.f -%}"
         "{%- set srest = pv.sr -%}{%- set ch = pv.c -%}{%- set tb = b if b else sa -%}"
+        "{%- set fat = pv.fa if pv.fa is defined else none -%}{%- set r.fat = fat -%}"
         "{%- set r.state = st -%}{%- set r.offset = off -%}{%- set r.base = b -%}"
         "{%- set r.since = since -%}{%- set r.unb = unb -%}{%- set r.forced = frc -%}"
         "{%- set r.srest = srest -%}{%- set r.chosen = ch -%}{%- set r.go = true -%}"
@@ -1139,6 +1158,7 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
         variables[_unit_var(unit)] = (
             _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
             + "{%- set r.capped = false -%}"        # control.correction_capped, by _step
+            + _read_forced_at(room, unit)
             + _overruled_step(config, room, unit) + _RESULT_MAINTENANCE)
 
     any_go = " or ".join(f"{_unit_var(u)}.go" for u in room["units"])
@@ -1235,7 +1255,7 @@ def build_vote_automation(config: dict, room: dict) -> dict:
     for unit in room["units"]:
         variables[_unit_var(unit)] = (
             _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit)) + _read_chosen(room, unit)
-            + _restore(room, unit)
+            + _read_forced_at(room, unit) + _restore(room, unit)
             + "{%- if accepted -%}{%- if not resumes -%}" + _vote(config, "direction", "none")
             + "{%- endif -%}" + _reversal_command(config) + "{%- endif -%}"
             + _RESULT_VOTE)
@@ -1304,7 +1324,7 @@ def build_manual_change_automation(config: dict, room: dict, unit: dict) -> dict
         body += "{%- endif -%}"
         variables[_unit_var(other)] = (
             _read_unit(room, other, _sa_live(other), _leak_on(room, other))
-            + _read_chosen(room, other) + body + _RESULT_VOTE)
+            + _read_chosen(room, other) + _read_forced_at(room, other) + body + _RESULT_VOTE)
     return {
         "id": manual_automation_id(r, u),
         "alias": f"AC {room.get('name', r)} — manual change ({unit.get('name', u)})",
