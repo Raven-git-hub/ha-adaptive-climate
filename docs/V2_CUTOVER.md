@@ -193,8 +193,10 @@ two rooms) at ~16:00, then *heartbeat* entries every 10 minutes.
   too_cold (the button)", then "replayed almanac for Main Room (vote)". The Almanac
   tab's Sunset setpoint is a degree warmer (applied), the section reads learned,
   and the comfort readings have moved toward each sensor's reading + 1.
-- **Press it again** (or too hot) while the unit rests: the Log shows "ignored
-  press: … during a forced rest or boost", and nothing changes.
+- **Press it again** while the unit rests: the Log shows "ignored press: …
+  during a correction the same way", and nothing changes. (Too hot, more than
+  20 s later, ends the correction and boosts: "… it ends the too cold
+  correction, and both votes stand".)
 - **When the room has warmed back to comfort** (at least 15 minutes, the rest's
   minimum time), maintenance wakes the unit into `cool` at the new base, offset 0,
   and `ac_forced_…` turns off. The next press counts again.
@@ -226,7 +228,7 @@ Turn it back on to see `cool`, `ac_unblocked` on, and a grace period of 30 minut
 | Every 10 minutes | Maintenance traces have no template errors |
 | Through the evening and night | Boosts end within 60 minutes or when the room settles, then another may start a degree lower. Rests wake when the room warms back to comfort. No unit flips state more often than every 10 to 20 minutes |
 | Any time | `ac_state` becomes `manual` or `user_off` only when someone actually touched that unit. If it changes with nobody touching it, note the time and open the manual-change trace at that time (`kind`, `ours`): a late echo of our own command got through |
-| Any time | *reactive* events appear only for real presses and real changes on a remote, app or HA; an "ignored press" only for a press (or remote change) during a forced rest or boost |
+| Any time | *reactive* events appear only for real presses and real changes on a remote, app or HA; an "ignored press" only for a press (or remote change) the same way during a forced rest or boost |
 | Any time | A *validation* warning "… last reported … ago … counts as unavailable" means a sensor has gone quiet (put away, battery, integration): it has no vote until it reports again, and an info event says when it does |
 | Any time | `ac_active_<room>` is on for seconds only. A **guard watchdog** run means a guard stuck for 5 minutes |
 | Any time | `ac_hold_<room>` stays off unless you paused the room |

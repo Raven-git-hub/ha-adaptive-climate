@@ -509,6 +509,45 @@ def check_reversed_vote() -> None:
     ok("a reversal of a vote that was never recorded marks nothing")
 
 
+def check_vote_ending_correction() -> None:
+    """Decision 147: too_cold at 20:30, then too_hot at 21:15, which ends
+    the too_cold correction, isn't a reversal: both votes stand and both
+    are learned. The replay differs from either vote alone, and its applied
+    setpoint went up a step and back down."""
+    print("a vote that ends a correction (decision 147)")
+    cold = {"wall": 23.0, "door": 26.0}
+    hot = {"wall": 26.0, "door": 25.0}
+    first, second = t(2, 20, 30), t(2, 21, 15)
+
+    def world(votes: tuple) -> Scenario:
+        sc = Scenario()
+        sc.beat(t(1, 8), setpoint=22.0, section="night")
+        for day in (1, 2, 3):
+            sc.run(t(day, 20), t(day, 23, 59), section="night")
+            sc.beat(t(day, 21), setpoint=22.0, section="night")
+        if "too_cold" in votes:
+            sc.vote(first, "too_cold", readings=cold, section="night")
+        if "too_hot" in votes:
+            sc.vote(second, "too_hot", readings=hot, section="night")
+        return sc
+
+    as_of = t(4, 12)
+    both = world(("too_cold", "too_hot"))
+    got = both.replay(as_of)["night"]
+    cold_only = world(("too_cold",)).replay(as_of)["night"]
+    hot_only = world(("too_hot",)).replay(as_of)["night"]
+    assert [r[0] for r in both.store._conn.execute("SELECT reversed_at FROM reactive")] \
+        == [None, None]
+    assert got.sensor_comfort != cold_only.sensor_comfort and \
+        got.sensor_comfort != hot_only.sensor_comfort, (got, cold_only, hot_only)
+    assert cold_only.unit_setpoints_applied == {"ac": 23.0}, cold_only.unit_setpoints_applied
+    assert got.unit_setpoints_applied == {"ac": 22.0}, got.unit_setpoints_applied
+    ok("too_cold then too_hot 45 min later: neither reversed, both learned (comfort "
+       f"{got.sensor_comfort}, unlike too_cold alone {cold_only.sensor_comfort} or too_hot "
+       f"alone {hot_only.sensor_comfort}); applied 22 -> 23 -> "
+       f"{got.unit_setpoints_applied['ac']:g}")
+
+
 def check_band_nudge() -> None:
     print("bands: one nudge per reaction")
     cfg = LearningConfig()
@@ -872,6 +911,7 @@ def main() -> int:
     check_comfort_window()
     check_votes()
     check_reversed_vote()
+    check_vote_ending_correction()
     check_band_nudge()
     check_on_off_manual()
     check_confidence()

@@ -16,6 +16,7 @@
     "control": {
       "boost_degrees": 2.0,
       "boost_max_minutes": 60,
+      "forced_rest_max_minutes": 60,
       "cool_min_heartbeats": 1,
       "rest_min_heartbeats": 2,
       "person_grace_minutes": 30,

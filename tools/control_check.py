@@ -117,16 +117,19 @@ def person(kind: str, expect_unit: dict, setpoint=None, at: int = 0) -> dict:
 
 
 def press(direction: str, expect_unit: dict, command, accepted: bool = True, at: int = 0,
-          reversal: bool | None = None, ctx: dict | None = None, **room) -> dict:
+          reversal: bool | None = None, ctx: dict | None = None, ends: bool | None = None,
+          resumes: bool | None = None, **room) -> dict:
     """A press of the room's too_cold or too_hot button; accepted or
     ignored (an episode is running, or it repeats the vote whose reversal
     window is open). reversal: whether it reverses that vote (decision 146;
-    unchecked if None). ctx: the step's own context. room: peers /
-    peer_commands."""
+    unchecked if None). ends / resumes: whether it ends a correction running
+    the other way, or reverses such a vote (decision 147; unchecked if
+    None). ctx: the step's own context. room: peers / peer_commands."""
     assert set(room) <= set(_ROOM), room
     expect = {"unit": expect_unit, "command": command, "accepted": accepted, **room}
-    if reversal is not None:
-        expect["reversal"] = reversal
+    for key, value in (("reversal", reversal), ("ends", ends), ("resumes", resumes)):
+        if value is not None:
+            expect[key] = value
     return {"do": "press", "at": at, "direction": direction, "expect": expect,
             **({"ctx": ctx} if ctx else {})}
 
@@ -192,7 +195,8 @@ OVERRULE_FORCED_REST = ("the overrule wakes a forced rest: a too_cold vote under
 # Decision 146: the reversal window.
 REVERSAL = ("reversal: too_cold then too_hot within the window is a single too_hot from the "
             "original record")
-REVERSAL_AFTER = "reversal: the same pair after the window: the second is ignored, as before"
+REVERSAL_AFTER = ("reversal: the same pair after the window is no reversal: it ends the "
+                  "correction and applies, and both stand")
 REVERSAL_EDGE = "reversal: 20 s after the vote is still within the window"
 REVERSAL_SAME = ("reversal: a same-direction press within the window is ignored, even with no "
                  "episode; after it, it counts")
@@ -217,6 +221,22 @@ REVERSAL_LEAK = ("reversal: a unit whose leak latch came on is left to the leak,
                  "or sent anything")
 REVERSAL_OFF = "reversal: vote_reversal_seconds 0 turns the window off"
 REVERSAL_PEERS = "reversal: every unit in the room is put back and takes the new vote"
+
+# Decision 147: a person's correction doesn't lock the room for hours.
+CAP_REST_COOL = ("forced rest cap: at 60 min with the room still cool, an ordinary rest: the "
+                 "marker off, nothing sent, and it wakes later at +1 as any rest")
+CAP_REST_BLOCKED = ("forced rest cap: under a block, an ordinary blocked rest: the marker off, "
+                    "still blocked")
+CAP_REST_CONFIG = "forced rest cap: forced_rest_max_minutes is the config's"
+CAP_REST_NEXT_VOTE = ("forced rest cap: once it has ended, a too_cold press counts again: a "
+                      "new correction, base +1")
+ENDS = ("too_cold then too_hot 45 min later ends the correction: a forced boost from the "
+        "voted base, both votes stand")
+ENDS_SAME = "a same-direction press during a correction is still ignored, 45 min in"
+ENDS_RESUMES = ("an undo within the window of the vote that ended a correction puts the "
+                "correction back as it was, the boost switched off")
+ENDS_PEERS = ("an opposite vote ends the correction for the whole room: every unit takes it, "
+              "one already released included")
 
 
 SCENARIOS = [
@@ -847,10 +867,10 @@ SCENARIOS = [
                            "since": -m(30)}, None),
         press("too_cold", {"state": "user_off", "base": 24.0}, None, at=m(1))],
       unit={"state": "user_off", "since": -m(30)}),
-    s("one correction per episode: a second press of either button is ignored; "
+    s("one correction per episode: a second press the same way is ignored; "
       "one after the release counts", [
         press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
-        press("too_hot", {"state": "rest", "base": 23.0, "forced": True, "since": 0}, None,
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True, "since": 0}, None,
               accepted=False, at=m(2)),
         press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, None,
               accepted=False, at=m(3)),
@@ -860,7 +880,7 @@ SCENARIOS = [
               at=m(25))],
       unit={"since": -m(60)}),
     s("a forced state on another unit holds the whole room's episode", [
-        press("too_hot", {"state": "cool", "base": None, "forced": False}, None, accepted=False,
+        press("too_cold", {"state": "cool", "base": None, "forced": False}, None, accepted=False,
               peers={"v": {"state": "rest", "base": 23.0, "forced": True}},
               peer_commands={"v": None})],
       unit={"since": -m(60)}, peers={"v": {"state": "rest", "base": 23.0, "forced": True,
@@ -1040,8 +1060,8 @@ SCENARIOS = [
       unit={"since": -m(60)}),
     s(REVERSAL_AFTER, [
         press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
-        press("too_hot", {"state": "rest", "base": 23.0, "forced": True, "since": 0}, None,
-              accepted=False, at=21, reversal=False)],
+        press("too_hot", {"state": "boost", "base": 22.0, "forced": True, "since": 21},
+              cmd("cool", "medium", 20.0), at=21, reversal=False, ends=True)],
       unit={"since": -m(60)}),
     s(REVERSAL_EDGE, [
         press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
@@ -1108,7 +1128,8 @@ SCENARIOS = [
               reversal=True),
         press("too_cold", {"state": "rest", "base": 23.0, "forced": True, "since": 25}, OFF,
               at=25, reversal=True),
-        press("too_hot", {"state": "rest", "base": 23.0}, None, accepted=False, at=m(1))],
+        press("too_hot", {"state": "boost", "base": 22.0}, cmd("cool", "medium", 20.0),
+              at=m(1), reversal=False, ends=True)],
       unit={"since": -m(60)}),
     s(REVERSAL_REMOTE, [
         press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
@@ -1131,8 +1152,8 @@ SCENARIOS = [
       unit={"since": -m(60)}),
     s(REVERSAL_OFF, [
         press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
-        press("too_hot", {"state": "rest", "base": 23.0}, None, accepted=False, at=5,
-              reversal=False)],
+        press("too_hot", {"state": "boost", "base": 22.0, "forced": True},
+              cmd("cool", "medium", 20.0), at=5, reversal=False, ends=True)],
       unit={"since": -m(60)}, ctx={"control": {"vote_reversal_seconds": 0}}),
     s(REVERSAL_PEERS, [
         press("too_cold", {"state": "rest", "base": 23.0}, OFF,
@@ -1143,6 +1164,83 @@ SCENARIOS = [
                            "since": -m(10)}},
               peer_commands={"v": cmd("cool", "medium", 19.0)})],
       unit={"since": -m(60)}, peers={"v": {"state": "boost", "offset": -1, "since": -m(10)}}),
+
+    # --- decision 147: a correction doesn't lock the room for hours -------------------
+    s(CAP_REST_COOL, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True, "since": 0}, OFF),
+        step("cold", {"state": "rest", "forced": True}, None, at=m(10)),
+        step("cold", {"state": "rest", "forced": True}, None, at=m(50)),
+        step("cold", {"state": "rest", "forced": False, "base": 23.0, "offset": 0,
+                      "since": 0}, None, at=m(60)),
+        step("cold", {"state": "rest", "forced": False}, None, at=m(70)),
+        step("settled_warm", {"state": "cool", "base": 23.0, "offset": 1, "since": m(80)},
+             cmd("cool", "low", 24.0), at=m(80))],
+      unit={"since": -m(60)}),
+    s(CAP_REST_BLOCKED, [
+        conditions({"blocked": True}, comfort=24.0, mean=17.0, max=17.0, block_mode="active"),
+        section({"state": "rest", "unblocked": False}, OFF),
+        press("too_cold", {"state": "rest", "forced": True, "base": 23.0, "since": 0}, None,
+              at=m(5)),
+        step("settled_warm", {"state": "rest", "forced": True}, None, at=m(50),
+             overruled=False),
+        step("settled_warm", {"state": "rest", "forced": False, "unblocked": False,
+                              "since": 0}, None, at=m(60), overruled=False),
+        step("settled_warm", {"state": "rest", "forced": False}, None, at=m(70))]),
+    s(CAP_REST_CONFIG, [
+        press("too_cold", {"state": "rest", "forced": True}, OFF),
+        step("cold", {"state": "rest", "forced": True}, None, at=m(60)),
+        step("cold", {"state": "rest", "forced": True}, None, at=m(80)),
+        step("cold", {"state": "rest", "forced": False}, None, at=m(90))],
+      unit={"since": -m(60)}, ctx={"control": {"forced_rest_max_minutes": 90}}),
+    s(CAP_REST_NEXT_VOTE, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        press("too_cold", {"state": "rest", "base": 23.0}, None, accepted=False, at=m(30)),
+        step("cold", {"state": "rest", "forced": False}, None, at=m(60)),
+        press("too_cold", {"state": "rest", "base": 24.0, "forced": True, "since": 0}, None,
+              at=m(65), ends=False)],
+      unit={"since": -m(60)}),
+    s(ENDS, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF,
+              reversal=False, ends=False),
+        step("cold", {"state": "rest", "forced": True}, None, at=m(10)),
+        press("too_hot", {"state": "boost", "base": 22.0, "offset": 0, "forced": True,
+                          "since": m(45), "grace_until": None},
+              cmd("cool", "medium", 20.0), at=m(45), reversal=False, ends=True),
+        step("hot", {"state": "boost", "forced": True}, None, at=m(55)),
+        step("settled_cool", {"state": "cool", "base": 22.0, "offset": 0, "forced": False},
+             cmd("cool", "low", 22.0), at=m(65))],
+      unit={"since": -m(60)}),
+    s(ENDS_SAME, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True, "since": 0}, None,
+              accepted=False, at=m(45), ends=False),
+        press("too_hot", {"state": "boost", "base": 22.0, "forced": True}, 
+              cmd("cool", "medium", 20.0), at=m(46), ends=True),
+        press("too_hot", {"state": "boost", "base": 22.0, "forced": True, "since": m(46)},
+              None, accepted=False, at=m(50))],
+      unit={"since": -m(60)}),
+    s(ENDS_RESUMES, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF),
+        press("too_hot", {"state": "boost", "base": 22.0, "forced": True},
+              cmd("cool", "medium", 20.0), at=m(45), ends=True),
+        press("too_cold", {"state": "rest", "base": 23.0, "offset": 0, "forced": True,
+                           "since": 0}, OFF, at=m(45, 10), reversal=True, resumes=True,
+              ends=False),
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, None,
+              accepted=False, at=m(47)),
+        step("cold", {"state": "rest", "forced": False, "base": 23.0}, None, at=m(60))],
+      unit={"since": -m(60)}),
+    s(ENDS_PEERS, [
+        press("too_cold", {"state": "rest", "base": 23.0, "forced": True}, OFF,
+              peers={"v": {"state": "rest", "base": 23.0, "forced": True}},
+              peer_commands={"v": OFF}),
+        step("settled_warm", {"state": "rest", "forced": True}, None, at=m(10),
+             peers={"v": {"state": "rest", "forced": True}}),
+        press("too_hot", {"state": "boost", "base": 22.0, "forced": True},
+              cmd("cool", "medium", 20.0), at=m(45), ends=True,
+              peers={"v": {"state": "boost", "base": 22.0, "forced": True, "since": m(45)}},
+              peer_commands={"v": cmd("cool", "medium", 20.0)})],
+      unit={"since": -m(60)}, peers={"v": {"since": -m(60)}}),
 ]
 
 
@@ -1312,8 +1410,9 @@ def compare(expect: dict, units: dict[str, control.Unit], commands: dict | None,
             return f"{uid} command {got}, expected {want}"
     if "accepted" in expect and (pv is None or pv.accepted != expect["accepted"]):
         return f"vote {pv}, expected accepted={expect['accepted']}"
-    if "reversal" in expect and (pv is None or pv.reversal != expect["reversal"]):
-        return f"vote {pv}, expected reversal={expect['reversal']}"
+    for key in ("reversal", "ends", "resumes"):
+        if key in expect and (pv is None or getattr(pv, key) != expect[key]):
+            return f"vote {pv}, expected {key}={expect[key]}"
     if "vote" in expect:
         got = None if pv is None else {"direction": pv.direction, "accepted": pv.accepted,
                                        "reversal": pv.reversal}
@@ -1635,8 +1734,8 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
          {"released": lambda side_count, required: side_count < required},
          ["no usable sensor: a rest wakes", "no usable sensor: a boost releases"]),
         ("one correction per episode", {"in_episode": lambda units: False},
-         ["one correction per episode: a second press of either button is ignored; "
-          "one after the release counts",
+         ["one correction per episode: a second press the same way is ignored; "
+          "one after the release counts", ENDS_SAME,
           "a forced state on another unit holds the whole room's episode",
           "a remote setpoint change during a forced state is ignored"]),
         ("an episode is a forced rest or boost, not a leftover marker",
@@ -1775,6 +1874,27 @@ def _mutants() -> list[tuple[str, dict, list[str]]]:
         ("a reversal sends the command of the state it leaves the unit in",
          {"reversal_command": lambda current, new, command, ctx: command},
          [REVERSAL_SECTION_REST_BACK, REVERSAL_BLOCK, REVERSAL_USER_OFF]),
+        ("the forced rest cap", {"forced_rest_capped": lambda unit, now, config: False},
+         [CAP_REST_COOL, CAP_REST_BLOCKED, CAP_REST_CONFIG, CAP_REST_NEXT_VOTE]),
+        ("the forced rest cap is forced_rest_max_minutes (the boost cap instead)",
+         {"forced_rest_capped": lambda unit, now, config: c.forced_now(unit)
+          and unit.state == "rest" and now - unit.since >= timedelta(
+              minutes=config.boost_max_minutes)},
+         [CAP_REST_CONFIG]),
+        ("the cap clears only the marker (moving the offset too instead)",
+         {"end_correction": lambda unit: dataclasses.replace(unit, forced=False, offset=9)},
+         [CAP_REST_COOL]),
+        ("an opposite vote ends a running correction",
+         {"ends_correction": lambda direction, units: False},
+         [ENDS, ENDS_SAME, ENDS_RESUMES, ENDS_PEERS, REVERSAL_AFTER, REVERSAL_OFF,
+          REVERSAL_CHAIN]),
+        ("only an opposite vote ends a correction",
+         {"ends_correction": lambda direction, units: c.in_episode(units)},
+         [ENDS_SAME, "a forced state on another unit holds the whole room's episode",
+          "one correction per episode: a second press the same way is ignored; "
+          "one after the release counts"]),
+        ("undoing the vote that ended a correction only puts it back",
+         {"resumes": lambda direction, window, now, config: False}, [ENDS_RESUMES]),
         ("the reactive_min_delta tolerance (exact setpoint instead)",
          {"_same_setpoint": lambda shown, commanded, min_delta: shown == commanded},
          ["a setpoint within reactive_min_delta of our command is ours"]),

@@ -145,6 +145,9 @@ USER_OFF_WAKE_EVENT = "ac_user_off_wake"
 # it (control.overrules_block); the runtime logs it and records it on the
 # section run, for the margin and the next section's hysteresis.
 BLOCK_OVERRULED_EVENT = "ac_block_overruled"
+# Maintenance's report that a person's forced rest reached its cap
+# (control.correction_capped, decision 147), for the runtime's log line.
+CORRECTION_ENDED_EVENT = "ac_correction_ended"
 
 def scene_automation_id(room: str, section: str) -> str:
     return f"ac_scene_{room}_{section}"
@@ -430,7 +433,7 @@ _RESULT_VOTE = _RESULT[:-len("} }}")] + ", 'chosen': r.chosen, 'pre': " + _PRE +
 
 _RESULT_MAINTENANCE = (_RESULT[:-len("} }}")]
                        + ", 'woke': st == 'user_off' and r.state == 'cool'"
-                       + ", 'overrule_woke': overrule and held} }}")
+                       + ", 'overrule_woke': overrule and held, 'capped': r.capped} }}")
 
 
 def _clamp(value: str) -> str:
@@ -539,9 +542,15 @@ def _step(config: dict, room: dict, unit: dict) -> str:
         + f"{{%- elif (since is not none and now_ts - since >= {cfg.boost_max_minutes * 60!r}) "
           f"or votes.warm_side < {release_floor} -%}}" + _go("cool", cfg, _release_offset(-1))
         + "{%- endif -%}"
+        # control.forced_rest_capped (decision 147): a person's forced rest
+        # ends at its cap, the marker cleared, and rests on as an ordinary one
+        # unless it releases by the ordinary rule
         + "{%- elif st == 'rest' -%}"
-        + f"{{%- if (blocked and not unb) or not {rest_min} -%}}"
-        + f"{{%- elif votes.cold_side < {release_floor} -%}}" + _go("cool", cfg, _release_offset(+1))
+        + f"{{%- set r.capped = frc and since is not none and "
+          f"now_ts - since >= {cfg.forced_rest_max_minutes * 60!r} -%}}"
+        + f"{{%- if not (blocked and not unb) and {rest_min} and "
+          f"votes.cold_side < {release_floor} -%}}" + _go("cool", cfg, _release_offset(+1))
+        + "{%- elif r.capped -%}{%- set r.forced = false -%}{%- set r.go = true -%}"
         + "{%- endif -%}"
         + "{%- endif -%}")
 
@@ -627,26 +636,48 @@ def _episode(room: dict) -> str:
         for u in room["units"]) + " }}"
 
 
+def _running(room: dict) -> str:
+    """The states of the room's units in a forced rest or boost
+    (control.ends_correction reads which correction is running)."""
+    r = room["id"]
+    return "{{ " + " + ".join(
+        f"([states('{state_id(r, u['id'])}')] if states('{forced_id(r, u['id'])}') == 'on' "
+        f"and states('{state_id(r, u['id'])}') in {list(control.FORCED_STATES)!r} else [])"
+        for u in room["units"]) + " }}"
+
+
 def _window(room: dict) -> str:
     """The room's reversal window (control.VoteWindow) from its helper:
-    {d, at}, or {} with none."""
+    {d, at, ended}, or {} with none. "too_hot 1785556800 ended": that vote
+    ended a correction (decision 147); a helper written before has no
+    third word."""
     return _fill("{%- set w = states('<<W>>').split(' ') -%}"
-                 "{{ {'d': w[0], 'at': w[1] | int(0)} if w | length == 2 and "
+                 "{{ {'d': w[0], 'at': w[1] | int(0), "
+                 "'ended': w | length == 3 and w[2] == 'ended'} if w | length in [2, 3] and "
                  "w[0] in <<VOTES>> else {} }}",
                  W=vote_window_id(room["id"]), VOTES=list(control.PERSON_VOTES))
 
 
 def _window_variables(config: dict, direction: str) -> dict:
-    """control.window_open, reverses, repeats and vote_accepted for a vote
-    in `direction` (a Jinja expression; none: no vote), after `episode` and
-    `window`."""
+    """control.window_open, reverses, repeats, ends_correction,
+    vote_accepted and resumes for a vote in `direction` (a Jinja
+    expression; none: no vote), after `episode`, `running` and `window`.
+    ends: the accepted vote ended a correction running the other way."""
     secs = control.ControlConfig.from_config(config).vote_reversal_seconds
+    forces = control.FORCES
+    against = {d: forces[control.TOO_HOT if d == control.TOO_COLD else control.TOO_COLD]
+               for d in control.PERSON_VOTES}
     return {
         "in_window": ("{{ " + (f"window.at is defined and 0 <= now_ts - window.at <= {secs!r}"
                                if secs > 0 else "false") + " }}"),
         "reversal": f"{{{{ in_window and {direction} is not none and window.d != {direction} }}}}",
-        "accepted": (f"{{{{ {direction} is not none and (reversal or (not episode and not "
-                     f"(in_window and window.d == {direction}))) }}}}"),
+        "against": (f"{{{{ {direction} in {list(control.PERSON_VOTES)!r} and "
+                    f"{against!r}[{direction}] in running and "
+                    f"{forces!r}[{direction}] not in running }}}}"),
+        "accepted": (f"{{{{ {direction} is not none and (reversal or (not (in_window and "
+                     f"window.d == {direction}) and (not episode or against))) }}}}"),
+        "ends": "{{ accepted and not reversal and episode }}",
+        "resumes": "{{ reversal and window.ended }}",
     }
 
 
@@ -820,26 +851,29 @@ def _vote_event(room: dict, direction: str, source: str, **remote: str) -> dict:
     """The ac_person_vote event: the room, the vote's direction, whether it
     was accepted (control.vote_accepted), its source, and whether it
     reversed the vote whose window was open (reversal, and that vote's time,
-    reverses_at, in epoch seconds); a remote vote adds the unit changed and
-    the setpoint chosen. The runtime records an
+    reverses_at, in epoch seconds), whether it ended a correction running
+    the other way (ends) or undid such a vote (resumes, decision 147); a
+    remote vote adds the unit changed and the setpoint chosen. The runtime records an
     accepted vote as a reaction and logs an ignored one, and judges
     nothing itself."""
     return {"event": PERSON_VOTE_EVENT,
             "event_data": {"room": room["id"], "direction": direction,
                            "accepted": "{{ accepted }}", "source": source,
                            "reversal": "{{ reversal }}",
-                           "reverses_at": "{{ window.at if reversal else none }}", **remote}}
+                           "reverses_at": "{{ window.at if reversal else none }}",
+                           "ends": "{{ ends }}", "resumes": "{{ resumes }}", **remote}}
 
 
 def _open_window(room: dict, direction: str) -> dict:
     """An accepted vote opens the room's reversal window: its direction and
-    time, and each unit's part (its result's `pre`). Written even while
+    time, " ended" if it ended a correction, and each unit's part (its
+    result's `pre`). Written even while
     ac_hold is on: a vote under the hold is still reported, and a reversal
     of it must still be."""
     r = room["id"]
     return _when("{{ accepted }}", [
         _set("input_text.set_value", vote_window_id(r),
-             {"value": f"{{{{ {direction} ~ ' ' ~ now_ts }}}}"}),
+             {"value": f"{{{{ {direction} ~ ' ' ~ now_ts ~ (' ended' if ends else '') }}}}"}),
         *[_set("input_text.set_value", prevote_id(r, u["id"]),
                {"value": f"{{{{ {_unit_var(u)}.pre | to_json }}}}"}) for u in room["units"]],
     ])
@@ -1104,6 +1138,7 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
     for unit in room["units"]:
         variables[_unit_var(unit)] = (
             _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
+            + "{%- set r.capped = false -%}"        # control.correction_capped, by _step
             + _overruled_step(config, room, unit) + _RESULT_MAINTENANCE)
 
     any_go = " or ".join(f"{_unit_var(u)}.go" for u in room["units"])
@@ -1123,6 +1158,7 @@ def build_maintenance_automation(config: dict, room: dict) -> dict:
             *[_send_command(unit) for unit in room["units"]],
             *[_wake_event(room, unit) for unit in room["units"]],
             _overrule_event(room),
+            _correction_event(config, room),
             _set("input_boolean.turn_off", guard_id(r)),
         ])],
     }
@@ -1144,6 +1180,25 @@ def _overrule_event(room: dict) -> dict:
                        "required": "{{ plain_votes.required }}",
                        "warm_side": "{{ plain_votes.warm_side }}",
                        "warm_edge": control.PLAIN_EDGES[1], "woke": "{{ " + woke + " }}"}}])
+
+
+def _correction_event(config: dict, room: dict) -> dict:
+    """The ac_correction_ended event, when this heartbeat ended one or more
+    units' forced rests at the cap (control.correction_capped, decision
+    147): the section, the cap, and each unit with the state it is left in
+    (still resting, or cooling) and the setpoint it now cools at, for the
+    runtime's log line. Fired once the commands are sent."""
+    cap = control.ControlConfig.from_config(config).forced_rest_max_minutes
+    units = " + ".join(
+        f"([{{'unit': '{u['id']}', 'state': {_unit_var(u)}.state, "
+        f"'setpoint': ({_unit_var(u)}.cmd.temperature if {_unit_var(u)}.cmd else none)}}] "
+        f"if {_unit_var(u)}.capped else [])" for u in room["units"])
+    any_capped = " or ".join(f"{_unit_var(u)}.capped" for u in room["units"])
+    return _when(f"{{{{ {any_capped} }}}}", [{
+        "event": CORRECTION_ENDED_EVENT,
+        "event_data": {"room": room["id"], "section": "{{ section }}",
+                       "direction": control.TOO_COLD, "minutes": cap,
+                       "units": "{{ " + units + " }}"}}])
 
 
 def _wake_event(room: dict, unit: dict) -> dict:
@@ -1173,6 +1228,7 @@ def build_vote_automation(config: dict, room: dict) -> dict:
         **_conditions_variables(config, room, "section"),
         "direction": "{{ trigger.id }}",
         "episode": _episode(room),
+        "running": _running(room),
         "window": _window(room),
         **_window_variables(config, "direction"),
     }
@@ -1180,8 +1236,8 @@ def build_vote_automation(config: dict, room: dict) -> dict:
         variables[_unit_var(unit)] = (
             _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit)) + _read_chosen(room, unit)
             + _restore(room, unit)
-            + "{%- if accepted -%}" + _vote(config, "direction", "none")
-            + _reversal_command(config) + "{%- endif -%}"
+            + "{%- if accepted -%}{%- if not resumes -%}" + _vote(config, "direction", "none")
+            + "{%- endif -%}" + _reversal_command(config) + "{%- endif -%}"
             + _RESULT_VOTE)
     return {
         "id": vote_automation_id(r),
@@ -1233,15 +1289,16 @@ def build_manual_change_automation(config: dict, room: dict, unit: dict) -> dict
         "change": _read_unit(room, unit, _sa_live(unit), _leak_on(room, unit))
                   + _read_chosen(room, unit) + _change_kind(config),
         "episode": _episode(room),
+        "running": _running(room),
         "window": _window(room),
         **_window_variables(config, "change.vote"),
     }
     for other in room["units"]:
         mine = other["id"] == u
         body = ("{%- if change.vote is not none -%}" + _restore(room, other)
-                + "{%- if accepted -%}"
+                + "{%- if accepted -%}{%- if not resumes -%}"
                 + _vote(config, "change.vote", "after.temperature" if mine else "none")
-                + _reversal_command(config) + "{%- endif -%}")
+                + "{%- endif -%}" + _reversal_command(config) + "{%- endif -%}")
         if mine:
             body += "{%- elif change.kind is not none and not change.ours -%}" + _person_change(config)
         body += "{%- endif -%}"

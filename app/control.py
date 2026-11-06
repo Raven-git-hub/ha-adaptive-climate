@@ -15,7 +15,8 @@ rule is a small named function, written the way a template can say it.
                       the units resting for it and unblocking every unit;
                       then each unit takes its step
   step                one maintenance heartbeat for one unit; a person's off
-                      wakes on a too-warm quorum (user_off_wakes)
+                      wakes on a too-warm quorum (user_off_wakes); a forced
+                      rest ends at forced_rest_max_minutes (forced_rest_capped)
   on_section_change   what the scene does to a unit at a crossover: a
                       person's off stays off; else rest if cooling is
                       blocked or the room starts cold (section_start), else
@@ -29,7 +30,9 @@ rule is a small named function, written the way a template can say it.
                       reversal window (decision 146): an opposite vote
                       within vote_reversal_seconds of an accepted one puts
                       each unit back as it was before it (restore), then
-                      applies itself, and the first teaches nothing
+                      applies itself, and the first teaches nothing; an
+                      opposite vote after the window ends a running
+                      correction (ends_correction, decision 147)
   on_person_change    what a person turning a unit on or off, or changing
                       its mode or fan, does to the unit's record (no
                       command: the person already moved the unit)
@@ -75,6 +78,7 @@ TOO_HOT = "too_hot"
 PERSON_VOTES = (TOO_COLD, TOO_HOT)
 SETPOINT_STEP = 1.0             # a vote moves the target this far
 FORCED_STATES = ("rest", "boost")      # what a vote forces
+FORCES = {TOO_COLD: "rest", TOO_HOT: "boost"}   # the state each vote forces
 VOTE_HANDS_OFF = ("leak", "config_off", "manual")   # a vote leaves these alone
 
 DEFAULT_MIN_TEMP, DEFAULT_MAX_TEMP = 16.0, 30.0
@@ -110,6 +114,7 @@ class ControlConfig:
     offset_cap: int = 3
     user_off_wakes_on_warm: bool = True     # a too-warm quorum ends a person's off
     vote_reversal_seconds: int = 20         # an opposite vote this soon reverses (0: never)
+    forced_rest_max_minutes: int = 60       # a person's forced rest ends after this (decision 147)
 
     @classmethod
     def from_config(cls, config: dict) -> ControlConfig:
@@ -182,10 +187,12 @@ class Prevote:
 @dataclass(frozen=True)
 class VoteWindow:
     """The reversal window an accepted vote opens (ac_vote_window_<room>):
-    its direction and time, and each unit's Prevote."""
+    its direction and time, each unit's Prevote, and whether that vote
+    ended a correction running the other way (decision 147)."""
     at: datetime
     direction: str
     prevotes: dict = field(default_factory=dict)
+    ended: bool = False
 
 
 @dataclass(frozen=True)
@@ -194,8 +201,11 @@ class PersonVote:
     ignored because an episode is running (or it repeats the vote whose
     window is open). source is button or remote; a remote vote also names
     the unit changed and the setpoint chosen. reversal: it reversed the
-    vote at reverses_at (decision 146). opens: the window an accepted vote
-    opens, which the next vote reads (not part of the event)."""
+    vote at reverses_at (decision 146). ends: it ended a correction running
+    the other way; resumes: a reversal of such a vote, which puts the
+    correction back and applies nothing (decision 147). opens: the window
+    an accepted vote opens, which the next vote reads (not part of the
+    event)."""
     direction: str                      # too_cold | too_hot
     accepted: bool
     source: str
@@ -203,6 +213,8 @@ class PersonVote:
     chosen: float | None = None
     reversal: bool = False
     reverses_at: datetime | None = None
+    ends: bool = False
+    resumes: bool = False
     opens: VoteWindow | None = field(default=None, compare=False)
 
 
@@ -300,6 +312,27 @@ def effective_blocked(unit: Unit, ctx: Context) -> bool:
 
 def boost_capped(unit: Unit, now: datetime, config: ControlConfig) -> bool:
     return unit.since is not None and now - unit.since >= timedelta(minutes=config.boost_max_minutes)
+
+
+def forced_rest_capped(unit: Unit, now: datetime, config: ControlConfig) -> bool:
+    """A person's forced rest has run forced_rest_max_minutes (decision
+    147), counted from its since as the boost cap is: the correction ends."""
+    return (forced_now(unit) and unit.state == "rest" and unit.since is not None
+            and now - unit.since >= timedelta(minutes=config.forced_rest_max_minutes))
+
+
+def end_correction(unit: Unit) -> Unit:
+    """The cap ends a forced rest: the marker clears and the unit is an
+    ordinary rest from here (it still rests while the room is cold or
+    cooling is blocked)."""
+    return replace(unit, forced=False)
+
+
+def correction_capped(unit: Unit, now: datetime, ctx: Context) -> bool:
+    """This heartbeat's step ends the unit's forced rest at the cap (the
+    ac_correction_ended event): capped, no leak latch, and seeded."""
+    return (forced_rest_capped(unit, now, ctx.config) and not ctx.leak_on
+            and target_base(unit, ctx) is not None)
 
 
 def released(side_count: int, required: int) -> bool:
@@ -498,8 +531,17 @@ def forced_now(unit: Unit) -> bool:
 
 def in_episode(units: Iterable[Unit]) -> bool:
     """One correction per episode: while any unit in the room is in a forced
-    rest or boost, a vote changes and teaches nothing."""
+    rest or boost, a vote the same way changes and teaches nothing."""
     return any(forced_now(u) for u in units)
+
+
+def ends_correction(direction: str, units: Iterable[Unit]) -> bool:
+    """A vote against the correction running (decision 147): a unit forced
+    into the state the other vote forces, and none into this vote's. It ends the
+    correction and applies as any vote; both stand."""
+    running = {u.state for u in units if forced_now(u)}
+    other = TOO_HOT if direction == TOO_COLD else TOO_COLD
+    return FORCES[other] in running and FORCES[direction] not in running
 
 
 def vote_base(direction: str, unit: Unit, ctx: Context,
@@ -596,6 +638,8 @@ class VoteOutcome:
     reverses_at: datetime | None
     results: dict                       # {unit_id: (unit, command)}
     opens: VoteWindow | None            # the window an accepted vote opens
+    ends: bool = False                  # it ended a correction running the other way
+    resumes: bool = False               # it reversed such a vote: the correction is back
 
 
 def window_open(window: VoteWindow | None, now: datetime, config: ControlConfig) -> bool:
@@ -619,10 +663,21 @@ def repeats(direction: str, window: VoteWindow | None, now: datetime,
 
 def vote_accepted(direction: str, units: Iterable[Unit], now: datetime,
                   window: VoteWindow | None, config: ControlConfig) -> bool:
-    """A reversal is accepted whatever the episode; any other vote only
-    with no episode running, and not as a repeat inside the window."""
+    """A reversal is accepted whatever the episode; any other vote not as a
+    repeat inside the window, and only with no episode running or against
+    the correction that is (ends_correction, decision 147)."""
+    units = list(units)
     return reverses(direction, window, now, config) or (
-        not in_episode(units) and not repeats(direction, window, now, config))
+        not repeats(direction, window, now, config)
+        and (not in_episode(units) or ends_correction(direction, units)))
+
+
+def resumes(direction: str, window: VoteWindow | None, now: datetime,
+            config: ControlConfig) -> bool:
+    """A reversal of a vote that ended a correction puts that correction
+    back as it was and applies nothing more: from the restored record the
+    vote would be a second press of the correction running (decision 147)."""
+    return reverses(direction, window, now, config) and window.ended
 
 
 def untouched(unit: Unit, prevote: Prevote) -> bool:
@@ -662,26 +717,34 @@ def room_vote(direction: str, units: dict[str, Unit], now: datetime, ctxs: dict[
     (vote_accepted). A reversal first restores every unit (restore), then
     the vote applies to each from there, with reversal_command. Every
     accepted vote opens a new window, recording each unit's record as the
-    vote found it (restored, for a reversal) and what it left. chosen:
+    vote found it (restored, for a reversal) and what it left. A vote
+    against a running correction ends it (ends_correction) and applies as
+    any vote; a reversal of that vote only restores (resumes). chosen:
     {unit_id: setpoint} for a unit changed on its remote."""
     config = next(iter(ctxs.values())).config
     if not vote_accepted(direction, units.values(), now, window, config):
         return VoteOutcome(False, False, None, {uid: (u, None) for uid, u in units.items()},
                            None)
     reversal = reverses(direction, window, now, config)
+    ends = not reversal and in_episode(units.values())
+    resumed = resumes(direction, window, now, config)
     chosen = chosen or {}
     found = {uid: restore(u, window.prevotes.get(uid), ctxs[uid]) if reversal else u
              for uid, u in units.items()}
     results = {}
     for uid, unit in found.items():
-        new, command = on_person_vote(direction, unit, now, ctxs[uid], chosen.get(uid))
+        if resumed:
+            new, command = unit, None
+        else:
+            new, command = on_person_vote(direction, unit, now, ctxs[uid], chosen.get(uid))
         if reversal:
             command = reversal_command(units[uid], new, command, ctxs[uid])
         results[uid] = (new, command)
     opens = VoteWindow(now, direction, {
         uid: Prevote(found[uid], new.state, new.since, new.base)
-        for uid, (new, _) in results.items()})
-    return VoteOutcome(True, reversal, window.at if reversal else None, results, opens)
+        for uid, (new, _) in results.items()}, ended=ends)
+    return VoteOutcome(True, reversal, window.at if reversal else None, results, opens,
+                       ends, resumed)
 
 
 def setpoint_direction(before: Climate, after: Climate) -> str:
@@ -833,11 +896,13 @@ def step(unit: Unit, votes: Votes, now: datetime, ctx: Context) -> tuple[Unit, C
         return _stay(unit, ctx)
 
     if unit.state == "rest":
-        if blocked or not min_time_met(unit, now, cfg.rest_min_heartbeats, interval):
-            return _stay(unit, ctx)
-        if released(votes.cold_side, votes.required):
+        # A person's forced rest ends at its cap (decision 147): the marker
+        # clears and the ordinary rules carry on from the rest it is in.
+        capped = forced_rest_capped(unit, now, cfg)
+        if not blocked and min_time_met(unit, now, cfg.rest_min_heartbeats, interval) \
+                and released(votes.cold_side, votes.required):
             return _go(unit, "cool", now, ctx, offset=release_offset(unit, +1))
-        return _stay(unit, ctx)
+        return (end_correction(unit), None) if capped else _stay(unit, ctx)
 
     return _stay(unit, ctx)
 
@@ -985,7 +1050,7 @@ def person_change_kind(unit: Unit, before: Climate, after: Climate, ctx: Context
 def _person_vote(outcome: VoteOutcome, direction: str, source: str, unit: str | None = None,
                  chosen: float | None = None) -> PersonVote:
     return PersonVote(direction, outcome.accepted, source, unit, chosen, outcome.reversal,
-                      outcome.reverses_at, outcome.opens)
+                      outcome.reverses_at, outcome.ends, outcome.resumes, outcome.opens)
 
 
 def on_button(direction: str, units: dict[str, Unit], now: datetime,

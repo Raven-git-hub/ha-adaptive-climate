@@ -129,6 +129,7 @@ def main() -> int:
         votes = [d for kind, d in ha.events if kind == g.PERSON_VOTE_EVENT]
         assert votes == ([{"room": ROOM, "direction": "too_hot", "accepted": True,
                            "source": "remote", "reversal": False, "reverses_at": None,
+                           "ends": False, "resumes": False,
                            "chosen": 20.0, "unit": UNIT}]
                          if after.mode == "off" else []), votes
     assert ran == [1, 1, 1], ran        # each change went on once, and changed nothing

@@ -85,8 +85,9 @@ until its first one, then **learned**.
 
 **Kinds of reaction.** The person is a sensor that always wins: a **vote**,
 `too_cold` or `too_hot`, is the main one (docs/V2_DESIGN.md, Person reactions).
-Home Assistant judges it (one per episode: a press during a forced rest or boost
-is ignored and teaches nothing) and reports it; the container learns only from
+Home Assistant judges it (one per episode: a press the same way during a forced
+rest or boost is ignored and teaches nothing; one the other way ends it and both
+count) and reports it; the container learns only from
 the votes HA reports as accepted. A person turning a unit **on** or **off**, or
 changing its mode or fan while it stays on (**manual**), is a reaction too. On
 says *too warm* and off *too cold*: both teach bands (below), but neither moves

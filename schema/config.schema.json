@@ -97,7 +97,11 @@
             },
             "vote_reversal_seconds": {
               "type": "integer", "minimum": 0, "maximum": 120, "default": 20,
-              "description": "Undo window for a person's vote (decision 146): an opposite vote this soon after an accepted one reverses it - each unit goes back to its record before the first vote and takes the new one from there, and the first vote teaches nothing. A same-direction vote inside the window is ignored. After it, one correction per episode applies as before. 0 turns the window off."
+              "description": "Undo window for a person's vote (decision 146): an opposite vote this soon after an accepted one reverses it - each unit goes back to its record before the first vote and takes the new one from there, and the first vote teaches nothing. A same-direction vote inside the window is ignored. After it, an opposite vote ends the correction running and applies as any vote, both standing (decision 147); a same-direction one is ignored. 0 turns the window off."
+            },
+            "forced_rest_max_minutes": {
+              "type": "integer", "minimum": 10, "maximum": 480, "default": 60,
+              "description": "Forced rest cap (decision 147): a person's too cold vote forces a rest that ends after this long (counted from when the rest began, as the boost cap counts), so the room isn't locked for hours. The marker clears and the ordinary rules carry on: the unit rests on while the room is still cool or cooling is blocked, otherwise it wakes to cool at its base; the next vote counts."
             },
             "user_off_wakes_on_warm": {
               "type": "boolean", "default": true,

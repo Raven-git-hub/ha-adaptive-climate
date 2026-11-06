@@ -560,7 +560,8 @@ def _event_says(pv: control.PersonVote | None) -> dict | None:
         return None
     data = {"room": ROOM, "direction": pv.direction, "accepted": pv.accepted,
             "source": pv.source, "reversal": pv.reversal,
-            "reverses_at": None if pv.reverses_at is None else int(pv.reverses_at.timestamp())}
+            "reverses_at": None if pv.reverses_at is None else int(pv.reverses_at.timestamp()),
+            "ends": pv.ends, "resumes": pv.resumes}
     if pv.source == "remote":
         data.update(chosen=pv.chosen, unit=pv.unit)
     return data
@@ -574,6 +575,7 @@ class Replay:
     def __init__(self) -> None:
         self.steps = self.runs = self.echoes = self.kinds = self.ours = self.twice = 0
         self.events = self.ignored = self.wakes = self.overrules = self.reversals = 0
+        self.caps = self.ends = 0
         self.last_vars: dict | None = None
         self.first_rendered: dict | None = None
 
@@ -679,7 +681,8 @@ class Replay:
                                 overrides, units, new, commands, now,
                                 wakes=self.wakes_for(st, units, new, commands, now, ctx),
                                 overrules=self.overrules_for(st, units, commands, now, ctx,
-                                                             overruled))
+                                                             overruled),
+                                caps=self.caps_for(units, new, commands, now, overruled))
             return new, diff and f"maintenance: {diff}"
 
         if do == "section_change":
@@ -755,11 +758,30 @@ class Replay:
                  "woke": [{"unit": uid, "setpoint": commands[uid].temperature} for uid in olds
                           if control.rests_for_block(olds[uid], self.ctxs[uid])]}]
 
+    def caps_for(self, olds: dict, news: dict, commands: dict, now: datetime,
+                 overruled: bool) -> list[dict]:
+        """The ac_correction_ended events a heartbeat must fire: one if
+        control's step ended any unit's forced rest at the cap
+        (control.correction_capped; not a unit the room's overrule woke),
+        with each such unit's state after it and the setpoint it cools at."""
+        capped = [uid for uid in olds
+                  if control.correction_capped(olds[uid], now, self.ctxs[uid])
+                  and not (overruled and control.rests_for_block(olds[uid], self.ctxs[uid]))]
+        if not capped:
+            return []
+        cfg = self.ctxs[UNIT].config
+        return [{"room": ROOM, "section": SECTION, "direction": control.TOO_COLD,
+                 "minutes": cfg.forced_rest_max_minutes,
+                 "units": [{"unit": uid, "state": news[uid].state,
+                            "setpoint": None if commands.get(uid) is None
+                            else commands[uid].temperature} for uid in capped]}]
+
     def compare(self, ha: HA, automation: dict, trigger, overrides: dict, olds: dict,
                 news: dict, commands: dict, now: datetime, echo: bool = True,
                 only: list[str] | None = None, pv: control.PersonVote | None = None,
                 wakes: list[dict] | None = None,
-                overrules: list[dict] | None = None) -> str | None:
+                overrules: list[dict] | None = None,
+                caps: list[dict] | None = None) -> str | None:
         """Run one automation - once per trigger, if given a list of the
         triggers that fired - and every unit's helpers and command must be
         control's, with nothing written or sent without a change, any
@@ -811,6 +833,10 @@ class Replay:
         if overruled != (overrules or []):
             return f"overrule events {overruled}, control {overrules or []}"
         self.overrules += len(overruled)
+        ended = [data for kind, data in ha.events if kind == g.CORRECTION_ENDED_EVENT]
+        if ended != (caps or []):
+            return f"correction-ended events {ended}, control {caps or []}"
+        self.caps += len(ended)
         if echo:
             for uid in uids:
                 if _sent(ha.calls, entity_of(uid)) is not None:
@@ -837,6 +863,7 @@ class Replay:
             return (f"the event says accepted={events[0]['accepted']}, but "
                     f"control.vote_accepted is {accepted}")
         self.reversals += events[0]["reversal"]
+        self.ends += events[0]["ends"]
         self.events += 1
         self.ignored += not events[0]["accepted"]
         return None
@@ -1210,7 +1237,8 @@ def _extra_cases() -> int:
     ha.set(g.hold_id(ROOM), "on")
     ha.run(vote, fired(vote, _press("too_cold"))[0])
     expect(vote_events(ha) == [{"room": ROOM, "direction": "too_cold", "accepted": True,
-                                "source": "button", "reversal": False, "reverses_at": None}]
+                                "source": "button", "reversal": False, "reverses_at": None,
+                                "ends": False, "resumes": False}]
            and not ha.calls_but_window() and _view(ha, table.T0) == snapshot,
            "hold on: a press is reported (accepted, so it is learned) but changes and sends "
            "nothing (it still opens its reversal window)")
@@ -1219,7 +1247,8 @@ def _extra_cases() -> int:
     ha.run(vote, fired(vote, _press("too_hot"))[0])
     expect(vote_events(ha)[-1] == {"room": ROOM, "direction": "too_hot", "accepted": True,
                                    "source": "button", "reversal": True,
-                                   "reverses_at": int(table.T0.timestamp())}
+                                   "reverses_at": int(table.T0.timestamp()),
+                                   "ends": False, "resumes": False}
            and not ha.calls_but_window() and _view(ha, table.T0) == snapshot,
            "hold on: an opposite press 10 s later is reported as a reversal (so the first is "
            "not learned), and still changes and sends nothing")
@@ -1305,10 +1334,12 @@ def main() -> int:
           f"app.control ({replay.steps} template runs, {replay.echoes} echoes ignored, "
           f"{replay.kinds} changes' kind and is-this-ours checked, {replay.ours} of them ours, "
           f"{replay.twice} firing two triggers, run once; {replay.events} vote events, "
-          f"{replay.reversals} of them reversals, {replay.ignored} ignored, each accepted "
+          f"{replay.reversals} of them reversals, {replay.ends} ending a correction, "
+          f"{replay.ignored} ignored, each accepted "
           f"exactly when control.vote_accepted says so; {replay.wakes} wake events, each exactly a user_off "
           f"control woke; {replay.overrules} overrule events, each exactly a heartbeat whose "
-          f"room overruled the block in control)")
+          f"room overruled the block in control; {replay.caps} correction-ended events, "
+          f"each exactly a forced rest control ended at its cap)")
     fuzz = _fuzz_votes(40)
     print("other cases:")
     extra = _extra_cases()

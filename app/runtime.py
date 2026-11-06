@@ -16,7 +16,13 @@ Observation (passive):
     the room replayed; an ignored one is logged as an "ignored press" and
     teaches nothing. A reversal (an opposite vote within
     system.control.vote_reversal_seconds, decision 146) is recorded the same
-    way and marks the vote it reversed, which the replay then skips.
+    way and marks the vote it reversed, which the replay then skips. An
+    opposite vote after that window ends the correction running (decision
+    147) and is recorded like any vote: both stand.
+  * a forced rest's cap - an ac_correction_ended subscription: HA's
+    maintenance ended a person's forced rest at
+    system.control.forced_rest_max_minutes (decision 147); logged, nothing
+    learned.
   * reactive detection - a state_changed subscription; a person's change
     to a unit (NOT automation-caused) - turning it on or off, or a mode or
     fan change while on - opens a consolidation window, snapshots every
@@ -113,7 +119,7 @@ from app import control, outdoor
 from app.analyser import (LearningConfig, MarginConfig, MarginStep, analyse_room,
                           is_setpoint_moving, learn_margin)
 from app.config import ConfigError, validate
-from app.generator import (BLOCK_OVERRULED_EVENT, PERSON_VOTE_EVENT, USER_OFF_WAKE_EVENT,
+from app.generator import (BLOCK_OVERRULED_EVENT, CORRECTION_ENDED_EVENT, PERSON_VOTE_EVENT, USER_OFF_WAKE_EVENT,
                            almanac_id, base_id, chosen_id, conditions_id, forced_id,
                            forced_off_sections, guard_id,
                            leak_id, offset_id, scene_automation_id, scene_select_id, state_id,
@@ -639,6 +645,7 @@ class Runtime:
         await self.ws.subscribe_events(PERSON_VOTE_EVENT, self._on_person_vote)
         await self.ws.subscribe_events(USER_OFF_WAKE_EVENT, self._on_user_off_wake)
         await self.ws.subscribe_events(BLOCK_OVERRULED_EVENT, self._on_block_overruled)
+        await self.ws.subscribe_events(CORRECTION_ENDED_EVENT, self._on_correction_ended)
         await self.ws.subscribe_events(HA_START_EVENT, self._on_ha_start)
 
     async def _resubscribe(self) -> None:
@@ -762,6 +769,7 @@ class Runtime:
                 "seq": self._vote_seq, "direction": data.get("direction"),
                 "accepted": _accepted(data), "source": data.get("source"),
                 "unit": data.get("unit"), "reversal": _flag(data, "reversal"),
+                "ends": _flag(data, "ends"), "resumes": _flag(data, "resumes"),
                 "at": self._now()[0]}
         task = asyncio.create_task(self._record_vote(event))
         self._followups.add(task)
@@ -792,6 +800,42 @@ class Runtime:
             f"Off (by you){cools}: the room is too warm, quorum met: {tally} vote(s) "
             f"({required} needed){past}", room_id=rs.room["id"],
             detail={**data, "from": "user_off", "to": "cool"})
+
+    def _on_correction_ended(self, event: dict) -> None:
+        """An ac_correction_ended event: HA's maintenance ended a person's
+        forced rest at system.control.forced_rest_max_minutes (decision
+        147). Logged as a control event, saying what each unit does now; it
+        is the cap's doing, so nothing is recorded or learned."""
+        data = event.get("data") or {}
+        ts, ts_utc, _, _ = self._now()
+        rs = self.rooms.get(data.get("room"))
+        if rs is None:
+            self.store.log_event(ts, ts_utc, "warning", "control",
+                                 "a correction-ended event this config can't place: room "
+                                 f"{data.get('room')!r}", detail=data)
+            return
+        names = {u["id"]: u.get("name", u["id"]) for u in rs.room["units"]}
+        parts = []
+        for u in data.get("units") or []:
+            if not isinstance(u, dict):
+                continue
+            unit, setpoint = names.get(u.get("unit"), u.get("unit")), _number(u.get("setpoint"), None)
+            if u.get("state") == "cool":
+                parts.append(f"{unit} cools" + (f" at {setpoint:g}°" if setpoint is not None
+                                                else ""))
+            elif u.get("state") == "rest":
+                parts.append(f"{unit} rests on (the room is still cool, or cooling is blocked)")
+            else:
+                parts.append(f"{unit}: {u.get('state')}")
+        direction = str(data.get("direction") or control.TOO_COLD).replace("_", " ")
+        minutes = _number(data.get("minutes"), None)
+        after = f" after {minutes:g} min" if minutes is not None else ""
+        name, sec = rs.room.get("name", rs.room["id"]), self._section_name(rs, data.get("section") or "")
+        self.store.log_event(
+            ts, ts_utc, "info", "control",
+            f"{name}: the {direction} correction in {sec} ended{after}"
+            + (f"; {'; '.join(parts)}" if parts else "")
+            + "; the next vote counts", room_id=rs.room["id"], detail=data)
 
     def _on_block_overruled(self, event: dict) -> None:
         """An ac_block_overruled event: HA's maintenance found the room too
@@ -943,12 +987,12 @@ class Runtime:
         if not accepted:
             self.store.log_event(
                 ts, ts_utc, "info", "reactive",
-                f"{name}: ignored press: {direction} from {via}, during a forced rest or "
-                "boost (one correction per episode), or a second press the same way just "
-                "after the first; nothing changed or learned",
+                f"{name}: ignored press: {direction} from {via}, during a correction the "
+                "same way (one per episode), or a second press the same way just after the "
+                "first; nothing changed or learned",
                 room_id=room_id, detail={"vote": data, "ignored": True})
             return
-        reversal = _flag(data, "reversal")
+        reversal, ends = _flag(data, "reversal"), _flag(data, "ends")
         reverses = self._reversed_vote(room_id, direction, data, now) if reversal else None
         states = {s["entity_id"]: s for s in await self.rest.states()}
         sensors = {s["id"]: self._sensor_reading(s, rs.room, states) for s in rs.room["sensors"]}
@@ -980,13 +1024,20 @@ class Runtime:
                        f"{self._reversal_seconds()} s; the first vote teaches nothing")
             if reverses is None:
                 message += " (it was never recorded)"
+            if _flag(data, "resumes"):
+                message += f"; the {direction.replace('_', ' ')} correction it ended carries on"
             self.store.log_event(ts, ts_utc, "info", "reactive", message, room_id=room_id,
                                  detail={"kind": direction, "vote": data, "sensors": sensors,
                                          "reversal": True, "reverses": reverses})
         else:
+            other = control.TOO_HOT if direction == control.TOO_COLD else control.TOO_COLD
+            ended = (f"; it ends the {other.replace('_', ' ')} correction, and both votes stand"
+                     if ends else "")
             self.store.log_event(ts, ts_utc, "info", "reactive",
-                                 f"{name}: a person voted {direction} ({via})", room_id=room_id,
-                                 detail={"kind": direction, "vote": data, "sensors": sensors})
+                                 f"{name}: a person voted {direction} ({via}){ended}",
+                                 room_id=room_id,
+                                 detail={"kind": direction, "vote": data, "sensors": sensors,
+                                         **({"ends": True} if ends else {})})
         log.info("vote (%s, %s%s) recorded for %s", direction, source,
                  ", a reversal" if reversal else "", room_id)
         await self.replay_room(room_id, "vote")

@@ -63,7 +63,7 @@ async function serve(context, c, posts) {
         return route.fulfill({ json: { pressed: `input_button.ac_${body.direction}_main_room`,
           direction: body.direction, outcome: st.outcome === null ? null : { seq: presses,
             direction: body.direction, accepted: st.outcome.accepted, source: "button",
-            reversal: !!st.outcome.reversal } } });
+            reversal: !!st.outcome.reversal, ends: !!st.outcome.ends } } });
       }
       if (p.endsWith("/leak-fixed")) {
         return route.fulfill({ json: { confirmed: "input_boolean.ac_leak_confirmed_main_room_main_room_ac" } });
@@ -321,12 +321,14 @@ async function fanCheck(browser, c) {
       NowView.reply(false, { detail: "no enabled room 'x'" }, "too_cold"),
       NowView.reply(true, { outcome: { accepted: true, reversal: true, direction: "too_hot" } }, "too_hot"),
       NowView.reply(true, { outcome: { accepted: true, reversal: true, direction: "too_cold" } }, "too_cold"),
+      NowView.reply(true, { outcome: { accepted: true, ends: true, direction: "too_hot" } }, "too_hot"),
+      NowView.reply(true, { outcome: { accepted: true, ends: true, direction: "too_cold" } }, "too_cold"),
     ].map((r) => r[0]));
     const want = ["Got it, cooling harder", "Got it, resting", "Already correcting, ignored",
       "Already correcting, ignored", "Sent", "Not sent: no enabled room 'x'",
-      "Changed to Cooling", "Changed to Warming"];
+      "Changed to Cooling", "Changed to Warming", "Changed to Cooling", "Changed to Warming"];
     if (JSON.stringify(got) !== JSON.stringify(want)) fail("replies", `${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
-    console.log(`${failures.some((f) => f.startsWith("replies")) ? "FAIL" : "ok  "} replies: accepted too hot -> cooling harder, accepted too cold -> resting, ignored -> ignored, no report -> sent, a reversal -> changed to cooling / warming`);
+    console.log(`${failures.some((f) => f.startsWith("replies")) ? "FAIL" : "ok  "} replies: accepted too hot -> cooling harder, accepted too cold -> resting, ignored -> ignored, no report -> sent, a reversal or the end of a correction -> changed to cooling / warming`);
     await context.close();
   }
 

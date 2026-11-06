@@ -94,6 +94,7 @@ def case_settings() -> dict:
         "system.control.vote_reversal_seconds": "default 20 · 0 to 120",
         "system.control.boost_degrees": "default 2 · 0.1 to 10",
         "system.control.boost_max_minutes": "default 60 · 1 to 240",
+        "system.control.forced_rest_max_minutes": "default 60 · 10 to 480",
         "system.control.cool_min_heartbeats": "default 1 · 0 to 12",
         "system.control.rest_min_heartbeats": "default 2 · 0 to 12",
         "system.control.user_off_wakes_on_warm": "default on",

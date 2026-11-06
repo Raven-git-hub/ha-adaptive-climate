@@ -55,8 +55,10 @@ Home Assistant, **too cold** and **too hot** (`input_button.ac_too_cold_<room>`,
 knob can press. A press rests or boosts the room's units at once, steps the
 target a degree, and teaches every sensor where your comfort sits. Changing a
 setpoint on the remote counts as the same vote, with the value you chose. One
-correction per episode: while a press's rest or boost is running, further
-presses are logged and ignored. The almanac is a replay of every reaction,
+correction per episode: while a press's rest or boost is running, a further
+press the same way is logged and ignored; one the other way ends it and
+counts. A too cold rest lasts an hour at most
+(`system.control.forced_rest_max_minutes`). The almanac is a replay of every reaction,
 rebuilt straight after each one and nightly at 00:15.
 
 The goal is convergence: a system that has learned enough to provoke no

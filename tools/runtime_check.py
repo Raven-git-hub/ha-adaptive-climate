@@ -244,11 +244,11 @@ def _state_changed(entity_id, before, after, parent_id=None, state="cool",
 
 def vote_event(room: str, direction: str, accepted=True, source: str = "button",
                chosen: float | None = None, unit: str | None = None, reversal=False,
-               reverses_at: int | None = None) -> dict:
+               reverses_at: int | None = None, ends=False, resumes=False) -> dict:
     """An ac_person_vote event as HA's vote or manual-change automation
     fires it."""
     data = {"room": room, "direction": direction, "accepted": accepted, "source": source,
-            "reversal": reversal, "reverses_at": reverses_at}
+            "reversal": reversal, "reverses_at": reverses_at, "ends": ends, "resumes": resumes}
     if source == "remote":
         data.update(chosen=chosen, unit=unit)
     return {"event_type": "ac_person_vote", "data": data,
@@ -371,7 +371,7 @@ async def main() -> int:
 
     # --- a person's vote: a setpoint change on the remote ---
     subscriptions = {"state_changed", "ac_person_vote", "ac_user_off_wake",
-                     "ac_block_overruled", "homeassistant_start"}
+                     "ac_block_overruled", "ac_correction_ended", "homeassistant_start"}
     assert set(ws.subscribed) == subscriptions, ws.subscribed
     ws.subscribed.clear()                         # a dropped socket loses them all
     await rt._resubscribe()
@@ -649,6 +649,45 @@ async def main() -> int:
           f"later, after it (one vote at a time), names it, and marks it reversed_at; logged "
           f"\"{msg}\"; the Now view's last vote says reversal - OK")
     count = n_reactions("main_bedroom")
+
+    # --- decision 147: an opposite vote after the window ends the correction ---
+    await asyncio.sleep(2.1)                     # past the reversal, stamped a second later
+    vote_cb(vote_event("main_bedroom", "too_cold"))
+    await eventually(lambda: n_reactions("main_bedroom") == count + 1, "the too_cold")
+    await asyncio.sleep(1.05)
+    vote_cb(vote_event("main_bedroom", "too_hot", ends="True"))
+    await eventually(lambda: n_reactions("main_bedroom") == count + 2, "the too_hot ending it")
+    (k1, rv1, rd1, _), (k2, rv2, rd2, _) = votes_of("main_bedroom")[-2:]
+    assert (k1, rv1, rd1, k2, rv2, rd2) == ("too_cold", None, None, "too_hot", None, None), \
+        votes_of("main_bedroom")[-2:]
+    events = store.recent_events(limit=5, room_id="main_bedroom", category="reactive")
+    msg = next(e["message"] for e in events if (e.get("detail") or {}).get("ends"))
+    assert msg == "Main Bedroom: a person voted too_hot (the button); it ends the too cold " \
+                  "correction, and both votes stand", msg
+    assert rt.last_votes["main_bedroom"]["ends"] is True, rt.last_votes["main_bedroom"]
+    since = (dt_mod.datetime.now(dt_mod.timezone.utc) - dt_mod.timedelta(hours=1)).isoformat()
+    learned = [kind for _, kind, *_ in store.reactions_since("main_bedroom", since)][-2:]
+    print(f"vote: too_cold, then a too_hot that ends its correction: both recorded, neither "
+          f"reversed, both learned ({learned}); logged \"{msg}\" - OK")
+    count = n_reactions("main_bedroom")
+
+    # --- decision 147: HA's maintenance ended a forced rest at its cap ---
+    controls = len(store.recent_events(limit=1000, category="control"))
+    ws.subscribed["ac_correction_ended"]({"event_type": "ac_correction_ended", "data": {
+        "room": "main_bedroom", "section": "sleep", "direction": "too_cold", "minutes": 60,
+        "units": [{"unit": "main_bedroom_ac", "state": "rest", "setpoint": None}]}})
+    ws.subscribed["ac_correction_ended"]({"event_type": "ac_correction_ended", "data": {
+        "room": "main_bedroom", "section": "sleep", "direction": "too_cold", "minutes": "60",
+        "units": [{"unit": "main_bedroom_ac", "state": "cool", "setpoint": "23.0"}]}})
+    ctl = store.recent_events(limit=1000, category="control")
+    assert len(ctl) == controls + 2, ctl[:3]
+    rests, cools = ctl[1]["message"], ctl[0]["message"]
+    assert rests.startswith("Main Bedroom: the too cold correction in Sleep ended after 60 min; ")\
+        and "rests on" in rests and rests.endswith("; the next vote counts"), rests
+    assert "cools at 23°" in cools, cools
+    assert n_reactions("main_bedroom") == count
+    print(f"cap: HA's correction-ended event is logged (\"{rests}\"; \"{cools}\"), "
+          "nothing recorded - OK")
 
     # --- section runs: a sleep run crossing midnight, with a restart inside it ---
     from datetime import datetime as dt
